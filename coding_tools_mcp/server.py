@@ -75,9 +75,14 @@ RISKY_ENV_NAMES = {
     "PYTHONPATH",
     "PYTHONSTARTUP",
     "NODE_OPTIONS",
-    "RUBYOPT",
+    "PERL5LIB",
     "PERL5OPT",
+    "RUBYOPT",
+    "RUBYLIB",
 }
+SHELL_ENV_INHERIT_CHOICES = ("core", "all", "none")
+POSIX_CORE_ENV_NAMES = {"PATH", "LANG", "LC_ALL", "TERM"}
+WINDOWS_CORE_ENV_NAMES = {"PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR"}
 NETWORK_RE = re.compile(
     r"(https?://|urllib\.request|urllib3|requests\.|http\.client|\bHTTPConnection\b|\bHTTPSConnection\b|socket\.|aiohttp|httpx|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\bftp\b)",
     re.I,
@@ -160,6 +165,14 @@ OAUTH_MAX_BODY_BYTES = 8_192
 
 
 @dataclass(frozen=True)
+class ShellEnvPolicy:
+    inherit: str = "core"
+    include_only: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+    set: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class OAuthConfig:
     client_id: str | None
     client_secret: str | None
@@ -230,6 +243,68 @@ def _safe_external_host(host: str) -> str:
     if not host or any(ch in host for ch in "\r\n/\\"):
         return ""
     return host
+
+
+def env_pattern_matches(name: str, patterns: tuple[str, ...]) -> bool:
+    upper_name = name.upper()
+    return any(fnmatch.fnmatchcase(upper_name, pattern.upper()) for pattern in patterns)
+
+
+def is_risky_env_name(name: str) -> bool:
+    upper = name.upper()
+    return upper in RISKY_ENV_NAMES or upper.startswith("DYLD_")
+
+
+def is_filtered_env_var(name: str, value: str) -> bool:
+    return bool(SENSITIVE_ENV_RE.search(name) or is_risky_env_name(name) or SENSITIVE_VALUE_RE.search(value))
+
+
+def is_core_command_env_name(name: str) -> bool:
+    upper = name.upper()
+    if os.name == "nt":
+        return upper in WINDOWS_CORE_ENV_NAMES
+    return upper in POSIX_CORE_ENV_NAMES or upper.startswith("LC_")
+
+
+def split_env_patterns(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def parse_shell_env_set(value: str | None) -> dict[str, str]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{ENV_PREFIX}_SHELL_ENV_SET must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{ENV_PREFIX}_SHELL_ENV_SET must be a JSON object")
+    return {str(key): str(item) for key, item in parsed.items()}
+
+
+def truthy_env(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def shell_env_policy_from_args(args: argparse.Namespace) -> ShellEnvPolicy:
+    raw_inherit = args.shell_env_inherit or os.environ.get(f"{ENV_PREFIX}_SHELL_ENV_INHERIT") or "core"
+    inherit = raw_inherit.strip().lower()
+    if inherit not in SHELL_ENV_INHERIT_CHOICES:
+        supported = ", ".join(SHELL_ENV_INHERIT_CHOICES)
+        raise ValueError(f"shell env inherit must be one of: {supported}")
+    return ShellEnvPolicy(
+        inherit=inherit,
+        include_only=split_env_patterns(os.environ.get(f"{ENV_PREFIX}_SHELL_ENV_INCLUDE_ONLY")),
+        exclude=split_env_patterns(os.environ.get(f"{ENV_PREFIX}_SHELL_ENV_EXCLUDE")),
+        set=parse_shell_env_set(os.environ.get(f"{ENV_PREFIX}_SHELL_ENV_SET")),
+    )
+
+
+def runtime_policy_from_args(args: argparse.Namespace) -> tuple[ShellEnvPolicy, bool]:
+    allow_network = bool(args.allow_network) or truthy_env(os.environ.get(f"{ENV_PREFIX}_ALLOW_NETWORK"))
+    return shell_env_policy_from_args(args), allow_network
 
 
 TOOL_PROFILE_CHOICES = ("full", "read-only", "compat-readonly-all")
@@ -905,6 +980,8 @@ class Runtime:
         *,
         enable_view_image: bool = True,
         dangerously_skip_all_permissions: bool = False,
+        shell_env_policy: ShellEnvPolicy | None = None,
+        allow_network: bool = False,
         tool_profile: str = "full",
         auth_token: str | None = None,
         oauth_config: OAuthConfig | None = None,
@@ -912,6 +989,15 @@ class Runtime:
         self.workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
         self.dangerously_skip_all_permissions = dangerously_skip_all_permissions
+        self.shell_env_policy = shell_env_policy or ShellEnvPolicy()
+        if self.shell_env_policy.inherit not in SHELL_ENV_INHERIT_CHOICES:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                f"Unknown shell env inherit policy: {self.shell_env_policy.inherit}",
+                category="validation",
+                details={"supported": list(SHELL_ENV_INHERIT_CHOICES)},
+            )
+        self.allow_network = allow_network
         if tool_profile not in TOOL_PROFILE_CHOICES:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -982,6 +1068,11 @@ class Runtime:
             "default_cwd": self.default_cwd_display(),
             "tool_profile": self.tool_profile,
             "auth_enabled": self.auth_enabled(),
+            "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
+            "network_allowed": self.allow_network,
+            "shell_env_inherit": self.shell_env_policy.inherit,
+            "shell_env_include_only": list(self.shell_env_policy.include_only),
+            "shell_env_exclude": list(self.shell_env_policy.exclude),
             "endpoint_path": "/mcp",
             "tools": tools,
             "tool_count": len(tools),
@@ -1776,10 +1867,7 @@ class Runtime:
             return
         env = args.get("env", {})
         if isinstance(env, dict) and any(
-            SENSITIVE_ENV_RE.search(str(key))
-            or str(key).upper() in RISKY_ENV_NAMES
-            or SENSITIVE_VALUE_RE.search(str(value))
-            for key, value in env.items()
+            is_filtered_env_var(str(key), str(value)) for key, value in env.items()
         ):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
@@ -1817,7 +1905,7 @@ class Runtime:
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if NETWORK_RE.search(cmd) and not is_literal_network_reference_command(cmd):
+        if not self.allow_network and NETWORK_RE.search(cmd) and not is_literal_network_reference_command(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Network access is denied by default.",
@@ -1906,25 +1994,48 @@ class Runtime:
             )
 
     def _command_env(self, extra: Any) -> dict[str, str]:
-        env: dict[str, str] = {}
-        for key in ("PATH", "LANG", "LC_ALL"):
-            if key in os.environ:
-                env[key] = os.environ[key]
+        env = self._base_command_env()
+        if not self.dangerously_skip_all_permissions:
+            env = {key: value for key, value in env.items() if not is_filtered_env_var(key, value)}
+        if self.shell_env_policy.exclude:
+            env = {
+                key: value
+                for key, value in env.items()
+                if not env_pattern_matches(key, self.shell_env_policy.exclude)
+            }
+        if self.shell_env_policy.include_only:
+            env = {
+                key: value
+                for key, value in env.items()
+                if env_pattern_matches(key, self.shell_env_policy.include_only)
+            }
+        env.update({str(key): str(value) for key, value in self.shell_env_policy.set.items()})
+        tmp_dir = self.workspace.root / ".tmp"
         env["HOME"] = str(self.workspace.root)
-        env["TMPDIR"] = str(self.workspace.root / ".tmp")
-        (self.workspace.root / ".tmp").mkdir(exist_ok=True)
+        env["TMPDIR"] = str(tmp_dir)
+        if os.name == "nt":
+            env["TEMP"] = str(tmp_dir)
+            env["TMP"] = str(tmp_dir)
+        tmp_dir.mkdir(exist_ok=True)
         if isinstance(extra, dict):
             for key, value in extra.items():
                 key_text = str(key)
                 value_text = str(value)
-                if not self.dangerously_skip_all_permissions and (
-                    SENSITIVE_ENV_RE.search(key_text)
-                    or key_text.upper() in RISKY_ENV_NAMES
-                    or SENSITIVE_VALUE_RE.search(value_text)
-                ):
+                if not self.dangerously_skip_all_permissions and is_filtered_env_var(key_text, value_text):
                     continue
                 env[key_text] = value_text
         return env
+
+    def _base_command_env(self) -> dict[str, str]:
+        if self.shell_env_policy.inherit == "none":
+            return {}
+        if self.shell_env_policy.inherit == "all":
+            return {str(key): str(value) for key, value in os.environ.items()}
+        return {
+            str(key): str(value)
+            for key, value in os.environ.items()
+            if is_core_command_env_name(str(key))
+        }
 
     def _make_session(
         self,
@@ -4521,6 +4632,11 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
 def run_http(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.environ.get("CODING_TOOLS_MCP_WORKSPACE") or os.getcwd())
     auth_token = args.auth_token or os.environ.get(f"{ENV_PREFIX}_AUTH_TOKEN") or None
+    try:
+        shell_env_policy, allow_network = runtime_policy_from_args(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     oauth_config: OAuthConfig | None = None
     oauth_mode = getattr(args, "oauth_mode", False) or os.environ.get(f"{ENV_PREFIX}_OAUTH_MODE") == "1"
@@ -4572,6 +4688,8 @@ def run_http(args: argparse.Namespace) -> int:
         workspace,
         enable_view_image=args.enable_view_image,
         dangerously_skip_all_permissions=args.dangerously_skip_all_permissions,
+        shell_env_policy=shell_env_policy,
+        allow_network=allow_network,
         tool_profile=args.tool_profile,
         auth_token=auth_token,
         oauth_config=oauth_config,
@@ -4604,10 +4722,17 @@ def run_http(args: argparse.Namespace) -> int:
 
 def run_stdio(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.environ.get("CODING_TOOLS_MCP_WORKSPACE") or os.getcwd())
+    try:
+        shell_env_policy, allow_network = runtime_policy_from_args(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     runtime = Runtime(
         workspace,
         enable_view_image=args.enable_view_image,
         dangerously_skip_all_permissions=args.dangerously_skip_all_permissions,
+        shell_env_policy=shell_env_policy,
+        allow_network=allow_network,
         tool_profile=args.tool_profile,
     )
     if args.dangerously_skip_all_permissions:
@@ -4716,6 +4841,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=TOOL_PROFILE_CHOICES,
         default=os.environ.get(f"{ENV_PREFIX}_TOOL_PROFILE", "full"),
         help="tool exposure profile",
+    )
+    parser.add_argument(
+        "--shell-env-inherit",
+        choices=SHELL_ENV_INHERIT_CHOICES,
+        default=None,
+        help=(
+            "baseline environment inheritance for exec_command subprocesses; "
+            f"defaults to {ENV_PREFIX}_SHELL_ENV_INHERIT or core"
+        ),
+    )
+    parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help=f"allow network-looking exec_command calls; can also be enabled with {ENV_PREFIX}_ALLOW_NETWORK=1",
     )
     parser.add_argument(
         "--enable-view-image",

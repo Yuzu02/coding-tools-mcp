@@ -21,7 +21,7 @@ For production, expose the server only to trusted local clients, bind HTTP to lo
 Commands run with:
 
 - Workspace-bound cwd.
-- Minimal environment with controlled `HOME` and `TMPDIR`.
+- Configurable shell environment inheritance with controlled `HOME` and `TMPDIR`.
 - Process group isolation for timeout and kill.
 - Best-effort Linux Landlock rules, when available, that allow workspace access and read/execute access to interpreter/runtime roots.
 - Optional operator-supplied read/execute roots from `CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS` for toolchains installed outside standard system prefixes.
@@ -37,6 +37,8 @@ The runtime denies or drops secret-looking variables and values:
 - Cloud credentials.
 - Shell startup injection variables.
 - Dynamic loader and interpreter path injection variables such as `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_*`, `BASH_ENV`, `ENV`, `PYTHONPATH`, `RUBYLIB`, and `NODE_OPTIONS`.
+
+`CODING_TOOLS_MCP_SHELL_ENV_INHERIT=all` broadens compatibility for local toolchains, but still applies the default secret and startup-loader filters. Only combine `--dangerously-skip-all-permissions` with `inherit=all` when the workspace, client, and child processes are trusted enough to receive the full parent environment.
 
 Secret redaction is defense in depth and must not be treated as the primary protection.
 
@@ -55,7 +57,7 @@ Risky capabilities return structured permission-required or unsupported response
 
 `request_permissions` currently returns `ELICITATION_UNSUPPORTED` unless a future MCP client elicitation flow is implemented and tested.
 
-Operators may start the server with `--dangerously-skip-all-permissions` to auto-grant permission-gated operations for clients that cannot elicit approvals. This mode permits network-looking commands, destructive commands, shell expansion, inline interpreter code, and sensitive env values passed explicitly through `exec_command`; use it only with trusted workspaces and trusted clients. Workspace path boundaries for direct file and patch tools still apply.
+Operators may start the server with `--allow-network` to permit network-looking commands while keeping other permission gates active. `--dangerously-skip-all-permissions` auto-grants permission-gated operations for clients that cannot elicit approvals; this mode permits network-looking commands, destructive commands, shell expansion, inline interpreter code, and sensitive env values passed explicitly through `exec_command`; use it only with trusted workspaces and trusted clients. Workspace path boundaries for direct file and patch tools still apply.
 
 ## Session Lifecycle
 

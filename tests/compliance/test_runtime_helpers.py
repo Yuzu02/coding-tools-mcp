@@ -6,9 +6,17 @@ import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from coding_tools_mcp import server as server_module
-from coding_tools_mcp.server import Runtime, ToolFailure, identify_image, truncate_text_head, truncate_text_tail
+from coding_tools_mcp.server import (
+    Runtime,
+    ShellEnvPolicy,
+    ToolFailure,
+    identify_image,
+    truncate_text_head,
+    truncate_text_tail,
+)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -73,6 +81,8 @@ class RuntimeHelperTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--workspace", result.stdout)
+        self.assertIn("--shell-env-inherit", result.stdout)
+        self.assertIn("--allow-network", result.stdout)
 
     def test_command_policy_gates_inline_interpreter_code(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -100,6 +110,128 @@ class RuntimeHelperTests(unittest.TestCase):
                     with self.assertRaises(ToolFailure) as cm:
                         runtime._check_command_policy(command, {})
                     self.assertEqual(cm.exception.code, "PERMISSION_REQUIRED")
+
+    def test_allow_network_only_opens_network_gate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), allow_network=True)
+            runtime._check_command_policy("curl https://example.com", {})
+            for command in ("git reset --hard", "python3 -c \"print(1)\""):
+                with self.subTest(command=command):
+                    with self.assertRaises(ToolFailure) as cm:
+                        runtime._check_command_policy(command, {})
+                    self.assertEqual(cm.exception.code, "PERMISSION_REQUIRED")
+
+    def test_command_env_core_is_not_windows_toolchain_specific(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(workspace)
+            host_env = {
+                "Path": r"C:\VS\VC\Tools\MSVC\bin;C:\Windows\System32",
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                "SystemRoot": r"C:\Windows",
+                "ComSpec": r"C:\Windows\System32\cmd.exe",
+                "INCLUDE": r"C:\VS\VC\Tools\MSVC\include;C:\SDK\Include",
+                "LIB": r"C:\VS\VC\Tools\MSVC\lib;C:\SDK\Lib",
+                "LIBPATH": r"C:\VS\VC\Tools\MSVC\libpath",
+                "WindowsSdkDir": r"C:\Program Files (x86)\Windows Kits\10\\",
+                "VCToolsInstallDir": r"C:\VS\VC\Tools\MSVC\14.99.99999\\",
+                "VSCMD_ARG_TGT_ARCH": "x64",
+                "UNRELATED": "drop-me",
+                "VSCMD_SECRET": "drop-me-too",
+            }
+            with (
+                patch.object(server_module.os, "name", "nt"),
+                patch.dict(server_module.os.environ, host_env, clear=True),
+            ):
+                env = runtime._command_env({"CUSTOM": "ok", "OPENAI_API_KEY": "sk-test-secret-value"})
+
+            self.assertEqual(env.get("Path"), host_env["Path"])
+            self.assertEqual(env.get("PATHEXT"), host_env["PATHEXT"])
+            self.assertEqual(env.get("SystemRoot"), host_env["SystemRoot"])
+            self.assertEqual(env.get("ComSpec"), host_env["ComSpec"])
+            self.assertEqual(env.get("CUSTOM"), "ok")
+            self.assertEqual(env.get("HOME"), str(workspace))
+            self.assertEqual(env.get("TEMP"), str(workspace / ".tmp"))
+            self.assertEqual(env.get("TMP"), str(workspace / ".tmp"))
+            self.assertNotIn("INCLUDE", env)
+            self.assertNotIn("LIB", env)
+            self.assertNotIn("LIBPATH", env)
+            self.assertNotIn("WindowsSdkDir", env)
+            self.assertNotIn("VCToolsInstallDir", env)
+            self.assertNotIn("VSCMD_ARG_TGT_ARCH", env)
+            self.assertNotIn("UNRELATED", env)
+            self.assertNotIn("VSCMD_SECRET", env)
+            self.assertNotIn("OPENAI_API_KEY", env)
+
+    def test_command_env_all_preserves_toolchain_environment_but_filters_sensitive_values(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(workspace, shell_env_policy=ShellEnvPolicy(inherit="all"))
+            host_env = {
+                "PATH": "/toolchain/bin:/usr/bin",
+                "INCLUDE": r"C:\VS\VC\Tools\MSVC\include",
+                "LIB": r"C:\VS\VC\Tools\MSVC\lib",
+                "LIBPATH": r"C:\VS\VC\Tools\MSVC\libpath",
+                "CUDA_PATH": "/opt/cuda",
+                "ONEAPI_ROOT": "/opt/intel/oneapi",
+                "OPENAI_API_KEY": "sk-test-secret-value",
+                "PYTHONPATH": "/tmp/injected",
+                "DYLD_LIBRARY_PATH": "/tmp/injected",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                env = runtime._command_env({})
+
+            self.assertEqual(env.get("INCLUDE"), host_env["INCLUDE"])
+            self.assertEqual(env.get("LIB"), host_env["LIB"])
+            self.assertEqual(env.get("LIBPATH"), host_env["LIBPATH"])
+            self.assertEqual(env.get("CUDA_PATH"), host_env["CUDA_PATH"])
+            self.assertEqual(env.get("ONEAPI_ROOT"), host_env["ONEAPI_ROOT"])
+            self.assertNotIn("OPENAI_API_KEY", env)
+            self.assertNotIn("PYTHONPATH", env)
+            self.assertNotIn("DYLD_LIBRARY_PATH", env)
+
+    def test_command_env_dangerous_all_preserves_sensitive_inherited_environment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(
+                Path(tmp),
+                dangerously_skip_all_permissions=True,
+                shell_env_policy=ShellEnvPolicy(inherit="all"),
+            )
+            host_env = {
+                "OPENAI_API_KEY": "sk-test-secret-value",
+                "LD_PRELOAD": "/tmp/injected.so",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                env = runtime._command_env({})
+
+            self.assertEqual(env.get("OPENAI_API_KEY"), "sk-test-secret-value")
+            self.assertEqual(env.get("LD_PRELOAD"), "/tmp/injected.so")
+
+    def test_command_env_include_exclude_and_set_are_applied_in_order(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(
+                Path(tmp),
+                shell_env_policy=ShellEnvPolicy(
+                    inherit="all",
+                    include_only=("PATH", "KEEP_*", "SET_BY_POLICY"),
+                    exclude=("KEEP_DROP",),
+                    set={"SET_BY_POLICY": "configured"},
+                ),
+            )
+            host_env = {
+                "PATH": "/usr/bin",
+                "KEEP_THIS": "yes",
+                "KEEP_DROP": "no",
+                "OTHER": "drop",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                env = runtime._command_env({})
+
+            self.assertEqual(env.get("PATH"), "/usr/bin")
+            self.assertEqual(env.get("KEEP_THIS"), "yes")
+            self.assertEqual(env.get("SET_BY_POLICY"), "configured")
+            self.assertNotIn("KEEP_DROP", env)
+            self.assertNotIn("OTHER", env)
 
     def test_command_policy_unwraps_env_before_path_checks(self) -> None:
         with TemporaryDirectory() as tmp:

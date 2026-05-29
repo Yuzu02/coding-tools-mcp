@@ -92,6 +92,18 @@ coding-tools-mcp --stdio --workspace /path/to/repo
 
 Set `CODING_TOOLS_MCP_TRACE=1` to emit redacted JSON tool-call trace events to stderr for local debugging. Logs stay off stdout so stdio JSON-RPC remains clean.
 
+By default, `exec_command` passes a core shell environment only. For local toolchains that depend on inherited environment variables, such as MSVC developer prompts, start with:
+
+```bash
+CODING_TOOLS_MCP_SHELL_ENV_INHERIT=all coding-tools-mcp --workspace /path/to/repo
+```
+
+`inherit=all` still filters secret-looking and loader/startup variables unless `--dangerously-skip-all-permissions` is also enabled. To allow dependency downloads without disabling every permission gate, use:
+
+```bash
+coding-tools-mcp --allow-network --workspace /path/to/repo
+```
+
 If your MCP client does not support permission elicitation and you explicitly want permission-gated operations to run, start with:
 
 ```bash
@@ -204,7 +216,7 @@ For input/output schemas and result envelopes, see [docs/tools-and-schemas.md](d
 
 The runtime binds one workspace root per server process. Paths are workspace-relative by default. Absolute paths, `..` traversal, and symlink escapes are rejected. Recursive listing/search excludes `.git`, `.reference`, `node_modules`, `target`, `dist`, build outputs, virtualenvs, and common caches by default.
 
-`exec_command` runs under policy controls with workspace-bound cwd, timeout, output caps, sensitive-value and loader/startup environment rejection, destructive command checks, network-looking command checks, shell-expansion permission gates, indirect absolute-path checks, cancellation/kill cleanup, session deadline watchdogs, and bounded session buffers. On Linux hosts with Landlock support it also applies filesystem confinement; on Windows, macOS, or Linux hosts without Landlock, command results include a warning and external sandboxing is required before running untrusted commands. This is still not a complete OS/container sandbox; see [SECURITY.md](SECURITY.md).
+`exec_command` runs under policy controls with workspace-bound cwd, configurable shell environment inheritance, timeout, output caps, sensitive-value and loader/startup environment rejection, destructive command checks, network-looking command checks, shell-expansion permission gates, indirect absolute-path checks, cancellation/kill cleanup, session deadline watchdogs, and bounded session buffers. On Linux hosts with Landlock support it also applies filesystem confinement; on Windows, macOS, or Linux hosts without Landlock, command results include a warning and external sandboxing is required before running untrusted commands. This is still not a complete OS/container sandbox; see [SECURITY.md](SECURITY.md).
 
 `--dangerously-skip-all-permissions` disables the permission gates above for operators who accept that risk. Do not use it for untrusted workspaces or untrusted MCP clients.
 
