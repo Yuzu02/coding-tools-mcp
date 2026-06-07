@@ -17,6 +17,11 @@ class RequiredDocsTests(unittest.TestCase):
             "docs/quickstart.md",
             "docs/mcp-client-config.md",
             "docs/tools-and-schemas.md",
+            "docs/permission-modes.md",
+            "docs/exec-command-recipes.md",
+            "docs/troubleshooting-exec.md",
+            "docs/security-boundary.md",
+            "docs/docker.md",
             "docs/ci-and-tests.md",
             "docs/dogfood.md",
             "docs/swe-bench.md",
@@ -24,6 +29,11 @@ class RequiredDocsTests(unittest.TestCase):
             "docs/troubleshooting.md",
             "docs/competitive-analysis.md",
             "docs/profile-v0.1.md",
+            "Dockerfile",
+            ".dockerignore",
+            "docker-compose.yml",
+            "scripts/docker-entrypoint.sh",
+            ".devcontainer/devcontainer.json",
         ]
         missing = [path for path in required_paths if not (ROOT / path).is_file()]
         self.assertEqual(missing, [])
@@ -55,6 +65,11 @@ class RequiredDocsTests(unittest.TestCase):
             "docs/dogfood.md": ["MCP-Only Rule", "view_image", "Direct filesystem/shell bypass"],
             "docs/swe-bench.md": ["Official attempt report", "BLOCKED", "sympy__sympy-12419"],
             "docs/troubleshooting.md": ["SANDBOX_UNAVAILABLE", "MCP-Protocol-Version"],
+            "docs/permission-modes.md": ["safe", "trusted", "dangerous"],
+            "docs/exec-command-recipes.md": ["MAVEN_USER_HOME", "npm_config_cache", "GOCACHE", "CARGO_HOME"],
+            "docs/troubleshooting-exec.md": ["DEV_NULL_DENIED", "DNS_RESOLUTION_FAILED", "OUTPUT_TRUNCATED"],
+            "docs/security-boundary.md": ["Landlock", "external container or VM"],
+            "docs/docker.md": ["permission-mode trusted", "permission_mode=dangerous", "mvn -version"],
             "docs/competitive-analysis.md": ["Claude Code", "Aider", "OpenHands", "Cline"],
         }
         for rel_path, needles in expectations.items():
@@ -84,3 +99,13 @@ class RequiredDocsTests(unittest.TestCase):
         for needle in ("workflow_dispatch", "--install-swebench", "--run-evaluation", "reports/benchmark/**"):
             with self.subTest(workflow="swebench-lite", needle=needle):
                 self.assertIn(needle, swebench)
+
+        docker_image = (ROOT / ".github/workflows/docker-image.yml").read_text(encoding="utf-8")
+        for needle in ("docker/build-push-action", "ghcr.io", "coding-tools-mcp-sandbox"):
+            with self.subTest(workflow="docker-image", needle=needle):
+                self.assertIn(needle, docker_image)
+
+        docker_smoke = (ROOT / ".github/workflows/docker-smoke.yml").read_text(encoding="utf-8")
+        for needle in ("docker build", "tools/list", "server_info", "exec_command"):
+            with self.subTest(workflow="docker-smoke", needle=needle):
+                self.assertIn(needle, docker_smoke)

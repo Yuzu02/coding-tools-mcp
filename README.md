@@ -15,12 +15,17 @@ It is not a prompt wrapper. It does not expose external agent accounts, memory, 
 - [MCP client configuration](docs/mcp-client-config.md)
 - [Remote MCP](docs/remote-mcp.md)
 - [Tools and schemas](docs/tools-and-schemas.md)
+- [Permission modes](docs/permission-modes.md)
+- [Exec command recipes](docs/exec-command-recipes.md)
+- [Docker sandbox](docs/docker.md)
 - [Security policy](SECURITY.md)
+- [Security boundary](docs/security-boundary.md)
 - [CI and test commands](docs/ci-and-tests.md)
 - [Dogfood](docs/dogfood.md)
 - [SWE-bench evaluation](docs/swe-bench.md)
 - [Known limitations](docs/limitations.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Exec troubleshooting](docs/troubleshooting-exec.md)
 - [Competitive analysis](docs/competitive-analysis.md)
 - Normative MCP runtime profile: [docs/profile-v0.1.md](docs/profile-v0.1.md)
 
@@ -98,19 +103,19 @@ By default, `exec_command` passes a core shell environment only. For local toolc
 CODING_TOOLS_MCP_SHELL_ENV_INHERIT=all coding-tools-mcp --workspace /path/to/repo
 ```
 
-`inherit=all` still filters secret-looking and loader/startup variables unless `--dangerously-skip-all-permissions` is also enabled. To allow dependency downloads without disabling every permission gate, use:
+`inherit=all` still filters secret-looking and loader/startup variables unless dangerous mode is also enabled. For local development with dependency downloads, shell expansion, and inline interpreter snippets, use:
 
 ```bash
-coding-tools-mcp --allow-network --workspace /path/to/repo
+coding-tools-mcp --permission-mode trusted --workspace /path/to/repo
 ```
 
-If your MCP client does not support permission elicitation and you explicitly want permission-gated operations to run, start with:
+`--allow-network` remains available as a compatibility flag when you only want to open network-looking commands. If your MCP client does not support permission elicitation and you explicitly want to disable `exec_command` permission gates inside an isolated container or VM, start with:
 
 ```bash
-coding-tools-mcp --dangerously-skip-all-permissions --workspace /path/to/repo
+coding-tools-mcp --permission-mode dangerous --workspace /path/to/repo
 ```
 
-This auto-grants permission-gated operations such as network-looking commands, destructive commands, shell expansion, and sensitive env passed through `exec_command`. Workspace path boundaries still apply.
+This disables `exec_command` permission gates such as network-looking commands, destructive command checks, shell expansion, inline scripts, and sensitive env checks. Workspace path boundaries for direct file tools still apply. `--dangerously-skip-all-permissions` remains as a compatibility alias.
 
 ## MCP Client Examples
 
@@ -218,7 +223,7 @@ The runtime binds one workspace root per server process. Paths are workspace-rel
 
 `exec_command` runs under policy controls with workspace-bound cwd, configurable shell environment inheritance, timeout, output caps, sensitive-value and loader/startup environment rejection, destructive command checks, network-looking command checks, shell-expansion permission gates, indirect absolute-path checks, cancellation/kill cleanup, session deadline watchdogs, and bounded session buffers. On Linux hosts with Landlock support it also applies filesystem confinement; on Windows, macOS, or Linux hosts without Landlock, command results include a warning and external sandboxing is required before running untrusted commands. This is still not a complete OS/container sandbox; see [SECURITY.md](SECURITY.md).
 
-`--dangerously-skip-all-permissions` disables the permission gates above for operators who accept that risk. Do not use it for untrusted workspaces or untrusted MCP clients.
+`--permission-mode safe` is the default. `--permission-mode trusted` opens local-development gates while keeping secret filtering and destructive-command checks. `--permission-mode dangerous` disables `exec_command` permission gates for operators who accept that risk inside an isolated runner. Do not use dangerous mode for untrusted workspaces or untrusted MCP clients.
 
 ## Compliance
 

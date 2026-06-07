@@ -17,8 +17,10 @@ import secrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -81,6 +83,7 @@ RISKY_ENV_NAMES = {
     "RUBYLIB",
 }
 SHELL_ENV_INHERIT_CHOICES = ("core", "all", "none")
+PERMISSION_MODE_CHOICES = ("safe", "trusted", "dangerous")
 POSIX_CORE_ENV_NAMES = {"PATH", "LANG", "LC_ALL", "TERM"}
 WINDOWS_CORE_ENV_NAMES = {"PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR"}
 NETWORK_RE = re.compile(
@@ -158,6 +161,52 @@ ENV_FLAG_OPTIONS = {
 NETWORK_LITERAL_COMMANDS = {"echo", "printf", "grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc"}
 INLINE_SCRIPT_PERMISSION = "inline_script"
 ENV_PREFIX = "CODING_TOOLS_MCP"
+CODING_TOOLS_DIR_NAME = ".coding-tools"
+SPECIAL_DEVICE_PATHS = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom")
+DNS_RESOLVER_READ_ROOTS = (
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/gai.conf",
+    "/etc/protocols",
+    "/etc/services",
+    "/run/systemd/resolve",
+    "/run/resolvconf",
+)
+TOOLCHAIN_READ_ROOTS = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc/alternatives",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/pki",
+    "/etc/localtime",
+    "/etc/npmrc",
+    "/usr/local/sdkman/candidates",
+)
+SYSTEM_PATH_ROOT_PREFIXES = (
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/etc/alternatives",
+    "/usr/local/sdkman/candidates",
+)
+ECOSYSTEM_CACHE_ENV_NAMES = {
+    "MAVEN_USER_HOME",
+    "GRADLE_USER_HOME",
+    "NPM_CONFIG_CACHE",
+    "npm_config_cache",
+    "PIP_CACHE_DIR",
+    "GOCACHE",
+    "GOMODCACHE",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+}
 
 OAUTH_CODE_TTL_SECONDS = 300
 OAUTH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
@@ -170,6 +219,13 @@ class ShellEnvPolicy:
     include_only: tuple[str, ...] = ()
     exclude: tuple[str, ...] = ()
     set: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuntimePolicy:
+    permission_mode: str
+    shell_env_policy: ShellEnvPolicy
+    allow_network: bool
 
 
 @dataclass(frozen=True)
@@ -302,14 +358,41 @@ def shell_env_policy_from_args(args: argparse.Namespace) -> ShellEnvPolicy:
     )
 
 
-def runtime_policy_from_args(args: argparse.Namespace) -> tuple[ShellEnvPolicy, bool]:
-    allow_network = bool(args.allow_network) or truthy_env(os.environ.get(f"{ENV_PREFIX}_ALLOW_NETWORK"))
-    return shell_env_policy_from_args(args), allow_network
+def permission_mode_from_args(args: argparse.Namespace) -> str:
+    raw_mode = (
+        getattr(args, "permission_mode", None)
+        or os.environ.get(f"{ENV_PREFIX}_PERMISSION_MODE")
+        or ("dangerous" if bool(getattr(args, "dangerously_skip_all_permissions", False)) else "")
+        or ("dangerous" if truthy_env(os.environ.get(f"{ENV_PREFIX}_DANGEROUSLY_SKIP_ALL_PERMISSIONS")) else "")
+        or "safe"
+    )
+    mode = raw_mode.strip().lower()
+    if mode not in PERMISSION_MODE_CHOICES:
+        supported = ", ".join(PERMISSION_MODE_CHOICES)
+        raise ValueError(f"permission mode must be one of: {supported}")
+    if bool(getattr(args, "dangerously_skip_all_permissions", False)) or truthy_env(os.environ.get(f"{ENV_PREFIX}_DANGEROUSLY_SKIP_ALL_PERMISSIONS")):
+        mode = "dangerous"
+    return mode
+
+
+def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
+    permission_mode = permission_mode_from_args(args)
+    allow_network = (
+        permission_mode in {"trusted", "dangerous"}
+        or bool(getattr(args, "allow_network", False))
+        or truthy_env(os.environ.get(f"{ENV_PREFIX}_ALLOW_NETWORK"))
+    )
+    return RuntimePolicy(
+        permission_mode=permission_mode,
+        shell_env_policy=shell_env_policy_from_args(args),
+        allow_network=allow_network,
+    )
 
 
 TOOL_PROFILE_CHOICES = ("full", "read-only", "compat-readonly-all")
 FULL_TOOL_NAMES = (
     "server_info",
+    "check_exec_environment",
     "get_default_cwd",
     "set_default_cwd",
     "read_file",
@@ -330,6 +413,7 @@ FULL_TOOL_NAMES = (
 )
 READ_ONLY_TOOL_NAMES = (
     "server_info",
+    "check_exec_environment",
     "get_default_cwd",
     "set_default_cwd",
     "read_file",
@@ -680,6 +764,188 @@ def landlock_unavailable_warning(exc: ToolFailure) -> str:
     )
 
 
+def landlock_status_payload() -> dict[str, Any]:
+    try:
+        version = landlock_abi_version()
+    except ToolFailure as exc:
+        return {
+            "enabled": False,
+            "available": False,
+            "abi_version": None,
+            "reason": exc.message,
+            "details": exc.details,
+        }
+    return {
+        "enabled": True,
+        "available": True,
+        "abi_version": version,
+    }
+
+
+def truncate_evidence(text: str, limit: int = 240) -> str:
+    text = " ".join(text.strip().split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def diagnostic(
+    code: str,
+    *,
+    evidence: str = "",
+    severity: str = "error",
+    suggested_fix: str | None = None,
+    suggested_next_command: str | None = None,
+    suggested_server_flag: str | None = None,
+) -> dict[str, str]:
+    item = {"code": code, "severity": severity}
+    if evidence:
+        item["evidence"] = truncate_evidence(evidence)
+    if suggested_fix:
+        item["suggested_fix"] = suggested_fix
+    if suggested_next_command:
+        item["suggested_next_command"] = suggested_next_command
+    if suggested_server_flag:
+        item["suggested_server_flag"] = suggested_server_flag
+    return item
+
+
+def permission_failure_diagnostics(exc: ToolFailure) -> list[dict[str, str]]:
+    permission = str(exc.details.get("permission") or "")
+    if permission == "network":
+        return [
+            diagnostic(
+                "NETWORK_PERMISSION_REQUIRED",
+                evidence=exc.message,
+                suggested_fix="Restart the server with --permission-mode trusted or --allow-network.",
+                suggested_server_flag="--permission-mode trusted",
+            )
+        ]
+    if permission == "shell_expansion":
+        return [
+            diagnostic(
+                "SHELL_EXPANSION_PERMISSION_REQUIRED",
+                evidence=exc.message,
+                suggested_fix="Restart the server with --permission-mode trusted for local development shell expansion.",
+                suggested_server_flag="--permission-mode trusted",
+            )
+        ]
+    if permission == INLINE_SCRIPT_PERMISSION:
+        return [
+            diagnostic(
+                "INLINE_SCRIPT_PERMISSION_REQUIRED",
+                evidence=exc.message,
+                suggested_fix="Restart the server with --permission-mode trusted for local development inline scripts.",
+                suggested_server_flag="--permission-mode trusted",
+            )
+        ]
+    if permission == "sensitive_env":
+        return [
+            diagnostic(
+                "SECRET_ENV_REJECTED",
+                evidence=exc.message,
+                suggested_fix="Remove secret-looking or loader/startup environment variables from exec_command env.",
+            )
+        ]
+    return []
+
+
+def exec_output_diagnostics(payload: dict[str, Any]) -> list[dict[str, str]]:
+    diagnostics: list[dict[str, str]] = []
+    stdout = str(payload.get("stdout", ""))
+    stderr = str(payload.get("stderr", ""))
+    combined = "\n".join(part for part in (stderr, stdout) if part)
+    lower = combined.lower()
+    if payload.get("timed_out") or payload.get("status") == "timeout":
+        diagnostics.append(
+            diagnostic(
+                "COMMAND_TIMED_OUT",
+                evidence="command timed out",
+                suggested_fix="Increase timeout_ms only for trusted workloads, or run a narrower command.",
+            )
+        )
+    if payload.get("truncated") or payload.get("stdout_truncated") or payload.get("stderr_truncated"):
+        diagnostics.append(
+            diagnostic(
+                "OUTPUT_TRUNCATED",
+                evidence="stdout/stderr exceeded max_output_bytes or session buffer limits",
+                severity="warning",
+                suggested_fix="Increase max_output_bytes or poll the running session more frequently.",
+            )
+        )
+    if "/dev/null" in lower and "permission denied" in lower and (
+        "cannot create" in lower or "denied" in lower or "open" in lower
+    ):
+        diagnostics.append(
+            diagnostic(
+                "DEV_NULL_DENIED",
+                evidence=combined,
+                suggested_fix="Landlock special device rules should include WRITE_FILE, TRUNCATE, and IOCTL_DEV for /dev/null.",
+            )
+        )
+    if "could not resolve host" in lower or "temporary failure in name resolution" in lower or "name or service not known" in lower:
+        diagnostics.append(
+            diagnostic(
+                "DNS_RESOLUTION_FAILED",
+                evidence=combined,
+                suggested_next_command="cat /etc/resolv.conf && getent hosts repo.maven.apache.org",
+            )
+        )
+    if "java.security" in lower and ("permission denied" in lower or "could not" in lower or "error loading" in lower):
+        diagnostics.append(
+            diagnostic(
+                "JDK_SECURITY_CONFIG_BLOCKED",
+                evidence=combined,
+                suggested_fix="Ensure the JDK security configuration path is included in Landlock read roots.",
+            )
+        )
+    if "tmpdir" in lower and ("permission denied" in lower or "not writable" in lower or "cannot write" in lower):
+        diagnostics.append(
+            diagnostic(
+                "TMPDIR_NOT_WRITABLE",
+                evidence=combined,
+                suggested_next_command="printf ok > \"$TMPDIR/coding-tools-write-test\"",
+            )
+        )
+    if re.search(r"\bhome\b", lower) and ("permission denied" in lower or "not writable" in lower or "cannot write" in lower):
+        diagnostics.append(
+            diagnostic(
+                "HOME_NOT_WRITABLE",
+                evidence=combined,
+                suggested_next_command="printf ok > \"$HOME/coding-tools-write-test\"",
+            )
+        )
+    if "permission denied" in lower and any(root in combined for root in ("/usr", "/bin", "/lib", "/etc", "/usr/local/sdkman")):
+        diagnostics.append(
+            diagnostic(
+                "LANDLOCK_READ_ROOT_BLOCKED",
+                evidence=combined,
+                suggested_fix="Add the missing toolchain path to CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS or the default read roots.",
+            )
+        )
+    if payload.get("exit_code") == 127 or "command not found" in lower or ("not found" in lower and "exec" in lower):
+        diagnostics.append(
+            diagnostic(
+                "EXECUTABLE_NOT_FOUND",
+                evidence=combined or "exit_code=127",
+                suggested_next_command="command -v <executable>",
+            )
+        )
+    return dedupe_diagnostics(diagnostics)
+
+
+def dedupe_diagnostics(items: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, str]] = []
+    for item in items:
+        code = item.get("code", "")
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        deduped.append(item)
+    return deduped
+
+
 def process_group_popen_kwargs() -> dict[str, Any]:
     if hasattr(os, "setsid"):
         return {"start_new_session": True}
@@ -979,6 +1245,7 @@ class Runtime:
         workspace: Path,
         *,
         enable_view_image: bool = True,
+        permission_mode: str = "safe",
         dangerously_skip_all_permissions: bool = False,
         shell_env_policy: ShellEnvPolicy | None = None,
         allow_network: bool = False,
@@ -988,7 +1255,17 @@ class Runtime:
     ) -> None:
         self.workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
-        self.dangerously_skip_all_permissions = dangerously_skip_all_permissions
+        if dangerously_skip_all_permissions:
+            permission_mode = "dangerous"
+        if permission_mode not in PERMISSION_MODE_CHOICES:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                f"Unknown permission mode: {permission_mode}",
+                category="validation",
+                details={"supported": list(PERMISSION_MODE_CHOICES)},
+            )
+        self.permission_mode = permission_mode
+        self.dangerously_skip_all_permissions = self.permission_mode == "dangerous"
         self.shell_env_policy = shell_env_policy or ShellEnvPolicy()
         if self.shell_env_policy.inherit not in SHELL_ENV_INHERIT_CHOICES:
             raise ToolFailure(
@@ -997,7 +1274,7 @@ class Runtime:
                 category="validation",
                 details={"supported": list(SHELL_ENV_INHERIT_CHOICES)},
             )
-        self.allow_network = allow_network
+        self.allow_network = allow_network or self.permission_mode in {"trusted", "dangerous"}
         if tool_profile not in TOOL_PROFILE_CHOICES:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -1008,6 +1285,12 @@ class Runtime:
         self.tool_profile = tool_profile
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
+        self.server_instance_id = secrets.token_urlsafe(12)
+        self.coding_tools_dir = self.workspace.root / CODING_TOOLS_DIR_NAME
+        self.workspace_home_dir = self.coding_tools_dir / "home"
+        self.workspace_tmp_dir = self.coding_tools_dir / "tmp"
+        self.cache_dir = self.coding_tools_dir / "cache"
+        self.trusted_tmp_dir = Path(tempfile.gettempdir()) / f"coding-tools-{self.server_instance_id}"
         self._pending_codes: dict[str, dict[str, Any]] = {}
         self._pending_codes_lock = threading.Lock()
         self.default_cwd = self.workspace.root
@@ -1017,6 +1300,49 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.initialized = False
         self.logging_level = "warning"
+
+    def _ensure_runtime_dirs(self) -> None:
+        for path in (self.workspace_home_dir, self.workspace_tmp_dir, self.cache_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        if self.permission_mode == "trusted":
+            self.trusted_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    def command_home_dir(self) -> Path:
+        return self.workspace_home_dir
+
+    def command_tmp_dir(self) -> Path:
+        return self.trusted_tmp_dir if self.permission_mode == "trusted" else self.workspace_tmp_dir
+
+    def global_tmp_write_policy(self) -> str:
+        if self.permission_mode == "dangerous":
+            return "allowed"
+        if self.permission_mode == "trusted":
+            return "tmp-prefix"
+        return "blocked"
+
+    def shell_expansion_policy(self) -> str:
+        return "allowed" if self.permission_mode in {"trusted", "dangerous"} else "blocked"
+
+    def inline_script_policy(self) -> str:
+        return "allowed" if self.permission_mode in {"trusted", "dangerous"} else "blocked"
+
+    def secret_env_filter_policy(self) -> str:
+        return "disabled" if self.permission_mode == "dangerous" else "enabled"
+
+    def landlock_enabled(self) -> bool:
+        return self.permission_mode != "dangerous"
+
+    def landlock_write_roots(self) -> list[Path]:
+        return [self.trusted_tmp_dir] if self.permission_mode == "trusted" else []
+
+    def is_allowed_command_tmp_path(self, candidate: str) -> bool:
+        if self.permission_mode != "trusted":
+            return False
+        try:
+            resolved = Path(candidate).expanduser().resolve(strict=False)
+        except OSError:
+            return False
+        return is_relative_to(resolved, self.trusted_tmp_dir)
 
     def initialize(self) -> dict[str, Any]:
         return {
@@ -1059,17 +1385,32 @@ class Runtime:
 
     def server_info_payload(self) -> dict[str, Any]:
         tools = self.exposed_tool_names()
+        landlock = landlock_status_payload()
+        landlock["enabled"] = bool(landlock.get("available")) and self.landlock_enabled()
         return {
             "server": SERVER_NAME,
             "title": "Coding Tools MCP",
             "version": __version__,
             "protocol_version": PROTOCOL_VERSION,
+            "permission_mode": self.permission_mode,
             "workspace": str(self.workspace.root),
             "default_cwd": self.default_cwd_display(),
             "tool_profile": self.tool_profile,
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
             "network_allowed": self.allow_network,
+            "home": normalize_rel_display(self.command_home_dir(), self.workspace.root),
+            "tmpdir": normalize_rel_display(self.command_tmp_dir(), self.workspace.root)
+            if is_relative_to(self.command_tmp_dir(), self.workspace.root)
+            else str(self.command_tmp_dir()),
+            "cache_dir": normalize_rel_display(self.cache_dir, self.workspace.root),
+            "landlock": landlock,
+            "exec_policy": {
+                "shell_expansion": self.shell_expansion_policy(),
+                "inline_script": self.inline_script_policy(),
+                "global_tmp_write": self.global_tmp_write_policy(),
+                "secret_env_filter": self.secret_env_filter_policy(),
+            },
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
@@ -1094,6 +1435,7 @@ class Runtime:
         args = arguments or {}
         handlers = {
             "server_info": self.server_info,
+            "check_exec_environment": self.check_exec_environment,
             "get_default_cwd": self.get_default_cwd,
             "set_default_cwd": self.set_default_cwd,
             "read_file": self.read_file,
@@ -1142,6 +1484,9 @@ class Runtime:
                     "details": exc.details,
                 },
             }
+            diagnostics = permission_failure_diagnostics(exc)
+            if diagnostics:
+                payload["diagnostics"] = diagnostics
             if exc.code == "PERMISSION_REQUIRED":
                 permission = exc.details.get("permission")
                 payload["permission_request"] = {
@@ -1170,6 +1515,29 @@ class Runtime:
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
+
+    def check_exec_environment(self, args: dict[str, Any]) -> dict[str, Any]:
+        landlock = landlock_status_payload()
+        warnings: list[str] = []
+        if not landlock.get("available"):
+            warnings.append("Linux Landlock filesystem confinement is unavailable")
+        if self.permission_mode == "dangerous":
+            warnings.append("permission_mode=dangerous disables MCP safety gates")
+        return {
+            "ok": True,
+            "workspace": str(self.workspace.root),
+            "permission_mode": self.permission_mode,
+            "network_allowed": self.allow_network,
+            "home": normalize_rel_display(self.command_home_dir(), self.workspace.root),
+            "tmpdir": normalize_rel_display(self.command_tmp_dir(), self.workspace.root)
+            if is_relative_to(self.command_tmp_dir(), self.workspace.root)
+            else str(self.command_tmp_dir()),
+            "cache_dir": normalize_rel_display(self.cache_dir, self.workspace.root),
+            "landlock_enabled": bool(landlock.get("available")) and self.landlock_enabled(),
+            "landlock_abi": landlock.get("abi_version"),
+            "global_tmp_write": self.global_tmp_write_policy(),
+            "warnings": warnings,
+        }
 
     def get_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1769,15 +2137,20 @@ class Runtime:
         popen_cmd: Any = cmd
         popen_shell = True
         popen_extra = process_group_popen_kwargs()
-        try:
-            landlock_fd = open_landlock_ruleset(self.workspace.root, guard_allow_roots())
-            popen_cmd = landlock_exec_argv(landlock_fd, cmd)
-            popen_shell = False
-            popen_extra["pass_fds"] = (landlock_fd,)
-        except ToolFailure as exc:
-            if exc.code != "SANDBOX_UNAVAILABLE":
-                raise
-            landlock_warning = landlock_unavailable_warning(exc)
+        if self.landlock_enabled():
+            try:
+                landlock_fd = open_landlock_ruleset(
+                    self.workspace.root,
+                    guard_allow_roots(),
+                    write_roots=self.landlock_write_roots(),
+                )
+                popen_cmd = landlock_exec_argv(landlock_fd, cmd)
+                popen_shell = False
+                popen_extra["pass_fds"] = (landlock_fd,)
+            except ToolFailure as exc:
+                if exc.code != "SANDBOX_UNAVAILABLE":
+                    raise
+                landlock_warning = landlock_unavailable_warning(exc)
         try:
             process = subprocess.Popen(
                 popen_cmd,
@@ -1827,6 +2200,7 @@ class Runtime:
                         "elapsed_ms": int((time.time() - start) * 1000),
                     }
                 )
+                self._add_exec_diagnostics(payload)
                 return payload
             now = time.time()
             if not tty and now >= deadline:
@@ -1842,6 +2216,7 @@ class Runtime:
                         "elapsed_ms": int((time.time() - start) * 1000),
                     }
                 )
+                self._add_exec_diagnostics(payload)
                 return payload
             with session.lock:
                 tty_has_initial_output = (
@@ -1858,13 +2233,14 @@ class Runtime:
                         "elapsed_ms": int((time.time() - start) * 1000),
                     }
                 )
+                self._add_exec_diagnostics(payload)
                 return payload
             time.sleep(0.02)
 
     def _check_command_policy(self, cmd: str, args: dict[str, Any]) -> None:
-        self._check_command_paths(cmd)
         if self.dangerously_skip_all_permissions:
             return
+        self._check_command_paths(cmd)
         env = args.get("env", {})
         if isinstance(env, dict) and any(
             is_filtered_env_var(str(key), str(value)) for key, value in env.items()
@@ -1876,7 +2252,7 @@ class Runtime:
                 details={"permission": "sensitive_env", "env_keys": sorted(str(key) for key in env)},
             )
         inline_script = inline_script_command(cmd)
-        if inline_script is not None:
+        if self.permission_mode == "safe" and inline_script is not None:
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Inline interpreter or shell code requires explicit permission because network and filesystem effects cannot be verified statically.",
@@ -1884,7 +2260,7 @@ class Runtime:
                 details={"permission": INLINE_SCRIPT_PERMISSION, **inline_script},
             )
         compact = " ".join(cmd.split()).lower()
-        if SHELL_EXPANSION_RE.search(cmd):
+        if self.permission_mode == "safe" and SHELL_EXPANSION_RE.search(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Shell command substitution and parameter expansion require explicit permission.",
@@ -1913,6 +2289,11 @@ class Runtime:
                 details={"permission": "network", "command": compact},
             )
 
+    def _add_exec_diagnostics(self, payload: dict[str, Any]) -> None:
+        diagnostics = exec_output_diagnostics(payload)
+        if diagnostics:
+            payload["diagnostics"] = diagnostics
+
     def _check_command_paths(self, cmd: str) -> None:
         try:
             tokens = shlex_split(cmd)
@@ -1930,6 +2311,10 @@ class Runtime:
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", candidate):
             return
         normalized = candidate.replace("\\", "/")
+        if normalized in SPECIAL_DEVICE_PATHS:
+            return
+        if self.is_allowed_command_tmp_path(normalized):
+            return
         if (
             normalized.startswith("/")
             or normalized.startswith("~")
@@ -1997,6 +2382,7 @@ class Runtime:
         env = self._base_command_env()
         if not self.dangerously_skip_all_permissions:
             env = {key: value for key, value in env.items() if not is_filtered_env_var(key, value)}
+            env = {key: value for key, value in env.items() if key not in ECOSYSTEM_CACHE_ENV_NAMES}
         if self.shell_env_policy.exclude:
             env = {
                 key: value
@@ -2010,13 +2396,14 @@ class Runtime:
                 if env_pattern_matches(key, self.shell_env_policy.include_only)
             }
         env.update({str(key): str(value) for key, value in self.shell_env_policy.set.items()})
-        tmp_dir = self.workspace.root / ".tmp"
-        env["HOME"] = str(self.workspace.root)
+        self._ensure_runtime_dirs()
+        tmp_dir = self.command_tmp_dir()
+        env["HOME"] = str(self.command_home_dir())
         env["TMPDIR"] = str(tmp_dir)
         if os.name == "nt":
             env["TEMP"] = str(tmp_dir)
             env["TMP"] = str(tmp_dir)
-        tmp_dir.mkdir(exist_ok=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         if isinstance(extra, dict):
             for key, value in extra.items():
                 key_text = str(key)
@@ -3194,7 +3581,7 @@ def landlock_handled_access(version: int) -> int:
     return handled
 
 
-def open_landlock_ruleset(workspace: Path, read_roots: list[str]) -> int:
+def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots: list[Path] | None = None) -> int:
     version = landlock_abi_version()
     handled = landlock_handled_access(version)
     ruleset_attr = LandlockRulesetAttr(handled)
@@ -3217,11 +3604,21 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str]) -> int:
         readonly_access = handled & (
             LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
         )
-        device_access = readonly_access | (handled & LANDLOCK_ACCESS_FS_WRITE_FILE)
+        readonly_file_access = handled & (LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE)
+        device_access = readonly_file_access | (
+            handled
+            & (
+                LANDLOCK_ACCESS_FS_WRITE_FILE
+                | LANDLOCK_ACCESS_FS_TRUNCATE
+                | LANDLOCK_ACCESS_FS_IOCTL_DEV
+            )
+        )
         add_landlock_path(ruleset_fd, workspace, workspace_access)
+        for root in write_roots or []:
+            add_landlock_path(ruleset_fd, root, workspace_access, required=False)
         for root in read_roots:
             add_landlock_path(ruleset_fd, Path(root), readonly_access, required=False)
-        for special in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
+        for special in SPECIAL_DEVICE_PATHS:
             add_landlock_path(ruleset_fd, Path(special), device_access, required=False)
         for special_dir in ("/proc/self", "/proc/thread-self", "/dev/fd"):
             add_landlock_path(ruleset_fd, Path(special_dir), readonly_access, required=False)
@@ -3244,7 +3641,7 @@ def add_landlock_path(ruleset_fd: int, path: Path, allowed_access: int, *, requi
             ) from exc
         return
     try:
-        path_attr = LandlockPathBeneathAttr(allowed_access, fd)
+        path_attr = LandlockPathBeneathAttr(allowed_access & landlock_path_allowed_access(path), fd)
         rc = libc_syscall(SYS_LANDLOCK_ADD_RULE, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, ctypes.byref(path_attr), 0)
         if rc < 0 and required:
             err = ctypes.get_errno()
@@ -3256,6 +3653,22 @@ def add_landlock_path(ruleset_fd: int, path: Path, allowed_access: int, *, requi
             )
     finally:
         os.close(fd)
+
+
+def landlock_path_allowed_access(path: Path) -> int:
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return ~0
+    if stat.S_ISDIR(mode):
+        return ~0
+    return (
+        LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_WRITE_FILE
+        | LANDLOCK_ACCESS_FS_READ_FILE
+        | LANDLOCK_ACCESS_FS_TRUNCATE
+        | LANDLOCK_ACCESS_FS_IOCTL_DEV
+    )
 
 
 def restrict_self_with_landlock(ruleset_fd: int) -> None:
@@ -3276,23 +3689,39 @@ def landlock_exec_argv(ruleset_fd: int, cmd: str) -> list[str]:
     return [sys.executable, str(helper), str(ruleset_fd), cmd]
 
 
+def is_default_system_path_root(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for prefix in SYSTEM_PATH_ROOT_PREFIXES:
+        try:
+            prefix_path = Path(prefix).resolve()
+        except OSError:
+            prefix_path = Path(prefix)
+        if resolved == prefix_path or is_relative_to(resolved, prefix_path):
+            return True
+    return False
+
+
 def guard_allow_roots() -> list[str]:
-    roots = {
-        "/bin",
-        "/lib",
-        "/lib64",
-        "/sbin",
-        "/usr",
-        "/etc/alternatives",
-        "/etc/ca-certificates",
-        "/etc/localtime",
-        "/etc/npmrc",
-        "/etc/pki",
-        "/etc/ssl",
-        str(Path(sys.executable).resolve().parent),
-        str(Path(sys.prefix).resolve()),
-        str(Path(sys.base_prefix).resolve()),
-    }
+    roots = set(TOOLCHAIN_READ_ROOTS)
+    roots.update(DNS_RESOLVER_READ_ROOTS)
+    roots.update(
+        {
+            str(Path(sys.executable).resolve().parent),
+            str(Path(sys.prefix).resolve()),
+            str(Path(sys.base_prefix).resolve()),
+        }
+    )
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        try:
+            resolved_java_home = Path(java_home).expanduser().resolve()
+        except OSError:
+            pass
+        else:
+            roots.add(str(resolved_java_home))
     for item in os.environ.get("PATH", "").split(os.pathsep):
         if not item:
             continue
@@ -3300,9 +3729,7 @@ def guard_allow_roots() -> list[str]:
             resolved = Path(item).resolve()
         except OSError:
             continue
-        if resolved.is_dir() and any(
-            str(resolved).startswith(prefix) for prefix in ("/usr", "/bin", "/sbin", "/lib", "/lib64", str(Path(sys.prefix).resolve()))
-        ):
+        if resolved.is_dir() and is_default_system_path_root(resolved):
             roots.add(str(resolved))
     for item in os.environ.get(f"{ENV_PREFIX}_EXEC_ALLOW_ROOTS", "").split(os.pathsep):
         if not item:
@@ -3690,6 +4117,7 @@ def tool_definition(name: str, *, tool_profile: str = "full") -> dict[str, Any]:
         }
     descriptions = {
         "server_info": "Return server, workspace, auth, profile, and exposed-tool metadata.",
+        "check_exec_environment": "Return lightweight exec_command sandbox and environment status known to the server.",
         "get_default_cwd": "Return the current default cwd inside the workspace.",
         "set_default_cwd": "Set the default cwd for relative tool paths inside the workspace.",
         "read_file": "Read a UTF-8 text file slice inside the configured workspace.",
@@ -3721,6 +4149,7 @@ def tool_definition(name: str, *, tool_profile: str = "full") -> dict[str, Any]:
 def tool_annotations(name: str) -> dict[str, Any]:
     read_only = name in {
         "server_info",
+        "check_exec_environment",
         "get_default_cwd",
         "set_default_cwd",
         "read_file",
@@ -3738,6 +4167,7 @@ def tool_annotations(name: str) -> dict[str, Any]:
     destructive = name in {"apply_patch", "exec_command", "kill_session"}
     idempotent = name in {
         "server_info",
+        "check_exec_environment",
         "get_default_cwd",
         "set_default_cwd",
         "read_file",
@@ -3754,6 +4184,7 @@ def tool_annotations(name: str) -> dict[str, Any]:
     open_world = name == "exec_command"
     titles = {
         "server_info": "Server info",
+        "check_exec_environment": "Check exec environment",
         "get_default_cwd": "Get default cwd",
         "set_default_cwd": "Set default cwd",
         "read_file": "Read file",
@@ -3788,6 +4219,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
     string_array = {"type": "array", "items": {"type": "string"}}
     return {
         "server_info": object_schema(),
+        "check_exec_environment": object_schema(),
         "get_default_cwd": object_schema(),
         "set_default_cwd": object_schema(
             {
@@ -4635,7 +5067,7 @@ def run_http(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.environ.get("CODING_TOOLS_MCP_WORKSPACE") or os.getcwd())
     auth_token = args.auth_token or os.environ.get(f"{ENV_PREFIX}_AUTH_TOKEN") or None
     try:
-        shell_env_policy, allow_network = runtime_policy_from_args(args)
+        runtime_policy = runtime_policy_from_args(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -4689,17 +5121,17 @@ def run_http(args: argparse.Namespace) -> int:
     runtime = Runtime(
         workspace,
         enable_view_image=args.enable_view_image,
-        dangerously_skip_all_permissions=args.dangerously_skip_all_permissions,
-        shell_env_policy=shell_env_policy,
-        allow_network=allow_network,
+        permission_mode=runtime_policy.permission_mode,
+        shell_env_policy=runtime_policy.shell_env_policy,
+        allow_network=runtime_policy.allow_network,
         tool_profile=args.tool_profile,
         auth_token=auth_token,
         oauth_config=oauth_config,
     )
     server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
-    if args.dangerously_skip_all_permissions:
+    if runtime.permission_mode == "dangerous":
         print(
-            "WARNING: --dangerously-skip-all-permissions is enabled; permission-gated operations will be auto-granted.",
+            "WARNING: permission_mode=dangerous disables MCP safety gates. Use only inside an isolated container or VM.",
             file=sys.stderr,
         )
     if oauth_config and runtime.auth_token:
@@ -4725,21 +5157,21 @@ def run_http(args: argparse.Namespace) -> int:
 def run_stdio(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace or os.environ.get("CODING_TOOLS_MCP_WORKSPACE") or os.getcwd())
     try:
-        shell_env_policy, allow_network = runtime_policy_from_args(args)
+        runtime_policy = runtime_policy_from_args(args)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     runtime = Runtime(
         workspace,
         enable_view_image=args.enable_view_image,
-        dangerously_skip_all_permissions=args.dangerously_skip_all_permissions,
-        shell_env_policy=shell_env_policy,
-        allow_network=allow_network,
+        permission_mode=runtime_policy.permission_mode,
+        shell_env_policy=runtime_policy.shell_env_policy,
+        allow_network=runtime_policy.allow_network,
         tool_profile=args.tool_profile,
     )
-    if args.dangerously_skip_all_permissions:
+    if runtime.permission_mode == "dangerous":
         print(
-            "WARNING: --dangerously-skip-all-permissions is enabled; permission-gated operations will be auto-granted.",
+            "WARNING: permission_mode=dangerous disables MCP safety gates. Use only inside an isolated container or VM.",
             file=sys.stderr,
         )
     dispatcher = StdioDispatcher(runtime)
@@ -4854,9 +5286,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--permission-mode",
+        choices=PERMISSION_MODE_CHOICES,
+        default=None,
+        help=(
+            "exec_command permission mode: safe denies network/shell-expansion/inline-script gates; "
+            "trusted allows local development network, shell expansion, and inline scripts; "
+            "dangerous disables permission gates"
+        ),
+    )
+    parser.add_argument(
         "--allow-network",
         action="store_true",
-        help=f"allow network-looking exec_command calls; can also be enabled with {ENV_PREFIX}_ALLOW_NETWORK=1",
+        help=(
+            "compatibility alias: allow network-looking exec_command calls without changing other gates; "
+            f"can also be enabled with {ENV_PREFIX}_ALLOW_NETWORK=1"
+        ),
     )
     parser.add_argument(
         "--enable-view-image",
@@ -4868,8 +5313,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dangerously-skip-all-permissions",
         action="store_true",
         help=(
-            "dangerous: auto-grant permission-gated operations when the MCP client cannot elicit approvals; "
-            "workspace path boundaries still apply"
+            "compatibility alias for --permission-mode dangerous; workspace path boundaries for direct file tools still apply"
         ),
     )
     return parser

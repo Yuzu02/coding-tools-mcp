@@ -88,6 +88,7 @@ class MCPContractTests(ComplianceTestCase):
     def test_tool_annotations_match_mcp_sdk_hint_shape(self) -> None:
         expected = {
             "server_info": (True, False, True, False),
+            "check_exec_environment": (True, False, True, False),
             "get_default_cwd": (True, False, True, False),
             "set_default_cwd": (True, False, True, False),
             "read_file": (True, False, True, False),

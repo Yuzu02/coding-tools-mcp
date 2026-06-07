@@ -1,0 +1,104 @@
+name: docker-smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - scripts/docker-entrypoint.sh
+      - coding_tools_mcp/**
+      - pyproject.toml
+      - .github/workflows/docker-smoke.yml
+
+jobs:
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build sandbox image
+        run: docker build -t coding-tools-mcp-sandbox:smoke .
+
+      - name: Start sandbox
+        run: |
+          docker run -d --rm \
+            --name coding-tools-mcp-smoke \
+            -p 8765:8765 \
+            -e CODING_TOOLS_MCP_AUTH_TOKEN=smoke-token \
+            -v "$PWD:/workspace" \
+            coding-tools-mcp-sandbox:smoke
+
+      - name: Wait for MCP server
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS -H "Authorization: Bearer smoke-token" http://127.0.0.1:8765/mcp >/tmp/mcp-card.json; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs coding-tools-mcp-smoke
+          exit 1
+
+      - name: Smoke HTTP metadata
+        run: |
+          curl -fsS -H "Authorization: Bearer smoke-token" http://127.0.0.1:8765/mcp | python -m json.tool
+
+      - name: Smoke MCP tools
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          url = "http://127.0.0.1:8765/mcp"
+          session_id = None
+          counter = 0
+
+          def rpc(method, params=None):
+              global counter, session_id
+              counter += 1
+              payload = {"jsonrpc": "2.0", "id": counter, "method": method, "params": params or {}}
+              headers = {
+                  "Content-Type": "application/json",
+                  "Accept": "application/json, text/event-stream",
+                  "Authorization": "Bearer smoke-token",
+              }
+              if session_id:
+                  headers["Mcp-Session-Id"] = session_id
+              req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  session_id = response.headers.get("Mcp-Session-Id", session_id)
+                  body = json.loads(response.read().decode())
+              if "error" in body:
+                  raise SystemExit(body)
+              return body["result"]
+
+          rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "docker-smoke", "version": "0"}})
+          tools = rpc("tools/list")
+          names = {tool["name"] for tool in tools["tools"]}
+          assert "exec_command" in names
+          info = rpc("tools/call", {"name": "server_info", "arguments": {}})["structuredContent"]
+          assert info["permission_mode"] == "trusted"
+          for cmd in (
+              "java -version",
+              "javac -version",
+              "mvn -version",
+              "gcc --version",
+              "node --version",
+              "npm --version",
+              "python --version",
+              "go version",
+              "cargo --version",
+              "rustc --version",
+          ):
+              result = rpc("tools/call", {"name": "exec_command", "arguments": {"cmd": cmd, "timeout_ms": 30000, "yield_time_ms": 30000}})["structuredContent"]
+              assert result["status"] == "exited", result
+              assert result["exit_code"] == 0, result
+          PY
+
+      - name: Stop sandbox
+        if: always()
+        run: docker stop coding-tools-mcp-smoke || true

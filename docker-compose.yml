@@ -1,0 +1,11 @@
+services:
+  coding-tools-mcp:
+    build: .
+    image: coding-tools-mcp-sandbox:local
+    ports:
+      - "8765:8765"
+    environment:
+      CODING_TOOLS_MCP_AUTH_TOKEN: dev-token
+      CODING_TOOLS_MCP_PERMISSION_MODE: trusted
+    volumes:
+      - .:/workspace
