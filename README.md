@@ -72,21 +72,31 @@ uvx coding-tools-mcp --stdio --workspace /path/to/repo
 If you are working from this checkout instead of a published package:
 
 ```bash
-cd /root/coding-tools-mcp
-python -m pip install -e ".[dev]"
-coding-tools-mcp --workspace /path/to/repo --host 127.0.0.1 --port 8765
+make start
 ```
 
-Install the optional image extra when you want `view_image` auto-resize support:
+Pass a different workspace, host, port, or extra server flags with Make variables:
 
 ```bash
-python -m pip install -e ".[image]"
+make start MCP_WORKSPACE=/path/to/repo MCP_PORT=8000 MCP_ARGS="--permission-mode trusted"
+```
+
+If dependencies are missing, install the runtime in editable mode:
+
+```bash
+python -m pip install -e ".[dev]"
 ```
 
 HTTP endpoint:
 
 ```text
 http://127.0.0.1:8765/mcp
+```
+
+Install the optional image extra when you want `view_image` auto-resize support:
+
+```bash
+python -m pip install -e ".[image]"
 ```
 
 Stdio:

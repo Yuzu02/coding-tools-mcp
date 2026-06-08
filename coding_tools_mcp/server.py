@@ -1002,7 +1002,12 @@ class Workspace:
         self.root = root.expanduser().resolve(strict=True)
         if not self.root.is_dir():
             raise ToolFailure("INVALID_ARGUMENT", "Workspace root must be a directory.", category="validation")
-        if str(self.root) in {"/", str(Path.home().resolve())}:
+        unsafe_roots = {"/"}
+        try:
+            unsafe_roots.add(str(Path.home().resolve()))
+        except RuntimeError:
+            pass
+        if str(self.root) in unsafe_roots:
             raise ToolFailure("INVALID_ARGUMENT", "Unsafe workspace root rejected.", category="security")
 
     def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
@@ -2520,13 +2525,17 @@ class Runtime:
             wait_until = time.time() + (int(args.get("wait_ms", 5000)) / 1000.0)
             while time.time() < wait_until and session.process.poll() is None:
                 time.sleep(0.02)
-            killed = True
-            status = "terminated" if session.process.poll() is not None else "terminated"
+            killed = session.process.poll() is not None
+            status = "terminated" if killed else "timeout"
         else:
             killed = False
             status = "exited"
         payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
         payload.update({"killed": killed, "status": status})
+        if status == "timeout":
+            warnings = list(payload.get("warnings", []))
+            warnings.append("Process did not exit after best-effort termination; session evicted.")
+            payload["warnings"] = warnings
         with self.sessions_lock:
             self.sessions.pop(session_id, None)
         return payload

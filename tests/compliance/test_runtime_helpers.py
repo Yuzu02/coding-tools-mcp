@@ -93,6 +93,30 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertIn("--permission-mode", result.stdout)
         self.assertIn("--allow-network", result.stdout)
 
+    def test_workspace_init_tolerates_missing_home_lookup(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with patch.object(server_module.Path, "home", side_effect=RuntimeError("home unavailable")):
+                runtime = Runtime(Path(tmp))
+
+        self.assertEqual(runtime.workspace.root, Path(tmp).resolve())
+
+    def test_kill_session_timeout_evicts_unresponsive_session(self) -> None:
+        class StillRunningProcess:
+            def poll(self) -> None:
+                return None
+
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp))
+            session = runtime._make_session(StillRunningProcess())  # type: ignore[arg-type]
+            runtime.sessions[session.session_id] = session
+            with patch.object(runtime, "_terminate_process_group", return_value=None):
+                result = runtime.kill_session({"session_id": session.session_id, "wait_ms": 0})
+
+        self.assertFalse(result.get("killed"), result)
+        self.assertEqual(result.get("status"), "timeout", result)
+        self.assertNotIn(session.session_id, runtime.sessions)
+        self.assertTrue(any("session evicted" in warning for warning in result.get("warnings", [])), result)
+
     def test_command_policy_gates_inline_interpreter_code(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp))
