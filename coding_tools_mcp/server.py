@@ -187,6 +187,10 @@ TOOLCHAIN_READ_ROOTS = (
     "/etc/npmrc",
     "/usr/local/sdkman/candidates",
 )
+GIT_READ_ROOTS = (
+    "/etc/gitconfig",
+    "/etc/gitconfig.d",
+)
 SYSTEM_PATH_ROOT_PREFIXES = (
     "/bin",
     "/sbin",
@@ -342,6 +346,12 @@ def parse_shell_env_set(value: str | None) -> dict[str, str]:
 
 def truthy_env(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def trusted_tmp_root() -> Path:
+    if os.name == "nt":
+        return Path(tempfile.gettempdir())
+    return Path("/tmp")
 
 
 def shell_env_policy_from_args(args: argparse.Namespace) -> ShellEnvPolicy:
@@ -907,7 +917,22 @@ def exec_output_diagnostics(payload: dict[str, Any]) -> list[dict[str, str]]:
                 suggested_next_command="printf ok > \"$TMPDIR/coding-tools-write-test\"",
             )
         )
-    if re.search(r"\bhome\b", lower) and ("permission denied" in lower or "not writable" in lower or "cannot write" in lower):
+    home_error_terms = ("permission denied", "not writable", "cannot write", "eacces")
+    home_path_error = any(
+        re.search(r"(?:\.coding-tools/home|/home(?:/|[\"'\s]|$))", line)
+        and any(term in line for term in home_error_terms)
+        for line in lower.splitlines()
+    )
+    home_error = (
+        "$home" in lower
+        or "home=" in lower
+        or re.search(r"\bhome directory\b", lower)
+        or "cannot write to home" in lower
+        or re.search(r"not writable:\s+\S*home", lower)
+        or re.search(r"permission denied:\s+\S*home", lower)
+        or home_path_error
+    )
+    if home_error and any(term in lower for term in home_error_terms):
         diagnostics.append(
             diagnostic(
                 "HOME_NOT_WRITABLE",
@@ -1290,7 +1315,7 @@ class Runtime:
         self.workspace_home_dir = self.coding_tools_dir / "home"
         self.workspace_tmp_dir = self.coding_tools_dir / "tmp"
         self.cache_dir = self.coding_tools_dir / "cache"
-        self.trusted_tmp_dir = Path(tempfile.gettempdir()) / f"coding-tools-{self.server_instance_id}"
+        self.trusted_tmp_dir = trusted_tmp_root() / f"coding-tools-{self.server_instance_id}"
         self._pending_codes: dict[str, dict[str, Any]] = {}
         self._pending_codes_lock = threading.Lock()
         self.default_cwd = self.workspace.root
@@ -3706,6 +3731,7 @@ def is_default_system_path_root(path: Path) -> bool:
 
 def guard_allow_roots() -> list[str]:
     roots = set(TOOLCHAIN_READ_ROOTS)
+    roots.update(GIT_READ_ROOTS)
     roots.update(DNS_RESOLVER_READ_ROOTS)
     roots.update(
         {

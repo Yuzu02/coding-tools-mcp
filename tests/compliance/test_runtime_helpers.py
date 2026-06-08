@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -22,6 +23,7 @@ from coding_tools_mcp.server import (
     permission_failure_diagnostics,
     truncate_text_head,
     truncate_text_tail,
+    trusted_tmp_root,
 )
 
 
@@ -265,6 +267,7 @@ class RuntimeHelperTests(unittest.TestCase):
             trusted._check_command_policy("curl https://example.com", {})
             self.assertEqual(trusted.global_tmp_write_policy(), "tmp-prefix")
             self.assertTrue(str(trusted.command_tmp_dir()).startswith("/tmp/coding-tools-"))
+            self.assertEqual(trusted.command_tmp_dir().parent, trusted_tmp_root())
             with self.assertRaises(ToolFailure):
                 trusted._check_command_policy("git reset --hard", {})
 
@@ -317,6 +320,18 @@ class RuntimeHelperTests(unittest.TestCase):
 
             self.assertEqual(env.get("OPENAI_API_KEY"), "sk-test-secret-value")
             self.assertEqual(env.get("LD_PRELOAD"), "/tmp/injected.so")
+
+    def test_trusted_tmp_root_stays_posix_tmp_when_process_tmpdir_is_workspace_local(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX /tmp semantics do not apply on Windows")
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            drifted_tmp = workspace / ".coding-tools" / "tmp"
+            drifted_tmp.mkdir(parents=True)
+            with patch.dict(server_module.os.environ, {"TMPDIR": str(drifted_tmp)}, clear=True):
+                runtime = Runtime(workspace, permission_mode="trusted")
+            self.assertEqual(runtime.command_tmp_dir().parent, Path("/tmp"))
+            self.assertTrue(str(runtime.command_tmp_dir()).startswith("/tmp/coding-tools-"))
 
     def test_command_env_include_exclude_and_set_are_applied_in_order(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -537,9 +552,35 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertIn("/etc/hosts", roots)
         self.assertIn("/usr", roots)
         self.assertIn("/usr/local/sdkman/candidates", roots)
+        self.assertIn("/etc/gitconfig", roots)
+        self.assertIn("/etc/gitconfig.d", roots)
         self.assertIn(str(java_home.resolve()), roots)
         self.assertIn(str(explicit_root.resolve()), roots)
         self.assertNotIn(str(private_path_dir.resolve()), roots)
+
+    def test_safe_exec_git_init_and_local_config_reads_system_git_config_roots(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not available")
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(workspace)
+            with patch.dict(server_module.os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True):
+                self.assertNotIn("GIT_CONFIG_NOSYSTEM", runtime._command_env({}))
+                result = runtime.exec_command(
+                    {
+                        "cmd": (
+                            "git init -q tmp-git-repo && "
+                            "git -C tmp-git-repo config user.email test@example.invalid && "
+                            "git -C tmp-git-repo config user.name Test"
+                        ),
+                        "timeout_ms": 10000,
+                        "yield_time_ms": 30000,
+                        "max_output_bytes": 20000,
+                    }
+                )
+        self.assertEqual(result.get("status"), "exited", result)
+        self.assertEqual(result.get("exit_code"), 0, result)
+        self.assertNotIn("unable to access '/etc/gitconfig'", str(result.get("stderr", "")))
 
     def test_exec_diagnostics_classify_common_failures(self) -> None:
         self.assertEqual(
@@ -558,6 +599,20 @@ class RuntimeHelperTests(unittest.TestCase):
             exec_output_diagnostics({"truncated": True})[0]["code"],
             "OUTPUT_TRUNCATED",
         )
+
+    def test_exec_diagnostics_do_not_treat_maven_home_as_unwritable_home(self) -> None:
+        output = """warning: unable to access '/etc/gitconfig': Permission denied
+fatal: unknown error occurred while reading the configuration files
+Maven home: /usr/share/maven
+"""
+        codes = [item["code"] for item in exec_output_diagnostics({"stderr": output})]
+        self.assertIn("LANDLOCK_READ_ROOT_BLOCKED", codes)
+        self.assertNotIn("HOME_NOT_WRITABLE", codes)
+
+    def test_exec_diagnostics_treat_eacces_home_path_as_unwritable_home(self) -> None:
+        output = "Error: EACCES: permission denied, mkdir '/work/.coding-tools/home/.cache'"
+        codes = [item["code"] for item in exec_output_diagnostics({"stderr": output})]
+        self.assertIn("HOME_NOT_WRITABLE", codes)
 
     def test_permission_failure_diagnostics_classify_policy_gates(self) -> None:
         cases = [
