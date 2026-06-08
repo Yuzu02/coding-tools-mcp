@@ -161,7 +161,7 @@ ENV_FLAG_OPTIONS = {
 NETWORK_LITERAL_COMMANDS = {"echo", "printf", "grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc"}
 INLINE_SCRIPT_PERMISSION = "inline_script"
 ENV_PREFIX = "CODING_TOOLS_MCP"
-CODING_TOOLS_DIR_NAME = ".coding-tools"
+RUNTIME_ROOT_DIR_NAME = "coding-tools-mcp"
 SPECIAL_DEVICE_PATHS = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom")
 DNS_RESOLVER_READ_ROOTS = (
     "/etc/resolv.conf",
@@ -348,10 +348,19 @@ def truthy_env(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def trusted_tmp_root() -> Path:
+def runtime_parent_root() -> Path:
     if os.name == "nt":
-        return Path(tempfile.gettempdir())
-    return Path("/tmp")
+        return Path(tempfile.gettempdir()) / RUNTIME_ROOT_DIR_NAME
+    return Path("/tmp") / RUNTIME_ROOT_DIR_NAME
+
+
+def workspace_runtime_hash(workspace: Path) -> str:
+    resolved = workspace.expanduser().resolve(strict=False)
+    return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+
+
+def runtime_dir_for_workspace(workspace: Path, instance_id: str) -> Path:
+    return runtime_parent_root() / workspace_runtime_hash(workspace) / instance_id
 
 
 def shell_env_policy_from_args(args: argparse.Namespace) -> ShellEnvPolicy:
@@ -1311,11 +1320,10 @@ class Runtime:
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
         self.server_instance_id = secrets.token_urlsafe(12)
-        self.coding_tools_dir = self.workspace.root / CODING_TOOLS_DIR_NAME
-        self.workspace_home_dir = self.coding_tools_dir / "home"
-        self.workspace_tmp_dir = self.coding_tools_dir / "tmp"
-        self.cache_dir = self.coding_tools_dir / "cache"
-        self.trusted_tmp_dir = trusted_tmp_root() / f"coding-tools-{self.server_instance_id}"
+        self.runtime_dir = runtime_dir_for_workspace(self.workspace.root, self.server_instance_id)
+        self.home_dir = self.runtime_dir / "home"
+        self.tmp_dir = self.runtime_dir / "tmp"
+        self.cache_dir = self.runtime_dir / "cache"
         self._pending_codes: dict[str, dict[str, Any]] = {}
         self._pending_codes_lock = threading.Lock()
         self.default_cwd = self.workspace.root
@@ -1327,16 +1335,25 @@ class Runtime:
         self.logging_level = "warning"
 
     def _ensure_runtime_dirs(self) -> None:
-        for path in (self.workspace_home_dir, self.workspace_tmp_dir, self.cache_dir):
-            path.mkdir(parents=True, exist_ok=True)
-        if self.permission_mode == "trusted":
-            self.trusted_tmp_dir.mkdir(parents=True, exist_ok=True)
+        for path in (
+            self.runtime_dir.parent,
+            self.runtime_dir,
+            self.home_dir,
+            self.tmp_dir,
+            self.cache_dir,
+        ):
+            path.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if os.name != "nt":
+                try:
+                    path.chmod(0o700)
+                except OSError:
+                    pass
 
     def command_home_dir(self) -> Path:
-        return self.workspace_home_dir
+        return self.home_dir
 
     def command_tmp_dir(self) -> Path:
-        return self.trusted_tmp_dir if self.permission_mode == "trusted" else self.workspace_tmp_dir
+        return self.tmp_dir
 
     def global_tmp_write_policy(self) -> str:
         if self.permission_mode == "dangerous":
@@ -1358,16 +1375,16 @@ class Runtime:
         return self.permission_mode != "dangerous"
 
     def landlock_write_roots(self) -> list[Path]:
-        return [self.trusted_tmp_dir] if self.permission_mode == "trusted" else []
+        return [self.runtime_dir]
 
     def is_allowed_command_tmp_path(self, candidate: str) -> bool:
-        if self.permission_mode != "trusted":
+        if self.permission_mode not in {"safe", "trusted"}:
             return False
         try:
             resolved = Path(candidate).expanduser().resolve(strict=False)
         except OSError:
             return False
-        return is_relative_to(resolved, self.trusted_tmp_dir)
+        return is_relative_to(resolved, self.runtime_dir)
 
     def initialize(self) -> dict[str, Any]:
         return {
@@ -1424,10 +1441,9 @@ class Runtime:
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
             "network_allowed": self.allow_network,
+            "runtime_dir": str(self.runtime_dir),
             "home": normalize_rel_display(self.command_home_dir(), self.workspace.root),
-            "tmpdir": normalize_rel_display(self.command_tmp_dir(), self.workspace.root)
-            if is_relative_to(self.command_tmp_dir(), self.workspace.root)
-            else str(self.command_tmp_dir()),
+            "tmpdir": normalize_rel_display(self.command_tmp_dir(), self.workspace.root),
             "cache_dir": normalize_rel_display(self.cache_dir, self.workspace.root),
             "landlock": landlock,
             "exec_policy": {
@@ -1553,10 +1569,9 @@ class Runtime:
             "workspace": str(self.workspace.root),
             "permission_mode": self.permission_mode,
             "network_allowed": self.allow_network,
+            "runtime_dir": str(self.runtime_dir),
             "home": normalize_rel_display(self.command_home_dir(), self.workspace.root),
-            "tmpdir": normalize_rel_display(self.command_tmp_dir(), self.workspace.root)
-            if is_relative_to(self.command_tmp_dir(), self.workspace.root)
-            else str(self.command_tmp_dir()),
+            "tmpdir": normalize_rel_display(self.command_tmp_dir(), self.workspace.root),
             "cache_dir": normalize_rel_display(self.cache_dir, self.workspace.root),
             "landlock_enabled": bool(landlock.get("available")) and self.landlock_enabled(),
             "landlock_abi": landlock.get("abi_version"),

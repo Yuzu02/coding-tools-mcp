@@ -21,9 +21,9 @@ For production, expose the server only to trusted local clients, bind HTTP to lo
 Commands run with:
 
 - Workspace-bound cwd.
-- Configurable shell environment inheritance with controlled `HOME`, `TMPDIR`, and `.coding-tools/cache`.
+- Configurable shell environment inheritance with controlled external `HOME`, `TMPDIR`, and `cache_dir`.
 - Process group isolation for timeout and kill.
-- Best-effort Linux Landlock rules, when available, that allow workspace access and read/execute access to interpreter/runtime roots.
+- Best-effort Linux Landlock rules, when available, that allow workspace access, exact runtime-directory writes, and read/execute access to interpreter/runtime roots.
 - Optional operator-supplied read/execute roots from `CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS` for toolchains installed outside standard system prefixes.
 - Policy denial for network-looking commands, destructive commands, shell expansion, inline interpreter/shell snippets, setuid/setgid executables, and outside-workspace path arguments.
 
@@ -59,8 +59,8 @@ Risky capabilities return structured permission-required or unsupported response
 
 Operators should choose one of three permission modes:
 
-- `safe`: default mode. Workspace writes are allowed, system toolchain roots are read-only, `HOME` and `TMPDIR` point under `.coding-tools`, network-looking commands are denied, shell expansion and inline scripts are denied, secrets and loader/startup env are filtered, and Landlock is enabled when available.
-- `trusted`: local development mode. It allows network-looking commands, shell expansion, inline scripts, and writes under `/tmp/coding-tools-*`, while still filtering secrets and blocking destructive commands and host-root writes.
+- `safe`: default mode. Workspace writes are allowed, system toolchain roots are read-only, `HOME`, `TMPDIR`, and `cache_dir` point under an external server-owned runtime directory, network-looking commands are denied, shell expansion and inline scripts are denied, secrets and loader/startup env are filtered, and Landlock is enabled when available.
+- `trusted`: local development mode. It allows network-looking commands, shell expansion, and inline scripts while still filtering secrets and blocking destructive commands and host-root writes. Runtime writes are scoped to the exact external runtime directory, not global `/tmp`.
 - `dangerous`: disables `exec_command` permission gates and Landlock. Use only inside an isolated container or VM. Workspace path boundaries for direct file and patch tools still apply.
 
 `--allow-network` remains a compatibility flag to open only the network-looking command gate. `--dangerously-skip-all-permissions` remains a compatibility alias for dangerous mode.
