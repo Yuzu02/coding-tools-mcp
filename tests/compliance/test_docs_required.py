@@ -109,3 +109,14 @@ class RequiredDocsTests(unittest.TestCase):
         for needle in ("docker build", "tools/list", "server_info", "exec_command"):
             with self.subTest(workflow="docker-smoke", needle=needle):
                 self.assertIn(needle, docker_smoke)
+
+        entrypoint = (ROOT / "scripts/docker-entrypoint.sh").read_text(encoding="utf-8")
+        for needle in (
+            "CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS",
+            "/etc/java-17-openjdk",
+            "/etc/maven",
+            "/usr/share/maven",
+            "/usr/lib/jvm/java-17-openjdk-amd64",
+        ):
+            with self.subTest(workflow="docker-entrypoint", needle=needle):
+                self.assertIn(needle, entrypoint)

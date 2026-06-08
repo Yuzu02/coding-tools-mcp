@@ -7,6 +7,9 @@ PORT="${CODING_TOOLS_MCP_PORT:-8765}"
 MODE="${CODING_TOOLS_MCP_PERMISSION_MODE:-trusted}"
 OAUTH_MODE="${CODING_TOOLS_MCP_OAUTH_MODE:-0}"
 
+: "${CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS:=/etc/java-17-openjdk:/etc/maven:/usr/share/maven:/usr/lib/jvm/java-17-openjdk-amd64}"
+export CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS
+
 if [ "$MODE" = "dangerous" ]; then
   {
     echo "WARNING: permission_mode=dangerous disables MCP safety gates."

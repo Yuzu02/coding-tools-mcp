@@ -4,7 +4,7 @@ PYTHON_SOURCES := coding_tools_mcp tests benchmarks
 MYPY_TARGETS := coding_tools_mcp benchmarks/mcp_http.py benchmarks/runtime_latency.py benchmarks/swebench/run_smoke.py benchmarks/swebench/generate_reference_predictions.py benchmarks/real_workloads.py
 REPORT_FLAG ?= --report
 SWE_BENCH_ARGS ?=
-DOGFOOD_PORT ?= 8765
+DOGFOOD_PORT ?= 18772
 RUFF_FLAGS ?= --exclude benchmarks/dogfood --ignore=E501
 MYPY_FLAGS ?= --python-version 3.11 --disable-error-code union-attr --disable-error-code assignment --disable-error-code arg-type --disable-error-code no-untyped-def
 

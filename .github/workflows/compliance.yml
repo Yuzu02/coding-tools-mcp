@@ -47,7 +47,7 @@ jobs:
         run: make test-schema-drift
 
       - name: Run dogfood smoke
-        run: make dogfood-smoke DOGFOOD_PORT=8765
+        run: make dogfood-smoke DOGFOOD_PORT=18772
 
       - name: Run latency benchmark
         run: make benchmark-latency
