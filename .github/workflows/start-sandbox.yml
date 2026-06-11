@@ -11,8 +11,8 @@ on:
       port:
         description: Local MCP port exposed on the GitHub Actions runner.
         required: false
-        type: number
-        default: 8765
+        type: string
+        default: "8765"
       permission_mode:
         description: coding-tools-mcp permission mode.
         required: false
@@ -28,11 +28,11 @@ on:
         required: false
         type: boolean
         default: true
-      timeout_minutes:
-        description: Maximum sandbox lifetime.
+      duration_minutes:
+        description: How long to keep the sandbox alive. GitHub-hosted runners stop after 6 hours.
         required: false
-        type: number
-        default: 120
+        type: string
+        default: "120"
   workflow_dispatch:
     inputs:
       image:
@@ -43,8 +43,8 @@ on:
       port:
         description: Local MCP port exposed on the GitHub Actions runner.
         required: true
-        type: number
-        default: 8765
+        type: string
+        default: "8765"
       permission_mode:
         description: coding-tools-mcp permission mode.
         required: true
@@ -68,11 +68,11 @@ on:
         required: true
         type: boolean
         default: true
-      timeout_minutes:
-        description: Maximum sandbox lifetime.
+      duration_minutes:
+        description: How long to keep the sandbox alive. GitHub-hosted runners stop after 6 hours.
         required: true
-        type: number
-        default: 120
+        type: string
+        default: "120"
 
 permissions:
   contents: write
@@ -86,7 +86,10 @@ jobs:
   sandbox:
     name: Start coding-tools-mcp sandbox
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ inputs.timeout_minutes }}
+    timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
+    env:
+      MCP_PORT: ${{ inputs.port }}
+
     steps:
       - name: Check out caller repository
         if: ${{ inputs.checkout_repository }}
@@ -94,48 +97,67 @@ jobs:
         with:
           persist-credentials: true
 
-      - name: Install cloudflared
-        run: |
-          set -euo pipefail
-          sudo curl -fsSL \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /usr/local/bin/cloudflared
-          sudo chmod +x /usr/local/bin/cloudflared
-          cloudflared --version
-
-      - name: Prepare sandbox credentials
-        id: credentials
+      - name: Resolve sandbox settings
+        id: settings
         shell: bash
         run: |
           set -euo pipefail
-          token="$(python3 - <<'PY'
-          import secrets
-          print(secrets.token_urlsafe(32))
-          PY
-          )"
+
+          duration="${{ inputs.duration_minutes }}"
+          if ! [[ "$duration" =~ ^[0-9]+$ ]]; then
+            echo "duration_minutes must be an integer" >&2
+            exit 1
+          fi
+          if (( duration < 5 || duration > 330 )); then
+            echo "duration_minutes must be between 5 and 330" >&2
+            exit 1
+          fi
+
+          port="${{ inputs.port }}"
+          if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo "port must be an integer" >&2
+            exit 1
+          fi
+          if (( port < 1 || port > 65535 )); then
+            echo "port must be between 1 and 65535" >&2
+            exit 1
+          fi
+
+          token="$(openssl rand -hex 32)"
           git_config="$RUNNER_TEMP/coding-tools-mcp-gitconfig"
           {
             echo '[safe]'
             echo 'directory = /workspace'
           } > "$git_config"
-          echo "mcp_token=$token" >> "$GITHUB_OUTPUT"
-          echo "git_config=$git_config" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "duration=$duration"
+            echo "port=$port"
+            echo "mcp_token=$token"
+            echo "git_config=$git_config"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Start coding-tools-mcp container
         env:
           IMAGE: ${{ inputs.image }}
-          MCP_PORT: ${{ inputs.port }}
-          MCP_TOKEN: ${{ steps.credentials.outputs.mcp_token }}
+          MCP_PORT: ${{ steps.settings.outputs.port }}
+          MCP_TOKEN: ${{ steps.settings.outputs.mcp_token }}
           PERMISSION_MODE: ${{ inputs.permission_mode }}
           TOOL_PROFILE: ${{ inputs.tool_profile }}
-          GIT_CONFIG: ${{ steps.credentials.outputs.git_config }}
+          GIT_CONFIG: ${{ steps.settings.outputs.git_config }}
+        shell: bash
         run: |
           set -euo pipefail
+
           docker pull "$IMAGE"
           docker rm -f coding-tools-mcp-sandbox >/dev/null 2>&1 || true
+
           shell_env_set='{"CARGO_HOME":"/usr/local/cargo","RUSTUP_HOME":"/usr/local/rustup","GIT_CONFIG_GLOBAL":"/etc/coding-tools-mcp/gitconfig"}'
           docker run -d --rm \
             --name coding-tools-mcp-sandbox \
+            --cpus "2" \
+            --memory "4g" \
+            --pids-limit "512" \
             -p "127.0.0.1:${MCP_PORT}:${MCP_PORT}" \
             -e CODING_TOOLS_MCP_PORT="$MCP_PORT" \
             -e CODING_TOOLS_MCP_AUTH_TOKEN="$MCP_TOKEN" \
@@ -147,52 +169,111 @@ jobs:
             -v "$GIT_CONFIG:/etc/coding-tools-mcp/gitconfig:ro" \
             "$IMAGE"
 
-      - name: Wait for MCP server
-        env:
-          MCP_PORT: ${{ inputs.port }}
-          MCP_TOKEN: ${{ steps.credentials.outputs.mcp_token }}
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 60); do
+          for _ in {1..60}; do
             if curl -fsS \
               -H "Authorization: Bearer $MCP_TOKEN" \
               "http://127.0.0.1:$MCP_PORT/mcp" >/tmp/coding-tools-mcp-card.json; then
               python3 -m json.tool /tmp/coding-tools-mcp-card.json
               exit 0
             fi
-            sleep 1
+            sleep 2
           done
-          docker logs coding-tools-mcp-sandbox || true
+
+          docker logs coding-tools-mcp-sandbox
           exit 1
 
-      - name: Print connection details
+      - name: Start Cloudflare quick tunnel
+        id: tunnel
         env:
-          MCP_PORT: ${{ inputs.port }}
-          MCP_TOKEN: ${{ steps.credentials.outputs.mcp_token }}
+          MCP_PORT: ${{ steps.settings.outputs.port }}
+          MCP_TOKEN: ${{ steps.settings.outputs.mcp_token }}
+          SESSION_DURATION: ${{ steps.settings.outputs.duration }}
           PERMISSION_MODE: ${{ inputs.permission_mode }}
           TOOL_PROFILE: ${{ inputs.tool_profile }}
-        run: |
-          cat <<EOF
-          coding-tools-mcp sandbox is ready.
-
-          Local runner endpoint: http://127.0.0.1:$MCP_PORT/mcp
-          Public tunnel endpoint: use the HTTPS hostname printed by cloudflared below, plus /mcp
-          Header: Authorization: Bearer $MCP_TOKEN
-          Permission mode: $PERMISSION_MODE
-          Tool profile: $TOOL_PROFILE
-
-          To push to the caller repository, the caller workflow must grant contents: write.
-          actions/checkout persisted the caller repository credential when checkout_repository=true.
-          Keep this job running while your MCP client is connected; cancel the workflow to tear it down.
-          EOF
-
-      - name: Open cloudflared tunnel
-        env:
-          MCP_PORT: ${{ inputs.port }}
+        shell: bash
         run: |
           set -euo pipefail
-          cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$MCP_PORT"
+
+          docker rm -f coding-tools-mcp-cloudflared >/dev/null 2>&1 || true
+          docker run -d \
+            --name coding-tools-mcp-cloudflared \
+            --network host \
+            cloudflare/cloudflared:latest \
+            tunnel --no-autoupdate --url "http://127.0.0.1:${MCP_PORT}"
+
+          for _ in {1..60}; do
+            docker logs coding-tools-mcp-cloudflared > cloudflared.log 2>&1 || true
+            tunnel_url="$(grep -Eo 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)"
+
+            if [[ -n "$tunnel_url" ]]; then
+              mcp_url="${tunnel_url}/mcp"
+              echo "url=$mcp_url" >> "$GITHUB_OUTPUT"
+              {
+                echo "## coding-tools-mcp sandbox"
+                echo ""
+                echo "- MCP URL: $mcp_url"
+                echo "- Authorization header: \`Bearer $MCP_TOKEN\`"
+                echo "- Permission mode: $PERMISSION_MODE"
+                echo "- Tool profile: $TOOL_PROFILE"
+                echo "- Expires after: $SESSION_DURATION minutes"
+                echo ""
+                echo "Keep this workflow run open while the sandbox is active."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          cat cloudflared.log
+          exit 1
+
+      - name: Print sandbox connection details
+        env:
+          MCP_URL: ${{ steps.tunnel.outputs.url }}
+          MCP_TOKEN: ${{ steps.settings.outputs.mcp_token }}
+          SESSION_DURATION: ${{ steps.settings.outputs.duration }}
+          PERMISSION_MODE: ${{ inputs.permission_mode }}
+          TOOL_PROFILE: ${{ inputs.tool_profile }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "MCP URL: $MCP_URL"
+          echo "Authorization header: Bearer $MCP_TOKEN"
+          echo "Permission mode: $PERMISSION_MODE"
+          echo "Tool profile: $TOOL_PROFILE"
+          echo "Sandbox expires after: $SESSION_DURATION minutes"
+          echo "::notice title=coding-tools-mcp sandbox::URL: $MCP_URL | Header: Authorization: Bearer $MCP_TOKEN | Expires after: $SESSION_DURATION minutes"
+
+      - name: Keep sandbox alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "coding-tools-mcp sandbox is live: ${{ steps.tunnel.outputs.url }}"
+          echo "The job will sleep for ${{ steps.settings.outputs.duration }} minutes."
+          sleep "$(( ${{ steps.settings.outputs.duration }} * 60 ))"
+
+      - name: Collect sandbox artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -u
+
+          mkdir -p artifacts
+          docker logs coding-tools-mcp-sandbox > artifacts/coding-tools-mcp.log 2>&1 || true
+          docker logs coding-tools-mcp-cloudflared > artifacts/cloudflared.log 2>&1 || true
+
+      - name: Upload sandbox artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coding-tools-mcp-sandbox-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: ignore
 
       - name: Stop sandbox
         if: always()
-        run: docker rm -f coding-tools-mcp-sandbox >/dev/null 2>&1 || true
+        run: |
+          docker rm -f coding-tools-mcp-cloudflared >/dev/null 2>&1 || true
+          docker rm -f coding-tools-mcp-sandbox >/dev/null 2>&1 || true
