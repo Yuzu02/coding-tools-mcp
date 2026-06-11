@@ -33,6 +33,11 @@ on:
         required: false
         type: string
         default: "120"
+      auth_token:
+        description: Optional MCP bearer token. Leave blank to generate one.
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       image:
@@ -73,6 +78,11 @@ on:
         required: true
         type: string
         default: "120"
+      auth_token:
+        description: Optional MCP bearer token. Leave blank to generate one.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -123,7 +133,16 @@ jobs:
             exit 1
           fi
 
-          token="$(openssl rand -hex 32)"
+          token="${{ inputs.auth_token }}"
+          if [[ -z "$token" ]]; then
+            token="$(openssl rand -hex 32)"
+          elif ! [[ "$token" =~ ^[A-Za-z0-9._@+-]{16,256}$ ]]; then
+            echo "auth_token must be 16-256 chars and only use A-Z, a-z, 0-9, dot, underscore, at, plus, or dash" >&2
+            exit 1
+          fi
+          token_file="$RUNNER_TEMP/coding-tools-mcp-token"
+          printf '%s' "$token" > "$token_file"
+
           git_config="$RUNNER_TEMP/coding-tools-mcp-gitconfig"
           {
             echo '[safe]'
@@ -133,7 +152,7 @@ jobs:
           {
             echo "duration=$duration"
             echo "port=$port"
-            echo "mcp_token=$token"
+            echo "token_file=$token_file"
             echo "git_config=$git_config"
           } >> "$GITHUB_OUTPUT"
 
@@ -141,7 +160,7 @@ jobs:
         env:
           IMAGE: ${{ inputs.image }}
           MCP_PORT: ${{ steps.settings.outputs.port }}
-          MCP_TOKEN: ${{ steps.settings.outputs.mcp_token }}
+          MCP_TOKEN_FILE: ${{ steps.settings.outputs.token_file }}
           PERMISSION_MODE: ${{ inputs.permission_mode }}
           TOOL_PROFILE: ${{ inputs.tool_profile }}
           GIT_CONFIG: ${{ steps.settings.outputs.git_config }}
@@ -151,6 +170,7 @@ jobs:
 
           docker pull "$IMAGE"
           docker rm -f coding-tools-mcp-sandbox >/dev/null 2>&1 || true
+          MCP_TOKEN="$(cat "$MCP_TOKEN_FILE")"
 
           shell_env_set='{"CARGO_HOME":"/usr/local/cargo","RUSTUP_HOME":"/usr/local/rustup","GIT_CONFIG_GLOBAL":"/etc/coding-tools-mcp/gitconfig"}'
           docker run -d --rm \
@@ -186,13 +206,14 @@ jobs:
         id: tunnel
         env:
           MCP_PORT: ${{ steps.settings.outputs.port }}
-          MCP_TOKEN: ${{ steps.settings.outputs.mcp_token }}
+          MCP_TOKEN_FILE: ${{ steps.settings.outputs.token_file }}
           SESSION_DURATION: ${{ steps.settings.outputs.duration }}
           PERMISSION_MODE: ${{ inputs.permission_mode }}
           TOOL_PROFILE: ${{ inputs.tool_profile }}
         shell: bash
         run: |
           set -euo pipefail
+          MCP_TOKEN="$(cat "$MCP_TOKEN_FILE")"
 
           docker rm -f coding-tools-mcp-cloudflared >/dev/null 2>&1 || true
           docker run -d \
@@ -231,13 +252,14 @@ jobs:
       - name: Print sandbox connection details
         env:
           MCP_URL: ${{ steps.tunnel.outputs.url }}
-          MCP_TOKEN: ${{ steps.settings.outputs.mcp_token }}
+          MCP_TOKEN_FILE: ${{ steps.settings.outputs.token_file }}
           SESSION_DURATION: ${{ steps.settings.outputs.duration }}
           PERMISSION_MODE: ${{ inputs.permission_mode }}
           TOOL_PROFILE: ${{ inputs.tool_profile }}
         shell: bash
         run: |
           set -euo pipefail
+          MCP_TOKEN="$(cat "$MCP_TOKEN_FILE")"
 
           echo "MCP URL: $MCP_URL"
           echo "Authorization header: Bearer $MCP_TOKEN"
