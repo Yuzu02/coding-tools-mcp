@@ -32,7 +32,7 @@ class RequiredDocsTests(unittest.TestCase):
             "Dockerfile",
             ".dockerignore",
             "docker-compose.yml",
-            "scripts/docker-entrypoint.sh",
+            "scripts/mcp_smoke.py",
             ".devcontainer/devcontainer.json",
         ]
         missing = [path for path in required_paths if not (ROOT / path).is_file()]
@@ -106,17 +106,22 @@ class RequiredDocsTests(unittest.TestCase):
                 self.assertIn(needle, docker_image)
 
         docker_smoke = (ROOT / ".github/workflows/docker-smoke.yml").read_text(encoding="utf-8")
-        for needle in ("docker build", "tools/list", "server_info", "exec_command"):
+        for needle in ("docker build", "scripts/mcp_smoke.py"):
             with self.subTest(workflow="docker-smoke", needle=needle):
                 self.assertIn(needle, docker_smoke)
 
-        entrypoint = (ROOT / "scripts/docker-entrypoint.sh").read_text(encoding="utf-8")
+        smoke_script = (ROOT / "scripts/mcp_smoke.py").read_text(encoding="utf-8")
+        for needle in ("server_info", "exec_command"):
+            with self.subTest(target="mcp_smoke", needle=needle):
+                self.assertIn(needle, smoke_script)
+
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         for needle in (
+            "ARG JAVA_VERSION",
+            "JAVA_HOME",
             "CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS",
-            "/etc/java-17-openjdk",
             "/etc/maven",
-            "/usr/share/maven",
-            "/usr/lib/jvm/java-17-openjdk-amd64",
+            "CODING_TOOLS_MCP_GENERATE_AUTH_TOKEN",
         ):
-            with self.subTest(workflow="docker-entrypoint", needle=needle):
-                self.assertIn(needle, entrypoint)
+            with self.subTest(target="Dockerfile", needle=needle):
+                self.assertIn(needle, dockerfile)

@@ -360,9 +360,10 @@ class DogfoodRunner:
 
 
 def dogfood_fixture_parent() -> Path:
-    if os.name == "nt":
-        return Path(tempfile.gettempdir())
-    return Path("/tmp")
+    configured = os.environ.get("CODING_TOOLS_MCP_DOGFOOD_ROOT") or ""
+    if configured.strip():
+        return Path(configured).expanduser()
+    return Path(tempfile.gettempdir())
 
 
 def prepare_workspace(base_dir: Path | None = None) -> tuple[Path, Path]:

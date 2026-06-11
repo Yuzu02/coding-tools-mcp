@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import sys
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -25,6 +27,49 @@ from coding_tools_mcp.server import (
     truncate_text_head,
     truncate_text_tail,
 )
+
+
+@contextmanager
+def fake_landlock_exec() -> Iterator[dict[str, object]]:
+    """Patch landlock + Popen so exec_command runs without spawning a process.
+
+    Yields a dict capturing the landlock write_roots and the Popen args/kwargs;
+    "read_fd" holds the fd handed to the server (closed by exec_command itself).
+    """
+    read_fd, write_fd = os.pipe()
+    original_open = server_module.open_landlock_ruleset
+    original_popen = server_module.subprocess.Popen
+    original_watchdog = server_module.start_session_watchdog
+    captured: dict[str, object] = {"read_fd": read_fd}
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+        stderr = None
+        pid = 1
+
+        def poll(self) -> int:
+            return 0
+
+    def fake_open(_workspace: Path, _read_roots: list[str], **kwargs: object) -> int:
+        captured["write_roots"] = kwargs.get("write_roots")
+        return read_fd
+
+    def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    server_module.open_landlock_ruleset = fake_open
+    server_module.subprocess.Popen = fake_popen  # type: ignore[method-assign]
+    server_module.start_session_watchdog = lambda _session: None
+    try:
+        yield captured
+    finally:
+        server_module.open_landlock_ruleset = original_open
+        server_module.subprocess.Popen = original_popen  # type: ignore[method-assign]
+        server_module.start_session_watchdog = original_watchdog
+        os.close(write_fd)
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -100,7 +145,7 @@ class RuntimeHelperTests(unittest.TestCase):
 
         self.assertEqual(runtime.workspace.root, Path(tmp).resolve())
 
-    def test_kill_session_timeout_evicts_unresponsive_session(self) -> None:
+    def test_kill_session_keeps_unresponsive_session(self) -> None:
         class StillRunningProcess:
             def poll(self) -> None:
                 return None
@@ -110,12 +155,13 @@ class RuntimeHelperTests(unittest.TestCase):
             session = runtime._make_session(StillRunningProcess())  # type: ignore[arg-type]
             runtime.sessions[session.session_id] = session
             with patch.object(runtime, "_terminate_process_group", return_value=None):
-                result = runtime.kill_session({"session_id": session.session_id, "wait_ms": 0})
+                result = runtime.kill_session({"session_id": session.session_id, "wait_ms": 0, "kill_wait_ms": 0})
 
         self.assertFalse(result.get("killed"), result)
-        self.assertEqual(result.get("status"), "timeout", result)
-        self.assertNotIn(session.session_id, runtime.sessions)
-        self.assertTrue(any("session evicted" in warning for warning in result.get("warnings", [])), result)
+        self.assertEqual(result.get("status"), "terminating", result)
+        self.assertFalse(result.get("evicted"), result)
+        self.assertIn(session.session_id, runtime.sessions)
+        self.assertTrue(any("session retained" in warning for warning in result.get("warnings", [])), result)
 
     def test_command_policy_gates_inline_interpreter_code(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -433,40 +479,8 @@ class RuntimeHelperTests(unittest.TestCase):
     def test_exec_command_uses_landlock_wrapper_without_preexec_fn(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp))
-            read_fd, write_fd = os.pipe()
-            original_open = server_module.open_landlock_ruleset
-            original_popen = server_module.subprocess.Popen
-            original_watchdog = server_module.start_session_watchdog
-            captured: dict[str, object] = {}
-
-            class FakeProcess:
-                stdin = None
-                stdout = None
-                stderr = None
-                pid = 1
-
-                def poll(self) -> int:
-                    return 0
-
-            def fake_open(_workspace: Path, _read_roots: list[str], **kwargs: object) -> int:
-                captured["write_roots"] = kwargs.get("write_roots")
-                return read_fd
-
-            def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
-                captured["args"] = args
-                captured["kwargs"] = kwargs
-                return FakeProcess()
-
-            server_module.open_landlock_ruleset = fake_open
-            server_module.subprocess.Popen = fake_popen  # type: ignore[method-assign]
-            server_module.start_session_watchdog = lambda _session: None
-            try:
+            with fake_landlock_exec() as captured:
                 runtime.exec_command({"cmd": "printf ok", "timeout_ms": 5000, "yield_time_ms": 0})
-            finally:
-                server_module.open_landlock_ruleset = original_open
-                server_module.subprocess.Popen = original_popen  # type: ignore[method-assign]
-                server_module.start_session_watchdog = original_watchdog
-                os.close(write_fd)
 
             kwargs = captured["kwargs"]
             self.assertIsInstance(kwargs, dict)
@@ -476,7 +490,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 self.assertIn("creationflags", kwargs)
             else:
                 self.assertIn("start_new_session", kwargs)
-            self.assertEqual(kwargs.get("pass_fds"), (read_fd,))
+            self.assertEqual(kwargs.get("pass_fds"), (captured["read_fd"],))
             self.assertEqual(captured.get("write_roots"), [runtime.runtime_dir])
             popen_args = captured["args"]
             self.assertIsInstance(popen_args, tuple)
@@ -488,38 +502,8 @@ class RuntimeHelperTests(unittest.TestCase):
         for permission_mode in ("safe", "trusted"):
             with self.subTest(permission_mode=permission_mode), TemporaryDirectory() as tmp:
                 runtime = Runtime(Path(tmp), permission_mode=permission_mode)
-                read_fd, write_fd = os.pipe()
-                original_open = server_module.open_landlock_ruleset
-                original_popen = server_module.subprocess.Popen
-                original_watchdog = server_module.start_session_watchdog
-                captured: dict[str, object] = {}
-
-                class FakeProcess:
-                    stdin = None
-                    stdout = None
-                    stderr = None
-                    pid = 1
-
-                    def poll(self) -> int:
-                        return 0
-
-                def fake_open(_workspace: Path, _read_roots: list[str], **kwargs: object) -> int:
-                    captured["write_roots"] = kwargs.get("write_roots")
-                    return read_fd
-
-                def fake_popen(*_args: object, **_kwargs: object) -> FakeProcess:
-                    return FakeProcess()
-
-                server_module.open_landlock_ruleset = fake_open
-                server_module.subprocess.Popen = fake_popen  # type: ignore[method-assign]
-                server_module.start_session_watchdog = lambda _session: None
-                try:
+                with fake_landlock_exec() as captured:
                     runtime.exec_command({"cmd": "printf ok", "timeout_ms": 5000, "yield_time_ms": 0})
-                finally:
-                    server_module.open_landlock_ruleset = original_open
-                    server_module.subprocess.Popen = original_popen  # type: ignore[method-assign]
-                    server_module.start_session_watchdog = original_watchdog
-                    os.close(write_fd)
 
                 self.assertEqual(captured.get("write_roots"), [runtime.runtime_dir])
 
@@ -550,20 +534,8 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(dangerous_env.get("OPENAI_API_KEY"), "sk-test-secret-value")
 
     def test_landlock_device_access_includes_truncate_and_ioctl_bits(self) -> None:
-        handled = (
-            LANDLOCK_ACCESS_FS_WRITE_FILE
-            | LANDLOCK_ACCESS_FS_TRUNCATE
-            | LANDLOCK_ACCESS_FS_IOCTL_DEV
-        )
-        readonly_file_access = 0
-        device_access = readonly_file_access | (
-            handled
-            & (
-                LANDLOCK_ACCESS_FS_WRITE_FILE
-                | LANDLOCK_ACCESS_FS_TRUNCATE
-                | LANDLOCK_ACCESS_FS_IOCTL_DEV
-            )
-        )
+        handled = server_module.landlock_handled_access(5)
+        device_access = server_module.landlock_device_access(handled)
         self.assertTrue(device_access & LANDLOCK_ACCESS_FS_WRITE_FILE)
         self.assertTrue(device_access & LANDLOCK_ACCESS_FS_TRUNCATE)
         self.assertTrue(device_access & LANDLOCK_ACCESS_FS_IOCTL_DEV)
