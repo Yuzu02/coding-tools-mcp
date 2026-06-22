@@ -261,7 +261,14 @@ See [docs/ci-and-tests.md](docs/ci-and-tests.md) for the full test matrix.
 
 ## License
 
-This project is source-available, not open source. See [LICENSE](LICENSE).
-Internal evaluation, development, testing, and security review are permitted;
-redistribution, hosted third-party service use, and production commercial use
-require prior written permission.
+This project is licensed under the [Apache License 2.0](LICENSE).
+
+If you use code, documentation, substantial implementation details, or
+derivative work from this project, preserve the copyright notice, license
+notice, and [NOTICE](NOTICE) file, and clearly attribute the original project.
+
+Project: Coding Tools MCP  
+Author: Coding Tools MCP Contributors  
+Source: https://github.com/xyTom/coding-tools-mcp
+
+Citation metadata is available in [CITATION.cff](CITATION.cff).

@@ -13,6 +13,9 @@ dependencies = [
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Coding Tools MCP Contributors" }]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+]
 
 [project.urls]
 Homepage = "https://github.com/xyTom/coding-tools-mcp"
