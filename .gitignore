@@ -15,6 +15,10 @@ dist/
 build/
 target/
 .DS_Store
+cloudflare/**/.dev.vars
+cloudflare/**/.dev.vars.*
+cloudflare/**/.env
+cloudflare/**/.env.*
 reports/compliance/latest*.tmp
 rollout-*.jsonl
 successful_apply_patch_blocks.txt

@@ -1,0 +1,93 @@
+# Cloudflare Sandbox Control Worker
+
+This Worker is the small authenticated control plane for remote coding sandboxes:
+
+1. A caller sends an authenticated request to the Worker.
+2. The Worker dispatches `.github/workflows/start-sandbox.yml` through the GitHub API.
+3. GitHub Actions starts the Docker sandbox and exposes `coding-tools-mcp` through Cloudflare Tunnel.
+4. The MCP client connects to the tunnel URL with the MCP bearer token stored in GitHub Secrets.
+
+The Worker does not run code and does not proxy MCP traffic. It only starts the sandbox workflow.
+
+## Recommended Setup
+
+Use a Cloudflare named tunnel for the MCP endpoint. Quick tunnels are fine for ad hoc tests, but named tunnels give you one reusable hostname such as `mcp.example.com`.
+
+1. Create a Cloudflare Tunnel and publish a hostname that routes to `http://localhost:8765`.
+2. Copy the tunnel token and save it as a GitHub repository secret named `CLOUDFLARE_TUNNEL_TOKEN`.
+3. Generate a stable MCP bearer token and save it as a GitHub repository secret named `CODING_TOOLS_MCP_AUTH_TOKEN`.
+4. Edit `wrangler.toml` and set `GITHUB_OWNER`, `GITHUB_REPO`, `GITHUB_REF`, and `TUNNEL_HOSTNAME`.
+5. Create a GitHub token for the Worker. A fine-grained token should be limited to the target repository with Actions write permission.
+6. Configure Worker secrets:
+
+```bash
+npx wrangler secret put CONTROL_TOKEN --config cloudflare/sandbox-control/wrangler.toml
+npx wrangler secret put GITHUB_TOKEN --config cloudflare/sandbox-control/wrangler.toml
+```
+
+7. Deploy the Worker:
+
+```bash
+npx wrangler deploy --config cloudflare/sandbox-control/wrangler.toml
+```
+
+## Start A Sandbox
+
+Use the token stored in the Worker `CONTROL_TOKEN` secret:
+
+```bash
+curl -X POST "https://<worker-host>/start" \
+  -H "Authorization: Bearer $CONTROL_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "duration_minutes": "120",
+    "permission_mode": "trusted",
+    "tool_profile": "full",
+    "tunnel_type": "named",
+    "tunnel_hostname": "mcp.example.com"
+  }'
+```
+
+When GitHub accepts the dispatch, the Worker response is `202 Accepted`. Newer GitHub API responses include a workflow run ID and URLs; older responses may only confirm that the dispatch was accepted.
+
+Connect the MCP client to:
+
+```text
+https://mcp.example.com/mcp
+Authorization: Bearer <CODING_TOOLS_MCP_AUTH_TOKEN>
+```
+
+## MCP-Style Control Tool
+
+The same Worker also exposes a minimal JSON-RPC endpoint at `/mcp` for clients that can call simple MCP-style tools:
+
+```bash
+curl -X POST "https://<worker-host>/mcp" \
+  -H "Authorization: Bearer $CONTROL_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+Call the tool:
+
+```bash
+curl -X POST "https://<worker-host>/mcp" \
+  -H "Authorization: Bearer $CONTROL_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "start_coding_tools_sandbox",
+      "arguments": {"duration_minutes": "120"}
+    }
+  }'
+```
+
+## Safety Notes
+
+- Keep `CONTROL_TOKEN`, `GITHUB_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`, and `CODING_TOOLS_MCP_AUTH_TOKEN` out of committed files.
+- Keep `ALLOW_DANGEROUS=false` unless the sandbox is isolated and the MCP client is trusted.
+- Keep `ALLOW_IMAGE_OVERRIDE=false` unless callers are allowed to choose arbitrary Docker images.
+- The fixed MCP hostname is only live while the GitHub Actions job is running.

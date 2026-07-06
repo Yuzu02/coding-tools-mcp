@@ -15,6 +15,7 @@ It is not a prompt wrapper. It does not expose external agent accounts, memory, 
 - [MCP client configuration](docs/mcp-client-config.md)
 - [Embedding in your app or agent](docs/embedding.md)
 - [Remote MCP](docs/remote-mcp.md)
+- [Cloudflare sandbox control worker](cloudflare/sandbox-control/README.md)
 - [Tools and schemas](docs/tools-and-schemas.md)
 - [Permission modes](docs/permission-modes.md)
 - [Exec command recipes](docs/exec-command-recipes.md)
