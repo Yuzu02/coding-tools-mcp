@@ -25,3 +25,15 @@ successful_apply_patch_blocks.txt
 pi/
 codex/
 opencode/
+tmp-run/
+.agents/
+.claude/
+.mcp-probe-kit/
+docs/.mcp-probe/
+docs/graph-insights/latest.json
+docs/graph-insights/latest.md
+AGENTS.md
+CLAUDE.md
+docs/project-context.md
+docs/project-context/
+docs/specs/
