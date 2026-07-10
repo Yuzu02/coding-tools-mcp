@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from .i18n import tr
 from .models import WorkspaceProfile
 
 
@@ -55,10 +56,10 @@ def run_health_checks(profile: WorkspaceProfile) -> list[HealthItem]:
         "authorization_servers",
     )
     return [
-        HealthItem("本地 /mcp", local_ok, local_detail),
-        HealthItem("公网 /mcp", public_ok, public_detail),
-        HealthItem("OAuth 授权元数据", oauth_ok, oauth_detail),
-        HealthItem("OAuth 受保护资源元数据", protected_ok, protected_detail),
+        HealthItem(tr("Health", "Local /mcp"), local_ok, local_detail),
+        HealthItem(tr("Health", "Public /mcp"), public_ok, public_detail),
+        HealthItem(tr("Health", "OAuth authorization metadata"), oauth_ok, oauth_detail),
+        HealthItem(tr("Health", "OAuth protected-resource metadata"), protected_ok, protected_detail),
     ]
 
 

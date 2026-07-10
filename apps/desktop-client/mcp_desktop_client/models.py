@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 from uuid import uuid4
+
+from .i18n import tr
 
 
 def _new_secret() -> str:
@@ -68,14 +73,15 @@ class WorkspaceProfile:
         return self.tunnel.computed_public_url().rstrip("/")
 
     def frp_proxy_snippet(self) -> str:
+        proxy_name = re.sub(r"[^a-z0-9_-]+", "-", self.name.lower()).strip("-_") or "workspace"
         return "\n".join(
             [
                 "[[proxies]]",
-                f'name = "{self.name.lower().replace(" ", "-") or "workspace"}-mcp"',
+                f'name = "{proxy_name}-mcp"',
                 'type = "http"',
-                'localIP = "host.docker.internal"',
+                'localIP = "127.0.0.1"',
                 f"localPort = {self.runtime.local_port}",
-                f'subdomain = "{self.tunnel.frp_subdomain}"',
+                f"subdomain = {json.dumps(self.tunnel.frp_subdomain, ensure_ascii=False)}",
             ]
         )
 
@@ -98,11 +104,13 @@ class WorkspaceProfile:
 class RuntimeStatus:
     state: str = "stopped"
     pid: int | None = None
-    local_message: str = "未启动"
-    public_message: str = "未知"
+    local_message: str = field(default_factory=lambda: tr("Models", "Not started"))
+    public_message: str = field(default_factory=lambda: tr("Models", "Unknown"))
 
 
 def build_profile(path: str, name: str | None = None) -> WorkspaceProfile:
-    cleaned = path.rstrip("\\/")
+    if not path.strip():
+        raise ValueError(tr("Models", "Workspace path cannot be empty."))
+    cleaned = os.path.normpath(path)
     label = name or cleaned.replace("\\", "/").split("/")[-1]
-    return WorkspaceProfile(id=uuid4().hex, name=label or "工作区", path=cleaned)
+    return WorkspaceProfile(id=uuid4().hex, name=label or tr("Models", "Workspace"), path=cleaned)

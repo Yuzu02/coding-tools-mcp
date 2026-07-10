@@ -93,8 +93,10 @@ Run the desktop client MVP:
 
 ```bash
 python -m pip install -e ".[desktop]"
-python apps/desktop-client/main.py
+coding-tools-mcp-desktop
 ```
+
+The desktop client follows the system language on first launch and can switch between English and Simplified Chinese at runtime.
 
 HTTP endpoint:
 

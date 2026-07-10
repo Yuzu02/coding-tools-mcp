@@ -39,6 +39,11 @@ image = [
 
 [project.scripts]
 coding-tools-mcp = "coding_tools_mcp.server:main"
+coding-tools-mcp-desktop = "mcp_desktop_client.app:main"
 
 [tool.setuptools.packages.find]
-include = ["coding_tools_mcp*"]
+where = [".", "apps/desktop-client"]
+include = ["coding_tools_mcp*", "mcp_desktop_client*"]
+
+[tool.setuptools.package-data]
+mcp_desktop_client = ["locales/*.qm", "locales/*.ts"]
