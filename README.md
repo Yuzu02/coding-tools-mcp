@@ -89,6 +89,13 @@ If dependencies are missing, install the runtime in editable mode:
 python -m pip install -e ".[dev]"
 ```
 
+Run the desktop client MVP:
+
+```bash
+python -m pip install -e ".[desktop]"
+python apps/desktop-client/main.py
+```
+
 HTTP endpoint:
 
 ```text
