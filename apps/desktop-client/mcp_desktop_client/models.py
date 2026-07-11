@@ -14,10 +14,6 @@ def _new_secret() -> str:
     return uuid4().hex + uuid4().hex
 
 
-def _new_client_id() -> str:
-    return f"chatgpt-client-{uuid4().hex[:12]}"
-
-
 @dataclass
 class TunnelConfig:
     type: str = "frp"
@@ -36,8 +32,6 @@ class TunnelConfig:
 @dataclass
 class AuthConfig:
     type: str = "oauth"
-    oauth_client_id: str = field(default_factory=_new_client_id)
-    oauth_client_secret: str = field(default_factory=_new_secret)
     oauth_password: str = field(default_factory=_new_secret)
     oauth_token_secret: str = field(default_factory=_new_secret)
     bearer_token: str = field(default_factory=_new_secret)
@@ -46,7 +40,6 @@ class AuthConfig:
 @dataclass
 class RuntimeConfig:
     local_port: int = 28766
-    tool_profile: str = "full"
     permission_mode: str = "trusted"
     runtime_command: str = ""
 
@@ -90,13 +83,23 @@ class WorkspaceProfile:
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> "WorkspaceProfile":
+        runtime_record = {
+            key: value
+            for key, value in dict(record.get("runtime", {})).items()
+            if key in RuntimeConfig.__dataclass_fields__
+        }
+        auth_record = {
+            key: value
+            for key, value in dict(record.get("auth", {})).items()
+            if key in AuthConfig.__dataclass_fields__
+        }
         return cls(
             id=record["id"],
             name=record["name"],
             path=record["path"],
             tunnel=TunnelConfig(**record.get("tunnel", {})),
-            auth=AuthConfig(**record.get("auth", {})),
-            runtime=RuntimeConfig(**record.get("runtime", {})),
+            auth=AuthConfig(**auth_record),
+            runtime=RuntimeConfig(**runtime_record),
         )
 
 

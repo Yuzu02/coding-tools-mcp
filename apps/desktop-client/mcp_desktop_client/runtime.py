@@ -473,8 +473,6 @@ class RuntimeManager:
                 ).format(path=profile.path)
             )
         if profile.auth.type == "oauth":
-            if not profile.auth.oauth_client_id.strip():
-                raise RuntimeError(tr("RuntimeManager", "OAuth mode requires a client ID."))
             if not profile.auth.oauth_password.strip():
                 raise RuntimeError(tr("RuntimeManager", "OAuth mode requires an authorization password."))
         elif profile.auth.type == "bearer" and not profile.auth.bearer_token.strip():
@@ -577,8 +575,6 @@ class RuntimeManager:
             "CODING_TOOLS_MCP_AUTH_MODE",
             "CODING_TOOLS_MCP_AUTH_TOKEN",
             "CODING_TOOLS_MCP_OAUTH_MODE",
-            "CODING_TOOLS_MCP_OAUTH_CLIENT_ID",
-            "CODING_TOOLS_MCP_OAUTH_CLIENT_SECRET",
             "CODING_TOOLS_MCP_OAUTH_PASSWORD",
             "CODING_TOOLS_MCP_OAUTH_TOKEN_SECRET",
         ):
@@ -590,17 +586,10 @@ class RuntimeManager:
             "127.0.0.1",
             "--port",
             str(profile.runtime.local_port),
-            "--tool-profile",
-            profile.runtime.tool_profile,
             "--permission-mode",
             profile.runtime.permission_mode,
         ]
         if profile.auth.type == "oauth":
-            env["CODING_TOOLS_MCP_OAUTH_CLIENT_ID"] = profile.auth.oauth_client_id
-            if profile.auth.oauth_client_secret.strip():
-                env["CODING_TOOLS_MCP_OAUTH_CLIENT_SECRET"] = profile.auth.oauth_client_secret
-            else:
-                env.pop("CODING_TOOLS_MCP_OAUTH_CLIENT_SECRET", None)
             env["CODING_TOOLS_MCP_OAUTH_PASSWORD"] = profile.auth.oauth_password
             env["CODING_TOOLS_MCP_OAUTH_TOKEN_SECRET"] = profile.auth.oauth_token_secret
             args.append("--oauth-mode")

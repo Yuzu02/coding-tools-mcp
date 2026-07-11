@@ -29,7 +29,7 @@ It is not a prompt wrapper. It does not expose external agent accounts, memory, 
 - [Troubleshooting](docs/troubleshooting.md)
 - [Exec troubleshooting](docs/troubleshooting-exec.md)
 - [Competitive analysis](docs/competitive-analysis.md)
-- Normative MCP runtime profile: [docs/profile-v0.1.md](docs/profile-v0.1.md)
+- Normative runtime contract: [docs/runtime-contract-v0.2.md](docs/runtime-contract-v0.2.md)
 
 ## Quickstart
 
@@ -46,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/xyTom/coding-tools-mcp/main/scripts
   | bash -s -- --start --workspace /path/to/repo
 ```
 
-Install and expose a read-only bearer-token tunnel:
+Install and expose an authenticated bearer-token tunnel:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xyTom/coding-tools-mcp/main/scripts/install.sh \
@@ -174,15 +174,19 @@ Cursor:
 }
 ```
 
-Generic Streamable HTTP clients should use MCP protocol version `2025-06-18` and point at `http://127.0.0.1:8765/mcp`.
+Generic Streamable HTTP clients should use MCP protocol version `2025-11-25`
+and point at `http://127.0.0.1:8765/mcp`. Version `2025-06-18` remains
+supported for existing clients.
 
 ## Remote MCP
 
-For remote MCP clients and local development over an HTTPS tunnel, keep the server bound to loopback and expose the tunnel URL with the safest profile your client can use. Anonymous tunnel testing should use `read-only` mode:
+For remote MCP clients and local development over an HTTPS tunnel, keep the
+server bound to loopback and require bearer or OAuth authentication. The fixed
+tool set contains command execution and workspace mutation, so an anonymous
+public tunnel is unsafe:
 
 ```bash
-CODING_TOOLS_MCP_AUTH_MODE=noauth \
-CODING_TOOLS_MCP_TOOL_PROFILE=read-only \
+CODING_TOOLS_MCP_AUTH_MODE=bearer \
 ./scripts/tunnel.sh cloudflared /path/to/repo
 ```
 
@@ -200,21 +204,29 @@ scripts/tunnel.sh ngrok /path/to/repo
 scripts/tunnel.sh devtunnel /path/to/repo
 ```
 
-For clients that support custom headers, use bearer-token auth with `Authorization: Bearer <token>`. For MCP clients that speak OAuth 2.1 Authorization Code + PKCE, use `CODING_TOOLS_MCP_AUTH_MODE=oauth` with `scripts/tunnel.sh` (or `scripts/install.sh --auth-mode oauth`). The server can infer its OAuth issuer from the tunnel request URL, so one-shot tunnels like cloudflared work without setting `CODING_TOOLS_MCP_SERVER_URL` before startup; set it only when you want to pin a stable issuer. The script prints a generated OAuth password, accepts any non-empty client_id by default, and lets you opt into `CODING_TOOLS_MCP_OAUTH_CLIENT_ID`/`CODING_TOOLS_MCP_OAUTH_CLIENT_SECRET` only when you need to lock down a confidential client. Clients that cannot send custom bearer headers and do not speak OAuth should use anonymous `read-only` mode only for local/testing tunnels, or be placed behind an external auth proxy for production use.
+For clients that support custom headers, use bearer-token auth with
+`Authorization: Bearer <token>`. OAuth-aware clients can use OAuth 2.1
+Authorization Code + PKCE by setting `CODING_TOOLS_MCP_AUTH_MODE=oauth`. The
+server publishes RFC 7591 dynamic client registration, binds exact redirect
+URIs, and can infer its issuer from a one-shot tunnel request. Set
+`CODING_TOOLS_MCP_SERVER_URL` only to pin a stable issuer. Clients that support
+neither bearer headers nor OAuth need an external authenticated proxy.
 
 See [docs/remote-mcp.md](docs/remote-mcp.md) for the exact modes and security notes.
 
-## Tool Profiles
+## Fixed Tool Set
 
-- `full`: exposes all tools with truthful annotations. This is the default for backward compatibility.
-- `read-only`: recommended for remote or safe-mode clients; exposes only inspection tools, git read tools, image viewing, and default-cwd helpers.
-- `compat-readonly-all`: exposes all tools but advertises every tool as read-only for clients that gate availability on `readOnlyHint`. This is not a safety mode; mutation-capable tools such as `apply_patch`, `exec_command`, `write_stdin`, and `kill_session` can still mutate local state.
+The server exposes one stable catalog with truthful annotations. It does not
+offer tool profiles, dynamically hide process tools, or provide `edit_file`.
+`apply_patch` is the only direct file-mutation primitive. Permission modes
+change command policy, not which tools the model sees.
 
 ## Tools
 
 P0 tools exposed by default:
 
 - `server_info`
+- `check_exec_environment`
 - `get_default_cwd`
 - `set_default_cwd`
 - `read_file`
@@ -225,6 +237,7 @@ P0 tools exposed by default:
 - `exec_command`
 - `write_stdin`
 - `kill_session`
+- `read_output`
 - `git_status`
 - `git_diff`
 - `git_log`
@@ -236,7 +249,19 @@ Additional image tool exposed by default:
 
 - `view_image`
 
-For input/output schemas and result envelopes, see [docs/tools-and-schemas.md](docs/tools-and-schemas.md) and [docs/profile-v0.1.md](docs/profile-v0.1.md).
+For input/output schemas and result envelopes, see
+[docs/tools-and-schemas.md](docs/tools-and-schemas.md) and
+[docs/runtime-contract-v0.2.md](docs/runtime-contract-v0.2.md).
+
+Root `AGENTS.md`/`CLAUDE.md` instructions are loaded into the MCP initialize
+context automatically; nested instruction files are indexed without eagerly
+injecting their contents. No `open_workspace` tool call is required.
+
+Tool `content` is concise agent-facing text, while `structuredContent` is the
+complete stable machine result. Commands wait up to 10 seconds by default. Only
+commands still running return a `write_stdin` next action; only truncated output
+returns a `read_output` next action. Image base64 is emitted once in one MCP
+image block.
 
 ## Safety Boundary
 

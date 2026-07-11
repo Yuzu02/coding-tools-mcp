@@ -25,28 +25,59 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
-import jwt
-
 from . import __version__
-
-
-PROTOCOL_VERSION = "2025-06-18"
-SERVER_NAME = "coding-tools-mcp"
-LOGGING_LEVELS = (
-    "debug",
-    "info",
-    "notice",
-    "warning",
-    "error",
-    "critical",
-    "alert",
-    "emergency",
+from .errors import JsonRpcError, ToolFailure
+from .oauth import (
+    OAUTH_CODE_TTL_SECONDS,
+    OAUTH_MAX_BODY_BYTES,
+    MAX_PENDING_CODES,
+    OAUTH_TOKEN_TTL_SECONDS,
+    OAuthConfig,
+    create_access_token,
+    valid_pkce_challenge,
+    validate_access_token,
+    verify_pkce,
 )
+from .patching import (
+    AtomicPatchCommitter,
+    FileBaseline,
+    StagedFile,
+    apply_update_hunks,
+    parse_patch,
+    read_text_preserve_newlines,
+)
+from .processes import (
+    HARD_KILL_SIGNAL,
+    SESSION_BUFFER_BYTES,
+    ExecSession,
+    spawn_process,
+    start_reader_threads,
+    start_session_watchdog,
+    terminate_process_group,
+)
+from .protocol import (
+    PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    protocol_version_is_supported,
+    response_id,
+    rpc_params,
+    validate_initialize_params,
+    validate_initialize_request,
+    validate_rpc_envelope,
+)
+from .project_context import ProjectContext, load_project_context
+from .tool_results import make_tool_result
+from .transport_http import HTTPSessionManager
+from .transport_stdio import serve_stdio
+
+
+SERVER_NAME = "coding-tools-mcp"
 DEFAULT_EXCLUDED_NAMES = {
     ".git",
     ".reference",
@@ -129,7 +160,7 @@ PERMISSION_MODE_CAPABILITIES: dict[str, ModeCapabilities] = {
     ),
 }
 PERMISSION_MODE_CHOICES = tuple(PERMISSION_MODE_CAPABILITIES)
-# Documented kill_session status enum (docs/profile-v0.1.md); guarded by test_schema_drift.
+# Documented kill_session status enum; guarded by test_schema_drift.
 KILL_SESSION_STATUSES = ("terminated", "killed", "exited", "terminating", "not_found")
 POSIX_CORE_ENV_NAMES = {"PATH", "LANG", "LC_ALL", "TERM"}
 # Not POSIX core, but inherited under inherit="core" so git helper subprocesses and
@@ -146,10 +177,11 @@ DESTRUCTIVE_RE = re.compile(
     re.I,
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
-MAX_JSON_RPC_BATCH_ITEMS = 50
-SESSION_BUFFER_BYTES = 1_048_576
 EXEC_PREVIEW_BYTES = 4096
-MAX_RETAINED_OUTPUT_SESSIONS = 128
+MAX_ACTIVE_EXEC_SESSIONS = 16
+MAX_RETAINED_OUTPUT_SESSIONS = 32
+COMPLETED_SESSION_TTL_SECONDS = 300
+MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -269,11 +301,6 @@ ECOSYSTEM_CACHE_ENV_NAMES = {
     "RUSTUP_HOME",
 }
 
-OAUTH_CODE_TTL_SECONDS = 300
-OAUTH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30
-OAUTH_MAX_BODY_BYTES = 8_192
-
-
 @dataclass(frozen=True)
 class ShellEnvPolicy:
     inherit: str = "core"
@@ -289,51 +316,8 @@ class RuntimePolicy:
     allow_network: bool
 
 
-@dataclass(frozen=True)
-class OAuthConfig:
-    client_id: str | None
-    client_secret: str | None
-    password: str
-    server_url: str | None
-    token_secret: bytes
-    token_ttl: int = OAUTH_TOKEN_TTL_SECONDS
-
-
-def _verify_pkce(code_verifier: str, code_challenge: str) -> bool:
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return secrets.compare_digest(expected, code_challenge)
-
-
-def _create_oauth_token(cfg: OAuthConfig, server_url: str) -> str:
-    now = int(time.time())
-    return jwt.encode(
-        {"iss": server_url, "aud": server_url, "iat": now, "exp": now + cfg.token_ttl, "scope": "mcp"},
-        cfg.token_secret,
-        algorithm="HS256",
-    )
-
-
-def _validate_oauth_token(token: str, cfg: OAuthConfig, server_url: str) -> bool:
-    try:
-        jwt.decode(token, cfg.token_secret, algorithms=["HS256"], audience=server_url, issuer=server_url)
-        return True
-    except jwt.PyJWTError:
-        return False
-
-
-def _oauth_client_id_allowed(client_id: str, cfg: OAuthConfig) -> bool:
-    if not client_id:
-        return False
-    if cfg.client_id is None:
-        return True
-    return secrets.compare_digest(client_id, cfg.client_id)
-
-
-def _oauth_token_auth_methods(cfg: OAuthConfig) -> list[str]:
-    if cfg.client_secret is None:
-        return ["none"]
-    return ["client_secret_post", "client_secret_basic"]
+def _oauth_token_auth_methods() -> list[str]:
+    return ["client_secret_basic", "client_secret_post", "none"]
 
 
 def _http_base_for_bind_host(host: str, port: int) -> str:
@@ -357,7 +341,14 @@ def _forwarded_header_param(value: str | None, name: str) -> str:
 
 def _safe_external_host(host: str) -> str:
     host = host.strip()
-    if not host or any(ch in host for ch in "\r\n/\\"):
+    if not host or any(ch.isspace() or ch in "/\\@?#" for ch in host):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(f"//{host}")
+        _ = parsed.port
+    except ValueError:
+        return ""
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
         return ""
     return host
 
@@ -508,12 +499,9 @@ def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
     )
 
 
-TOOL_PROFILE_CHOICES = ("full", "read-only", "compat-readonly-all")
-
-
 @dataclass(frozen=True)
 class ToolSpec:
-    """Single source of truth for one tool: title, description, annotation hints, profile membership.
+    """Single source of truth for one tool's title, description, and annotation hints.
 
     Handler methods on Runtime are named exactly after the tool. Input schemas live in
     input_schemas(), keyed by the same names.
@@ -525,69 +513,59 @@ class ToolSpec:
     destructive: bool = False
     idempotent: bool = False
     open_world: bool = False
-    in_read_only_profile: bool = False
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
     "server_info": ToolSpec(
         title="Server info",
-        description="Return server, workspace, auth, profile, and exposed-tool metadata.",
+        description="Return server, workspace, project-context, auth, policy, and fixed-tool metadata.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "check_exec_environment": ToolSpec(
         title="Check exec environment",
         description="Return lightweight exec_command sandbox and environment status known to the server.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "get_default_cwd": ToolSpec(
         title="Get default cwd",
         description="Return the current default cwd inside the workspace.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "set_default_cwd": ToolSpec(
         title="Set default cwd",
         description="Set the default cwd for relative tool paths inside the workspace.",
-        read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "read_file": ToolSpec(
         title="Read file",
         description="Read a UTF-8 text file slice inside the configured workspace.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "list_dir": ToolSpec(
         title="List directory",
         description="List directory entries inside the configured workspace.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "list_files": ToolSpec(
         title="List files",
         description="List workspace files using glob filters.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "search_text": ToolSpec(
         title="Search text",
         description="Search UTF-8 workspace files for text or regex matches.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "apply_patch": ToolSpec(
         title="Apply patch",
-        description="Apply a patch envelope transactionally inside the workspace.",
+        description="Stage, validate, and atomically replace files from a patch envelope inside the workspace.",
         destructive=True,
     ),
     "exec_command": ToolSpec(
@@ -598,7 +576,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "write_stdin": ToolSpec(
         title="Write stdin",
-        description="Write characters to a server-managed running command session.",
+        description=(
+            "Poll or interact with a running command session. Pass empty chars to wait for more output; "
+            "pass non-empty chars to write to stdin."
+        ),
     ),
     "kill_session": ToolSpec(
         title="Kill session",
@@ -610,46 +591,40 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description="Read retained stdout or stderr by output_ref with per-stream byte offset pagination.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "git_status": ToolSpec(
         title="Git status",
         description="Return git working tree status for the workspace.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "git_diff": ToolSpec(
         title="Git diff",
         description="Return unified git diff for workspace changes.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "git_log": ToolSpec(
         title="Git log",
         description="Return recent git commits with bounded structured metadata.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "git_show": ToolSpec(
         title="Git show",
         description="Return bounded git show output for a revision.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "git_blame": ToolSpec(
         title="Git blame",
         description="Return bounded git blame metadata for a workspace file.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
     "request_permissions": ToolSpec(
         title="Request permissions",
-        description="Request a scoped permission grant for dangerous runtime operations.",
+        description="Report scoped permission-request status without silently granting operations.",
         read_only=True,
     ),
     "view_image": ToolSpec(
@@ -657,12 +632,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description="Return a workspace image as MCP image content.",
         read_only=True,
         idempotent=True,
-        in_read_only_profile=True,
     ),
 }
 
 FULL_TOOL_NAMES = tuple(TOOL_REGISTRY)
-READ_ONLY_TOOL_NAMES = tuple(name for name, spec in TOOL_REGISTRY.items() if spec.in_read_only_profile)
 
 LANDLOCK_CREATE_RULESET_VERSION = 1
 LANDLOCK_RULE_PATH_BENEATH = 1
@@ -688,24 +661,6 @@ LANDLOCK_ACCESS_FS_TRUNCATE = 1 << 14
 LANDLOCK_ACCESS_FS_IOCTL_DEV = 1 << 15
 
 
-class ToolFailure(Exception):
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        category: str = "runtime",
-        retryable: bool = False,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.category = category
-        self.retryable = retryable
-        self.details = details or {}
-
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -715,15 +670,33 @@ def json_response_payload(payload: Any) -> bytes:
 
 
 def is_allowed_origin(origin: str, *, auth_enabled: bool = False) -> bool:
+    del auth_enabled  # authentication does not replace browser Origin validation
     try:
         parsed = urllib.parse.urlparse(origin)
     except ValueError:
         return False
-    if parsed.scheme not in {"http", "https"}:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
         return False
-    if auth_enabled:
-        return parsed.hostname is not None
-    return parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    try:
+        _ = parsed.port
+    except ValueError:
+        return False
+    normalized = origin.rstrip("/")
+    configured = {
+        item.strip().rstrip("/")
+        for item in os.environ.get(f"{ENV_PREFIX}_ALLOWED_ORIGINS", "").split(",")
+        if item.strip()
+    }
+    return parsed.hostname in {"localhost", "127.0.0.1", "::1"} or normalized in configured
 
 
 def is_loopback_bind_host(host: str) -> bool:
@@ -904,38 +877,6 @@ def truncate_line_chars(line: str, max_chars: int = GREP_MAX_LINE_CHARS) -> tupl
     return line[:keep] + suffix, True
 
 
-def truncate_output_bytes_tail(data: bytes, limit: int) -> TextTruncation:
-    text = data.decode("utf-8", errors="replace")
-    return truncate_text_tail(text, max_lines=DEFAULT_MAX_LINES, max_bytes=limit)
-
-
-def strip_bom(text: str) -> tuple[str, str]:
-    return ("\ufeff", text[1:]) if text.startswith("\ufeff") else ("", text)
-
-
-def detect_line_ending(text: str) -> str:
-    crlf = text.find("\r\n")
-    lf = text.find("\n")
-    if lf < 0:
-        return "\n"
-    if crlf < 0:
-        return "\n"
-    return "\r\n" if crlf <= lf else "\n"
-
-
-def normalize_to_lf(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def restore_line_endings(text: str, ending: str) -> str:
-    return text.replace("\n", "\r\n") if ending == "\r\n" else text
-
-
-def read_text_preserve_newlines(path: Path) -> str:
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        return handle.read()
-
-
 def normalize_rel_display(path: Path, root: Path) -> str:
     try:
         rel = path.relative_to(root)
@@ -951,41 +892,6 @@ def is_relative_to(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
-
-
-def terminate_process_group(process: subprocess.Popen[bytes], signum: signal.Signals) -> None:
-    if not hasattr(os, "killpg"):
-        if os.name == "nt" and signum != signal.SIGKILL:
-            event = getattr(signal, "CTRL_BREAK_EVENT", None)
-            if event is not None:
-                try:
-                    process.send_signal(event)
-                    process.wait(timeout=1)
-                    return
-                except Exception:
-                    pass
-        try:
-            if signum == signal.SIGKILL:
-                process.kill()
-            else:
-                process.terminate()
-            process.wait(timeout=1)
-        except Exception:
-            process.kill()
-        return
-    try:
-        os.killpg(process.pid, signum)
-    except ProcessLookupError:
-        return
-    except Exception:
-        process.terminate()
-    try:
-        process.wait(timeout=1)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except Exception:
-            process.kill()
 
 
 def landlock_unavailable_warning(exc: ToolFailure) -> str:
@@ -1284,7 +1190,14 @@ class Workspace:
         if candidate.is_symlink():
             raise ToolFailure("SYMLINK_ESCAPE", "Writing through symlinks is denied.", category="security")
 
-    def is_ignored_path(self, path: Path, *, include_hidden: bool = False, include_ignored: bool = False) -> bool:
+    def is_ignored_path(
+        self,
+        path: Path,
+        *,
+        include_hidden: bool = False,
+        include_ignored: bool = False,
+        git_ignored: set[str] | None = None,
+    ) -> bool:
         try:
             rel = path.relative_to(self.root)
         except ValueError:
@@ -1296,7 +1209,8 @@ class Workspace:
             return True
         if include_ignored:
             return False
-        if self._git_ignored(rel.as_posix()):
+        rel_text = rel.as_posix()
+        if rel_text in (git_ignored if git_ignored is not None else self.git_ignored_paths([rel_text])):
             return True
         return False
 
@@ -1307,208 +1221,26 @@ class Workspace:
             return False
         return is_relative_to(resolved, self.root)
 
-    def _git_ignored(self, rel_path: str) -> bool:
+    def git_ignored_paths(self, rel_paths: list[str]) -> set[str]:
+        if not rel_paths:
+            return set()
         git = shutil.which("git")
         if not git:
-            return False
+            return set()
         try:
             completed = subprocess.run(
-                [git, "-C", str(self.root), "check-ignore", "-q", "--", rel_path],
-                stdout=subprocess.DEVNULL,
+                [git, "-C", str(self.root), "check-ignore", "--stdin", "-z"],
+                input="\0".join(rel_paths) + "\0",
+                text=True,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=2,
             )
-        except Exception:
-            return False
-        return completed.returncode == 0
-
-
-def trim_buffer(
-    buffer: bytearray,
-    *,
-    total_bytes: int,
-    start_offset_attr: str,
-    cursor_attr: str,
-    session: Any,
-) -> int:
-    overflow = len(buffer) - session.buffer_limit
-    if overflow <= 0:
-        return 0
-    del buffer[:overflow]
-    setattr(session, start_offset_attr, total_bytes - len(buffer))
-    cursor = getattr(session, cursor_attr)
-    if cursor < getattr(session, start_offset_attr):
-        setattr(session, cursor_attr, getattr(session, start_offset_attr))
-    return overflow
-
-
-@dataclass
-class ExecSession:
-    session_id: str
-    process: subprocess.Popen[bytes]
-    timeout_at: float | None = None
-    warnings: list[str] = field(default_factory=list)
-    stdout: bytearray = field(default_factory=bytearray)
-    stderr: bytearray = field(default_factory=bytearray)
-    stdout_start_offset: int = 0
-    stderr_start_offset: int = 0
-    stdout_cursor: int = 0
-    stderr_cursor: int = 0
-    stdout_total_bytes: int = 0
-    stderr_total_bytes: int = 0
-    stdout_dropped_bytes: int = 0
-    stderr_dropped_bytes: int = 0
-    buffer_limit: int = SESSION_BUFFER_BYTES
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    reader_threads: list[threading.Thread] = field(default_factory=list)
-    started_at: float = field(default_factory=time.time)
-    closed: bool = False
-    exit_code: int | None = None
-    signal_name: str | None = None
-    timed_out: bool = False
-    terminating: bool = False
-
-    def append_stdout(self, chunk: bytes) -> None:
-        with self.lock:
-            self.stdout.extend(chunk)
-            self.stdout_total_bytes += len(chunk)
-            self.stdout_dropped_bytes += trim_buffer(
-                self.stdout,
-                total_bytes=self.stdout_total_bytes,
-                start_offset_attr="stdout_start_offset",
-                cursor_attr="stdout_cursor",
-                session=self,
-            )
-
-    def append_stderr(self, chunk: bytes) -> None:
-        with self.lock:
-            self.stderr.extend(chunk)
-            self.stderr_total_bytes += len(chunk)
-            self.stderr_dropped_bytes += trim_buffer(
-                self.stderr,
-                total_bytes=self.stderr_total_bytes,
-                start_offset_attr="stderr_start_offset",
-                cursor_attr="stderr_cursor",
-                session=self,
-            )
-
-    def snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
-        self.refresh_status()
-        with self.lock:
-            stdout_omitted = max(0, self.stdout_start_offset - self.stdout_cursor)
-            stderr_omitted = max(0, self.stderr_start_offset - self.stderr_cursor)
-            stdout_start = max(0, self.stdout_cursor - self.stdout_start_offset)
-            stderr_start = max(0, self.stderr_cursor - self.stderr_start_offset)
-            stdout_bytes = bytes(self.stdout[stdout_start:])
-            stderr_bytes = bytes(self.stderr[stderr_start:])
-            self.stdout_cursor = self.stdout_total_bytes
-            self.stderr_cursor = self.stderr_total_bytes
-        stdout_truncation = truncate_output_bytes_tail(stdout_bytes, max_output_bytes)
-        stderr_truncation = truncate_output_bytes_tail(stderr_bytes, max_output_bytes)
-        stdout = stdout_truncation.content
-        stderr = stderr_truncation.content
-        stdout_truncated = stdout_truncation.truncated
-        stderr_truncated = stderr_truncation.truncated
-        if self.timed_out:
-            status = "timeout"
-        elif self.terminating and self.process.poll() is None:
-            status = "terminating"
-        else:
-            status = "running" if self.process.poll() is None else "exited"
-        payload: dict[str, Any] = {
-            "session_id": self.session_id,
-            "status": status,
-            "exit_code": self.exit_code,
-            "signal": self.signal_name,
-            "timed_out": self.timed_out,
-            "stdout": stdout,
-            "stderr": stderr,
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-            "stdout_truncated_by": stdout_truncation.truncated_by,
-            "stderr_truncated_by": stderr_truncation.truncated_by,
-            "stdout_output_lines": stdout_truncation.output_lines,
-            "stderr_output_lines": stderr_truncation.output_lines,
-            "stdout_output_bytes": stdout_truncation.output_bytes,
-            "stderr_output_bytes": stderr_truncation.output_bytes,
-            "stdout_dropped_bytes": self.stdout_dropped_bytes,
-            "stderr_dropped_bytes": self.stderr_dropped_bytes,
-            "stdout_omitted_bytes": stdout_omitted,
-            "stderr_omitted_bytes": stderr_omitted,
-            "truncated": stdout_truncated or stderr_truncated or stdout_omitted > 0 or stderr_omitted > 0,
-            "ok": True,
-        }
-        warnings: list[str] = list(self.warnings)
-        if stdout_truncated:
-            warnings.append(f"stdout truncated from tail by {stdout_truncation.truncated_by}")
-        if stderr_truncated:
-            warnings.append(f"stderr truncated from tail by {stderr_truncation.truncated_by}")
-        if stdout_omitted > 0:
-            warnings.append("stdout cursor skipped dropped bytes")
-        if stderr_omitted > 0:
-            warnings.append("stderr cursor skipped dropped bytes")
-        if warnings:
-            payload["warnings"] = warnings
-        return payload
-
-    def refresh_status(self) -> None:
-        if (
-            self.timeout_at is not None
-            and not self.timed_out
-            and self.process.poll() is None
-            and time.time() >= self.timeout_at
-        ):
-            self.timed_out = True
-            terminate_process_group(self.process, signal.SIGTERM)
-            self.drain_readers()
-        code = self.process.poll()
-        if code is None:
-            return
-        self.drain_readers()
-        self.exit_code = code
-        self.terminating = False
-        if code < 0:
-            self.signal_name = signal.Signals(-code).name if -code in [s.value for s in signal.Signals] else str(-code)
-        self.closed = True
-
-    def drain_readers(self, timeout: float = 0.2) -> None:
-        deadline = time.time() + timeout
-        for thread in list(self.reader_threads):
-            remaining = max(0.0, deadline - time.time())
-            if remaining <= 0:
-                break
-            thread.join(timeout=remaining)
-
-    def retained_output_bytes(self) -> bytes:
-        with self.lock:
-            stdout = bytes(self.stdout)
-            stderr = bytes(self.stderr)
-        sections: list[bytes] = []
-        if stdout:
-            sections.extend([b"--- stdout ---\n", stdout])
-        if stderr:
-            if sections:
-                sections.append(b"\n")
-            sections.extend([b"--- stderr ---\n", stderr])
-        return b"".join(sections)
-
-    def retained_stream_bytes(self, stream: str) -> tuple[bytes, int, int, int]:
-        with self.lock:
-            if stream == "stdout":
-                return (
-                    bytes(self.stdout),
-                    self.stdout_start_offset,
-                    self.stdout_total_bytes,
-                    self.stdout_dropped_bytes,
-                )
-            if stream == "stderr":
-                return (
-                    bytes(self.stderr),
-                    self.stderr_start_offset,
-                    self.stderr_total_bytes,
-                    self.stderr_dropped_bytes,
-                )
-        raise ValueError(f"Unknown output stream: {stream}")
+        except (OSError, subprocess.SubprocessError):
+            return set()
+        if completed.returncode not in {0, 1}:
+            return set()
+        return {path for path in completed.stdout.split("\0") if path}
 
 
 class Runtime:
@@ -1521,7 +1253,6 @@ class Runtime:
         dangerously_skip_all_permissions: bool = False,
         shell_env_policy: ShellEnvPolicy | None = None,
         allow_network: bool = False,
-        tool_profile: str = "full",
         auth_token: str | None = None,
         oauth_config: OAuthConfig | None = None,
     ) -> None:
@@ -1548,29 +1279,27 @@ class Runtime:
                 details={"supported": list(SHELL_ENV_INHERIT_CHOICES)},
             )
         self.allow_network = allow_network or self.capabilities.network
-        if tool_profile not in TOOL_PROFILE_CHOICES:
-            raise ToolFailure(
-                "INVALID_ARGUMENT",
-                f"Unknown tool profile: {tool_profile}",
-                category="validation",
-                details={"supported": list(TOOL_PROFILE_CHOICES)},
-            )
-        self.tool_profile = tool_profile
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
         self.server_instance_id = secrets.token_urlsafe(12)
         self._set_runtime_dir(runtime_dir_for_workspace(self.workspace.root, self.server_instance_id))
         self.fallback_runtime_dir = fallback_runtime_dir_for_workspace(self.workspace.root, self.server_instance_id)
-        self._pending_codes: dict[str, dict[str, Any]] = {}
-        self._pending_codes_lock = threading.Lock()
         self.default_cwd = self.workspace.root
         self.sessions: dict[str, ExecSession] = {}
         self.output_sessions: dict[str, ExecSession] = {}
         self.sessions_lock = threading.Lock()
+        self.starting_sessions = 0
+        self._closed = False
         self.http_session_id = secrets.token_urlsafe(24)
+        self.protocol_version = PROTOCOL_VERSION
         self.patch_baselines: dict[str, str | None] = {}
+        self.patch_lock = threading.Lock()
+        self.patch_committer = AtomicPatchCommitter()
+        self.project_context: ProjectContext = load_project_context(self.workspace.root)
+        self.request_sessions: dict[str | int, str] = {}
+        self.request_sessions_lock = threading.Lock()
+        self.request_context = threading.local()
         self.initialized = False
-        self.logging_level = "warning"
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
 
     def _set_runtime_dir(self, runtime_dir: Path) -> None:
@@ -1578,6 +1307,21 @@ class Runtime:
         self.home_dir = self.runtime_dir / "home"
         self.tmp_dir = self.runtime_dir / "tmp"
         self.cache_dir = self.runtime_dir / "cache"
+
+    def close(self) -> None:
+        with self.sessions_lock:
+            if self._closed:
+                return
+            self._closed = True
+            sessions = list(self.sessions.values())
+            self.sessions.clear()
+            self.output_sessions.clear()
+        for session in sessions:
+            session.refresh_status()
+            if session.process.poll() is None:
+                terminate_process_group(session.process, signal.SIGTERM)
+            session.drain_readers()
+        shutil.rmtree(self.runtime_dir, ignore_errors=True)
 
     def _ensure_runtime_dirs(self) -> None:
         candidates = [self.runtime_dir]
@@ -1645,22 +1389,21 @@ class Runtime:
 
     def initialize(self) -> dict[str, Any]:
         return {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {"listChanged": False}, "logging": {}},
+            "protocolVersion": self.protocol_version,
+            "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {
                 "name": SERVER_NAME,
                 "title": "Coding Tools MCP",
                 "version": __version__,
             },
-            "instructions": "Use these tools only for local coding operations inside the configured workspace.",
+            "instructions": self.project_context.server_instructions(),
         }
 
     def list_tools(self) -> dict[str, Any]:
-        return {"tools": [tool_definition(name, tool_profile=self.tool_profile) for name in self.exposed_tool_names()]}
+        return {"tools": [tool_definition(name) for name in self.exposed_tool_names()]}
 
     def exposed_tool_names(self) -> list[str]:
-        names = READ_ONLY_TOOL_NAMES if self.tool_profile == "read-only" else FULL_TOOL_NAMES
-        return [name for name in names if self.enable_view_image or name != "view_image"]
+        return [name for name in FULL_TOOL_NAMES if self.enable_view_image or name != "view_image"]
 
     def auth_enabled(self) -> bool:
         return self.auth_token is not None or self.oauth_config is not None
@@ -1704,10 +1447,9 @@ class Runtime:
             "server": SERVER_NAME,
             "title": "Coding Tools MCP",
             "version": __version__,
-            "protocol_version": PROTOCOL_VERSION,
+            "protocol_version": self.protocol_version,
             **self._exec_environment_summary(),
             "default_cwd": self.default_cwd_display(),
-            "tool_profile": self.tool_profile,
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
             "landlock": landlock,
@@ -1721,22 +1463,22 @@ class Runtime:
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
             "endpoint_path": "/mcp",
+            "project_context": {
+                "root_instruction_files": [item.path for item in self.project_context.root_files],
+                "nested_instruction_files": list(self.project_context.nested_files),
+                "warnings": list(self.project_context.warnings),
+            },
             "tools": tools,
             "tool_count": len(tools),
         }
 
-    def set_logging_level(self, params: dict[str, Any]) -> dict[str, Any]:
-        level = params.get("level")
-        if not isinstance(level, str) or level not in LOGGING_LEVELS:
-            raise JsonRpcError(
-                -32602,
-                "logging/setLevel requires a valid logging level",
-                {"supported": list(LOGGING_LEVELS), "received": level},
-            )
-        self.logging_level = level
-        return {}
-
-    def call_tool(self, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        request_id: str | int | None = None,
+    ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
         handler = self._tool_handlers.get(name) if name in self.exposed_tool_names() else None
@@ -1744,19 +1486,29 @@ class Runtime:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         validate_arguments(name, args)
         try:
-            payload = handler(args)
+            self.request_context.request_id = request_id
+            try:
+                payload = handler(args)
+            finally:
+                if request_id is not None:
+                    with self.request_sessions_lock:
+                        self.request_sessions.pop(request_id, None)
+                self.request_context.request_id = None
             payload.setdefault("ok", True)
             self.emit_tool_trace(name, args, payload, started_at)
             content = None
-            if name == "view_image" and args.get("output", "mcp_image") == "mcp_image":
+            if name == "view_image":
+                encoded = str(payload.pop("_mcp_image_data", ""))
                 content = [
                     {
                         "type": "image",
-                        "data": str(payload.get("base64", "")),
+                        "data": encoded,
                         "mimeType": str(payload.get("mime_type", "application/octet-stream")),
                     }
                 ]
-            return tool_result(payload, is_error=payload.get("ok") is False, content=content)
+            else:
+                payload.pop("_mcp_image_data", None)
+            return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
         except ToolFailure as exc:
             payload = {
                 "ok": False,
@@ -1768,6 +1520,8 @@ class Runtime:
                     "details": exc.details,
                 },
             }
+            if name == "exec_command":
+                payload["status"] = "failed"
             diagnostics = permission_failure_diagnostics(exc)
             if diagnostics:
                 payload["diagnostics"] = diagnostics
@@ -1782,7 +1536,7 @@ class Runtime:
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
             self.emit_tool_trace(name, args, payload, started_at)
-            return tool_result(payload, is_error=True)
+            return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
             payload = {
                 "ok": False,
@@ -1794,8 +1548,10 @@ class Runtime:
                     "details": {},
                 },
             }
+            if name == "exec_command":
+                payload["status"] = "failed"
             self.emit_tool_trace(name, args, payload, started_at)
-            return tool_result(payload, is_error=True)
+            return make_tool_result(name, payload, is_error=True)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
@@ -1867,26 +1623,39 @@ class Runtime:
         encoding = args.get("encoding", "utf-8")
         if encoding != "utf-8":
             raise ToolFailure("UNSUPPORTED_ENCODING", "Only utf-8 is supported.", category="validation")
-        data = resolved.path.read_bytes()
-        if b"\x00" in data[:4096]:
-            raise ToolFailure("BINARY_FILE", "Binary file read blocked for text tool.", category="validation")
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ToolFailure("UNSUPPORTED_ENCODING", "File is not valid utf-8.", category="validation") from exc
-        lines = text.splitlines(keepends=True)
-        total_lines = len(lines)
-        total_bytes = len(data)
+        total_bytes = resolved.path.stat().st_size
+        with resolved.path.open("rb") as raw_handle:
+            if b"\x00" in raw_handle.read(4096):
+                raise ToolFailure("BINARY_FILE", "Binary file read blocked for text tool.", category="validation")
         if start_line < 1:
             raise ToolFailure("INVALID_ARGUMENT", "start_line must be >= 1.", category="validation")
-        end = int(end_line) if end_line is not None else total_lines
-        if end < start_line:
-            selected = ""
-        else:
-            selected = "".join(lines[start_line - 1 : end])
+        requested_end = int(end_line) if end_line is not None else None
+        selected_parts: list[str] = []
+        selected_bytes = 0
+        total_lines = 0
+        selection_complete = False
+        try:
+            with resolved.path.open("r", encoding="utf-8", errors="strict", newline="") as handle:
+                for total_lines, line in enumerate(handle, start=1):
+                    if total_lines < start_line:
+                        continue
+                    if requested_end is not None and total_lines > requested_end:
+                        continue
+                    if selection_complete:
+                        continue
+                    selected_parts.append(line)
+                    selected_bytes += len(line.encode("utf-8"))
+                    if len(selected_parts) > DEFAULT_MAX_LINES or selected_bytes > max_bytes:
+                        selection_complete = True
+        except UnicodeDecodeError as exc:
+            raise ToolFailure("UNSUPPORTED_ENCODING", "File is not valid utf-8.", category="validation") from exc
+        selected = "".join(selected_parts)
         truncation = truncate_text_head(selected, max_lines=DEFAULT_MAX_LINES, max_bytes=max_bytes)
         selected = truncation.content
-        truncated = truncation.truncated
+        truncated = truncation.truncated or selection_complete
+        end = requested_end if requested_end is not None else total_lines
+        if end < start_line:
+            selected = ""
         actual_end = min(end, total_lines)
         if truncated and truncation.output_lines > 0:
             actual_end = min(total_lines, start_line + truncation.output_lines - 1)
@@ -1906,7 +1675,7 @@ class Runtime:
             "total_bytes": total_bytes,
             "bytes_read": len(selected.encode("utf-8")),
             "truncated": truncated,
-            "truncated_by": truncation.truncated_by,
+            "truncated_by": truncation.truncated_by or ("bytes" if selection_complete else None),
             "output_lines": truncation.output_lines,
             "output_bytes": truncation.output_bytes,
             "next_start_line": next_start_line,
@@ -1934,8 +1703,15 @@ class Runtime:
                 children = list(directory.iterdir())
             except OSError:
                 return
+            child_rel_paths = [normalize_rel_display(child, self.workspace.root) for child in children]
+            ignored = set() if include_ignored else self.workspace.git_ignored_paths(child_rel_paths)
             for child in children:
-                if self.workspace.is_ignored_path(child, include_hidden=include_hidden, include_ignored=include_ignored):
+                if self.workspace.is_ignored_path(
+                    child,
+                    include_hidden=include_hidden,
+                    include_ignored=include_ignored,
+                    git_ignored=ignored,
+                ):
                     continue
                 entries.append(entry_for_path(child, self.workspace.root))
                 if len(entries) >= max_entries:
@@ -1982,27 +1758,36 @@ class Runtime:
             return fast_result
         files: list[dict[str, Any]] = []
         truncated = False
-        for path in walk_files(resolved.path):
-            if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
-                continue
-            if self.workspace.is_ignored_path(path, include_hidden=include_hidden, include_ignored=include_ignored):
-                continue
-            rel = normalize_rel_display(path, self.workspace.root)
-            if not any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in patterns):
-                continue
-            if any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in exclude_patterns):
-                continue
-            stat = path.lstat()
-            files.append(
-                {
-                    "path": rel,
-                    "type": "symlink" if path.is_symlink() else "file",
-                    "size_bytes": stat.st_size,
-                    "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
-                }
-            )
-            if len(files) >= max_results:
-                truncated = True
+        for batch in path_batches(walk_files(resolved.path), 256):
+            rel_paths = [normalize_rel_display(path, self.workspace.root) for path in batch]
+            ignored = set() if include_ignored else self.workspace.git_ignored_paths(rel_paths)
+            for path, rel in zip(batch, rel_paths):
+                if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
+                    continue
+                if self.workspace.is_ignored_path(
+                    path,
+                    include_hidden=include_hidden,
+                    include_ignored=include_ignored,
+                    git_ignored=ignored,
+                ):
+                    continue
+                if not any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in patterns):
+                    continue
+                if any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in exclude_patterns):
+                    continue
+                path_stat = path.lstat()
+                files.append(
+                    {
+                        "path": rel,
+                        "type": "symlink" if path.is_symlink() else "file",
+                        "size_bytes": path_stat.st_size,
+                        "modified": datetime.fromtimestamp(path_stat.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+                    }
+                )
+                if len(files) >= max_results:
+                    truncated = True
+                    break
+            if truncated:
                 break
         files.sort(key=lambda item: item["modified"] if args.get("sort") == "modified" else item["path"])
         return {
@@ -2077,8 +1862,6 @@ class Runtime:
                 path = resolved.path / rel_to_search
                 if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
                     continue
-                if self.workspace.is_ignored_path(path, include_hidden=include_hidden, include_ignored=include_ignored):
-                    continue
                 rel = normalize_rel_display(path, self.workspace.root)
                 if any(fnmatch.fnmatch(rel, pat) or PurePosixPath(rel).match(pat) for pat in exclude_patterns):
                     continue
@@ -2087,8 +1870,16 @@ class Runtime:
                     break
             if len(paths) >= max_results:
                 break
+        ignored = set() if include_ignored else self.workspace.git_ignored_paths(list(paths))
         files: list[dict[str, Any]] = []
         for rel, path in paths.items():
+            if self.workspace.is_ignored_path(
+                path,
+                include_hidden=include_hidden,
+                include_ignored=include_ignored,
+                git_ignored=ignored,
+            ):
+                continue
             try:
                 stat = path.lstat()
             except OSError:
@@ -2230,134 +2021,210 @@ class Runtime:
         search_path = resolved.display if resolved.display != "." else "."
         args.extend(["--", query, search_path])
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 args,
                 cwd=str(self.workspace.root),
                 text=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=10,
+                stderr=subprocess.DEVNULL,
             )
-        except Exception:
+        except OSError:
             return None
-        if completed.returncode not in {0, 1}:
-            return None
+        timed_out = threading.Event()
+
+        def stop_timed_out_search() -> None:
+            timed_out.set()
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        timeout = threading.Timer(10, stop_timed_out_search)
+        timeout.daemon = True
+        timeout.start()
         matches: list[dict[str, Any]] = []
         total = 0
+        truncated = False
         file_cache: dict[str, list[str]] = {}
-        for raw in completed.stdout.splitlines():
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") != "match":
-                continue
-            data = event.get("data") if isinstance(event.get("data"), dict) else {}
-            path_text = data.get("path", {}).get("text") if isinstance(data.get("path"), dict) else None
-            line_number = data.get("line_number")
-            line_text = data.get("lines", {}).get("text") if isinstance(data.get("lines"), dict) else ""
-            if not isinstance(path_text, str) or not isinstance(line_number, int):
-                continue
-            total += 1
-            if len(matches) >= max_results:
-                continue
-            rel = normalize_rel_display((self.workspace.root / path_text).resolve(), self.workspace.root)
-            submatches = data.get("submatches") if isinstance(data.get("submatches"), list) else []
-            first_submatch = submatches[0] if submatches and isinstance(submatches[0], dict) else {}
-            column = int(first_submatch.get("start", 0)) + 1
-            sanitized = str(line_text).replace("\r\n", "\n").replace("\r", "").rstrip("\n")
-            preview, line_truncated = truncate_line_chars(sanitized)
-            preview_truncation = truncate_text_head(preview, max_lines=1, max_bytes=max_preview_bytes)
-            preview = preview_truncation.content
-            lines = file_cache.get(rel)
-            if lines is None:
+        assert process.stdout is not None
+        try:
+            for raw in process.stdout:
                 try:
-                    lines = (self.workspace.root / rel).read_text(encoding="utf-8").splitlines()
-                except OSError:
-                    lines = []
-                file_cache[rel] = lines
-            index = line_number - 1
-            before = lines[max(0, index - context_lines) : index] if lines else []
-            after = lines[index + 1 : index + 1 + context_lines] if lines else []
-            item = {
-                "path": rel,
-                "line": line_number,
-                "column": column,
-                "preview": preview,
-                "before": before,
-                "after": after,
-            }
-            if line_truncated or preview_truncation.truncated:
-                item["preview_truncated"] = True
-                item["preview_truncated_by"] = "chars" if line_truncated else preview_truncation.truncated_by
-            matches.append(item)
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "match":
+                    continue
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                path_text = data.get("path", {}).get("text") if isinstance(data.get("path"), dict) else None
+                line_number = data.get("line_number")
+                line_text = data.get("lines", {}).get("text") if isinstance(data.get("lines"), dict) else ""
+                if not isinstance(path_text, str) or not isinstance(line_number, int):
+                    continue
+                total += 1
+                if len(matches) >= max_results:
+                    truncated = True
+                    process.terminate()
+                    break
+                rel = normalize_rel_display((self.workspace.root / path_text).resolve(), self.workspace.root)
+                submatches = data.get("submatches") if isinstance(data.get("submatches"), list) else []
+                first_submatch = submatches[0] if submatches and isinstance(submatches[0], dict) else {}
+                column = int(first_submatch.get("start", 0)) + 1
+                sanitized = str(line_text).replace("\r\n", "\n").replace("\r", "").rstrip("\n")
+                preview, line_truncated = truncate_line_chars(sanitized)
+                preview_truncation = truncate_text_head(preview, max_lines=1, max_bytes=max_preview_bytes)
+                preview = preview_truncation.content
+                lines: list[str] = []
+                if context_lines > 0:
+                    lines = file_cache.get(rel, [])
+                    if rel not in file_cache:
+                        try:
+                            lines = (self.workspace.root / rel).read_text(encoding="utf-8").splitlines()
+                        except OSError:
+                            lines = []
+                        file_cache[rel] = lines
+                index = line_number - 1
+                before = lines[max(0, index - context_lines) : index] if lines else []
+                after = lines[index + 1 : index + 1 + context_lines] if lines else []
+                item = {
+                    "path": rel,
+                    "line": line_number,
+                    "column": column,
+                    "preview": preview,
+                    "before": before,
+                    "after": after,
+                }
+                if line_truncated or preview_truncation.truncated:
+                    item["preview_truncated"] = True
+                    item["preview_truncated_by"] = "chars" if line_truncated else preview_truncation.truncated_by
+                matches.append(item)
+        finally:
+            timeout.cancel()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+        if timed_out.is_set():
+            return None
+        if not truncated and process.returncode not in {0, 1}:
+            return None
         return {
             "query": query,
             "matches": matches,
             "total_matches": total,
-            "truncated": total > len(matches),
+            "total_matches_exact": not truncated,
+            "truncated": truncated,
             "engine": "rg",
-            "warnings": ["result limit reached"] if total > len(matches) else [],
+            "warnings": ["result limit reached; search stopped early"] if truncated else [],
         }
 
     def apply_patch(self, args: dict[str, Any]) -> dict[str, Any]:
         patch = str(args.get("patch", ""))
         dry_run = bool(args.get("dry_run", False))
-        operations = parse_patch(patch)
-        staged: dict[str, str | None] = {}
-        summaries: list[str] = []
-        affected: list[dict[str, str]] = []
-        for op in operations:
-            self._validate_patch_path(op.path, require_existing=op.kind in {"update", "delete"})
-            if op.kind in {"add", "update", "delete"}:
-                self.workspace.reject_write_symlink(op.path)
-            if op.move_to:
-                self._validate_patch_path(op.move_to, require_existing=False)
-                self.workspace.reject_write_symlink(op.move_to)
-            if op.kind == "add":
-                target = self.workspace.resolve_for_write(op.path)
-                if target.existed:
-                    raise ToolFailure("PATCH_FAILED", "Cannot add file that already exists.", category="validation")
-                staged[target.display] = op.add_content or ""
-                affected.append({"path": target.display, "operation": "add"})
-                summaries.append(f"A {target.display}")
-            elif op.kind == "delete":
-                target = self.workspace.resolve_existing(op.path)
-                if target.path.is_dir():
-                    raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
-                staged[target.display] = None
-                affected.append({"path": target.display, "operation": "delete"})
-                summaries.append(f"D {target.display}")
-            elif op.kind == "update":
-                source = self.workspace.resolve_existing(op.path)
-                if source.path.is_dir():
-                    raise ToolFailure("PATCH_FAILED", "Cannot update a directory.", category="validation")
-                current = staged.get(source.display)
-                if current is None and source.display in staged:
-                    raise ToolFailure("PATCH_FAILED", "Cannot update a deleted file.", category="validation")
-                content = current if isinstance(current, str) else read_text_preserve_newlines(source.path)
-                updated = apply_update_hunks(content, op.hunks, op.path)
+        with self.patch_lock:
+            operations = parse_patch(patch)
+            staged: dict[str, StagedFile] = {}
+            summaries: list[str] = []
+            affected: list[dict[str, str]] = []
+            additions = 0
+            removals = 0
+            for op in operations:
+                self._validate_patch_path(op.path, require_existing=op.kind in {"update", "delete"})
+                if op.kind in {"add", "update", "delete"}:
+                    self.workspace.reject_write_symlink(op.path)
                 if op.move_to:
-                    dest = self.workspace.resolve_for_write(op.move_to)
-                    if dest.existed and dest.display != source.display:
-                        raise ToolFailure("PATCH_FAILED", "Cannot move over an existing file.", category="validation")
-                    staged[source.display] = None
-                    staged[dest.display] = updated
-                    affected.append({"path": dest.display, "old_path": source.display, "operation": "move"})
-                    summaries.append(f"R {source.display} -> {dest.display}")
-                else:
-                    staged[source.display] = updated
-                    affected.append({"path": source.display, "operation": "update"})
-                    summaries.append(f"M {source.display}")
-        if not affected:
-            raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
-        if not dry_run:
-            self._commit_staged_files(staged)
+                    self._validate_patch_path(op.move_to, require_existing=False)
+                    self.workspace.reject_write_symlink(op.move_to)
+                if op.kind == "add":
+                    target = self.workspace.resolve_for_write(op.path)
+                    if target.existed:
+                        raise ToolFailure("PATCH_FAILED", "Cannot add file that already exists.", category="validation")
+                    baseline = FileBaseline.capture(target.path)
+                    staged[target.display] = StagedFile(
+                        target.display,
+                        target.path,
+                        op.add_content or "",
+                        baseline,
+                        None,
+                    )
+                    affected.append({"path": target.display, "operation": "add"})
+                    summaries.append(f"A {target.display}")
+                    additions += len((op.add_content or "").splitlines())
+                elif op.kind == "delete":
+                    target = self.workspace.resolve_existing(op.path)
+                    if target.path.is_dir():
+                        raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
+                    prior = staged.get(target.display)
+                    baseline = prior.baseline if prior is not None else FileBaseline.capture(target.path)
+                    staged[target.display] = StagedFile(target.display, target.path, None, baseline, baseline.mode)
+                    affected.append({"path": target.display, "operation": "delete"})
+                    summaries.append(f"D {target.display}")
+                    removals += len((baseline.data or b"").splitlines())
+                elif op.kind == "update":
+                    source = self.workspace.resolve_existing(op.path)
+                    if source.path.is_dir():
+                        raise ToolFailure("PATCH_FAILED", "Cannot update a directory.", category="validation")
+                    prior = staged.get(source.display)
+                    if prior is not None and prior.content is None:
+                        raise ToolFailure("PATCH_FAILED", "Cannot update a deleted file.", category="validation")
+                    baseline = prior.baseline if prior is not None else FileBaseline.capture(source.path)
+                    content = prior.content if prior is not None else baseline.text(source.display)
+                    assert content is not None
+                    updated = apply_update_hunks(content, op.hunks, op.path)
+                    additions += sum(
+                        line.startswith("+")
+                        for hunk in op.hunks
+                        for line in hunk
+                    )
+                    removals += sum(
+                        line.startswith("-")
+                        for hunk in op.hunks
+                        for line in hunk
+                    )
+                    source_mode = prior.mode if prior is not None else baseline.mode
+                    if op.move_to:
+                        dest = self.workspace.resolve_for_write(op.move_to)
+                        if dest.existed and dest.display != source.display:
+                            raise ToolFailure("PATCH_FAILED", "Cannot move over an existing file.", category="validation")
+                        dest_baseline = baseline if dest.display == source.display else FileBaseline.capture(dest.path)
+                        staged[source.display] = StagedFile(
+                            source.display,
+                            source.path,
+                            None,
+                            baseline,
+                            source_mode,
+                        )
+                        staged[dest.display] = StagedFile(
+                            dest.display,
+                            dest.path,
+                            updated,
+                            dest_baseline,
+                            source_mode,
+                        )
+                        affected.append({"path": dest.display, "old_path": source.display, "operation": "move"})
+                        summaries.append(f"R {source.display} -> {dest.display}")
+                    else:
+                        staged[source.display] = StagedFile(
+                            source.display,
+                            source.path,
+                            updated,
+                            baseline,
+                            source_mode,
+                        )
+                        affected.append({"path": source.display, "operation": "update"})
+                        summaries.append(f"M {source.display}")
+            if not affected:
+                raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
+            if not dry_run:
+                self._commit_staged_files(list(staged.values()))
         return {
             "dry_run": dry_run,
             "clean": True,
             "summary": "\n".join(summaries),
             "affected_files": affected,
+            "additions": additions,
+            "removals": removals,
             "warnings": [],
         }
 
@@ -2367,40 +2234,17 @@ class Runtime:
         else:
             self.workspace.resolve_for_write(raw_path)
 
-    def _commit_staged_files(self, staged: dict[str, str | None]) -> None:
-        backups: dict[Path, bytes | None] = {}
-        try:
-            for rel, content in staged.items():
-                path = self.workspace.resolve_for_write(rel).path
-                backups[path] = path.read_bytes() if path.exists() and not path.is_dir() else None
-                if rel not in self.patch_baselines:
-                    if backups[path] is None:
-                        self.patch_baselines[rel] = None
-                    else:
-                        self.patch_baselines[rel] = backups[path].decode("utf-8", errors="replace")
-                if content is None:
-                    if path.exists():
-                        if path.is_dir():
-                            raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
-                        path.unlink()
-                else:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    with path.open("w", encoding="utf-8", newline="") as handle:
-                        handle.write(content)
-        except Exception:
-            for path, data in backups.items():
-                try:
-                    if data is None:
-                        if path.exists() and not path.is_dir():
-                            path.unlink()
-                    else:
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(data)
-                except OSError:
-                    pass
-            raise
+    def _commit_staged_files(self, staged: list[StagedFile]) -> None:
+        self.patch_committer.commit(staged)
+        for change in staged:
+            if change.display in self.patch_baselines:
+                continue
+            self.patch_baselines[change.display] = (
+                None if change.baseline.data is None else change.baseline.data.decode("utf-8", errors="replace")
+            )
 
     def exec_command(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._prune_sessions()
         cmd = str(args.get("cmd", ""))
         if not cmd:
             raise ToolFailure("INVALID_ARGUMENT", "cmd is required.", category="validation")
@@ -2412,7 +2256,7 @@ class Runtime:
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
         self._check_command_policy(cmd, args)
         timeout_ms = int(args.get("timeout_ms", 30000))
-        yield_ms = int(args.get("yield_time_ms", 1000))
+        yield_ms = int(args.get("yield_time_ms", 10000))
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
@@ -2438,47 +2282,84 @@ class Runtime:
                 if exc.code != "SANDBOX_UNAVAILABLE":
                     raise
                 landlock_warning = landlock_unavailable_warning(exc)
+        with self.sessions_lock:
+            if self._closed:
+                if landlock_fd is not None:
+                    os.close(landlock_fd)
+                raise ToolFailure("SESSION_CLOSED", "Runtime is closed.", category="runtime")
+            if len(self.sessions) + self.starting_sessions >= MAX_ACTIVE_EXEC_SESSIONS:
+                if landlock_fd is not None:
+                    os.close(landlock_fd)
+                raise ToolFailure(
+                    "SESSION_LIMIT_REACHED",
+                    "Too many commands are already running or starting.",
+                    category="runtime",
+                    retryable=True,
+                    details={"max_active_sessions": MAX_ACTIVE_EXEC_SESSIONS},
+                )
+            self.starting_sessions += 1
+        process: subprocess.Popen[bytes] | None = None
+        session: ExecSession | None = None
+        registered = False
+        slot_released = False
         try:
-            process = subprocess.Popen(
+            process, pty_master_fd = spawn_process(
                 popen_cmd,
                 cwd=str(workdir.path),
                 shell=popen_shell,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 env=env,
-                **popen_extra,
+                tty=tty,
+                popen_kwargs=popen_extra,
             )
+            session = self._make_session(
+                process,
+                timeout_at=deadline,
+                warnings=[landlock_warning] if landlock_warning else None,
+                pty_master_fd=pty_master_fd,
+            )
+            with self.sessions_lock:
+                self.starting_sessions -= 1
+                slot_released = True
+                if not self._closed:
+                    self.sessions[session.session_id] = session
+                    registered = True
+            if not registered:
+                raise ToolFailure("SESSION_CLOSED", "Runtime closed while the command was starting.", category="runtime")
+        except Exception:
+            with self.sessions_lock:
+                if not registered and not slot_released:
+                    self.starting_sessions -= 1
+            if process is not None and process.poll() is None:
+                terminate_process_group(process, signal.SIGTERM)
+            raise
         finally:
             if landlock_fd is not None:
                 try:
                     os.close(landlock_fd)
                 except OSError:
                     pass
-        session = self._make_session(
-            process,
-            timeout_at=deadline,
-            warnings=[landlock_warning] if landlock_warning else None,
-        )
+        assert session is not None
+        request_id = getattr(self.request_context, "request_id", None)
+        if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
+            with self.request_sessions_lock:
+                self.request_sessions[request_id] = session.session_id
         start_reader_threads(session)
         start_session_watchdog(session)
-        if process.stdin is not None:
-            try:
-                if stdin_text:
-                    process.stdin.write(stdin_text.encode("utf-8"))
-                    process.stdin.flush()
-            except BrokenPipeError:
-                pass
-            finally:
-                if not tty:
-                    try:
-                        process.stdin.close()
-                    except OSError:
-                        pass
+        try:
+            if stdin_text:
+                session.write_input(stdin_text.encode("utf-8"))
+        except ToolFailure:
+            if process.poll() is None:
+                raise
+        finally:
+            if not tty:
+                session.close_stdin()
         initial_wait = max(0, min(yield_ms, 30000)) / 1000.0
 
         def finish(status: str, **extra: Any) -> dict[str, Any]:
             payload = session.snapshot_since_cursor(max_output_bytes)
+            if status == "exited" and session.signal_name is not None:
+                status = "terminated"
             payload["status"] = status
             payload["elapsed_ms"] = int((time.time() - start) * 1000)
             payload.update(extra)
@@ -2498,13 +2379,11 @@ class Runtime:
                 session.drain_readers()
                 return finish("timeout", timed_out=True)
             with session.lock:
-                tty_has_initial_output = (
+                tty_has_initial_output = bool(
                     len(session.stdout) > session.stdout_cursor
                     or len(session.stderr) > session.stderr_cursor
                 )
             if now - start >= initial_wait or (tty and tty_has_initial_output):
-                with self.sessions_lock:
-                    self.sessions[session.session_id] = session
                 return finish("running")
             time.sleep(0.02)
 
@@ -2742,23 +2621,62 @@ class Runtime:
         *,
         timeout_at: float | None = None,
         warnings: list[str] | None = None,
+        pty_master_fd: int | None = None,
     ) -> ExecSession:
         return ExecSession(
             session_id=secrets.token_urlsafe(18),
             process=process,
             timeout_at=timeout_at,
             warnings=warnings or [],
+            pty_master_fd=pty_master_fd,
         )
 
     def _remember_output_session(self, session: ExecSession) -> None:
+        session.refresh_status()
         with self.sessions_lock:
             self.output_sessions.pop(session.session_id, None)
             self.output_sessions[session.session_id] = session
-            while len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS:
+            while len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS or self._retained_output_bytes_locked() > MAX_RUNTIME_OUTPUT_BYTES:
                 oldest = next(iter(self.output_sessions))
                 self.output_sessions.pop(oldest, None)
 
+    def _retained_output_bytes_locked(self) -> int:
+        return sum(session.retained_bytes for session in self.sessions.values()) + sum(
+            session.retained_bytes for session in self.output_sessions.values()
+        )
+
+    def _complete_session(self, session: ExecSession) -> None:
+        session.refresh_status()
+        if session.process.poll() is None:
+            return
+        with self.sessions_lock:
+            self.sessions.pop(session.session_id, None)
+        self._remember_output_session(session)
+
+    def _prune_sessions(self) -> None:
+        with self.sessions_lock:
+            active = list(self.sessions.values())
+        for session in active:
+            session.refresh_status()
+            if session.process.poll() is not None:
+                self._complete_session(session)
+        cutoff = time.time() - COMPLETED_SESSION_TTL_SECONDS
+        with self.sessions_lock:
+            expired = [
+                session_id
+                for session_id, session in self.output_sessions.items()
+                if session.completed_at is not None and session.completed_at < cutoff
+            ]
+            for session_id in expired:
+                self.output_sessions.pop(session_id, None)
+            while self.output_sessions and (
+                len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS
+                or self._retained_output_bytes_locked() > MAX_RUNTIME_OUTPUT_BYTES
+            ):
+                self.output_sessions.pop(next(iter(self.output_sessions)), None)
+
     def _get_output_session(self, session_id: str) -> ExecSession:
+        self._prune_sessions()
         with self.sessions_lock:
             session = self.sessions.get(session_id) or self.output_sessions.get(session_id)
         if session is None:
@@ -2766,6 +2684,35 @@ class Runtime:
         return session
 
     def _format_session_output(self, session: ExecSession, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+        terminal = payload.get("status") != "running"
+        if terminal:
+            self._complete_session(session)
+        if payload.get("status") == "running":
+            payload["next_action"] = {
+                "tool": "write_stdin",
+                "arguments": {
+                    "session_id": session.session_id,
+                    "chars": "",
+                    "yield_time_ms": 10000,
+                },
+            }
+        if payload.get("truncated"):
+            if terminal:
+                self._remember_output_session(session)
+            output_refs = {
+                "stdout": f"session:{session.session_id}:stdout",
+                "stderr": f"session:{session.session_id}:stderr",
+            }
+            output_stream = "stderr" if not payload.get("stdout") and payload.get("stderr") else "stdout"
+            payload["output_ref"] = output_refs[output_stream]
+            payload["output_stream"] = output_stream
+            payload["output_refs"] = output_refs
+            payload["output_truncated"] = True
+            if terminal:
+                payload["next_action"] = {
+                    "tool": "read_output",
+                    "arguments": {"output_ref": payload["output_ref"], "offset": 0, "limit": EXEC_PREVIEW_BYTES},
+                }
         verbosity = str(args.get("verbosity", "")).strip().lower()
         if not verbosity:
             return payload
@@ -2775,7 +2722,8 @@ class Runtime:
                 "verbosity must be one of: summary, preview, full.",
                 category="validation",
             )
-        self._remember_output_session(session)
+        if terminal:
+            self._remember_output_session(session)
         output_refs = {
             "stdout": f"session:{session.session_id}:stdout",
             "stderr": f"session:{session.session_id}:stderr",
@@ -2894,14 +2842,8 @@ class Runtime:
             payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
             return self._format_session_output(session, payload, args)
         if chars:
-            if session.process.stdin is None or session.process.stdin.closed:
-                raise ToolFailure("SESSION_CLOSED", "Session stdin is closed.", category="runtime")
-            try:
-                session.process.stdin.write(chars.encode("utf-8"))
-                session.process.stdin.flush()
-            except (BrokenPipeError, ValueError) as exc:
-                raise ToolFailure("SESSION_CLOSED", "Session stdin is closed.", category="runtime") from exc
-        wait_until = time.time() + (int(args.get("yield_time_ms", 1000)) / 1000.0)
+            session.write_input(chars.encode("utf-8"))
+        wait_until = time.time() + (int(args.get("yield_time_ms", 10000)) / 1000.0)
         first_output_at: float | None = None
         while time.time() < wait_until and session.process.poll() is None:
             time.sleep(0.02)
@@ -2929,21 +2871,26 @@ class Runtime:
         session_id = str(args.get("session_id", ""))
         session = self._get_session(session_id)
         signal_name = str(args.get("signal", "TERM"))
-        signum = {"TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "INT": signal.SIGINT}.get(signal_name, signal.SIGTERM)
+        force = signal_name == "KILL"
+        signum = {"TERM": signal.SIGTERM, "KILL": HARD_KILL_SIGNAL, "INT": signal.SIGINT}.get(
+            signal_name,
+            signal.SIGTERM,
+        )
         evict = True
-        signal_sent = signal.Signals(signum).name
+        signal_sent = "SIGKILL" if force else signal.Signals(signum).name
         if session.process.poll() is None:
             session.terminating = True
-            self._terminate_process_group(session.process, signum)
+            self._terminate_process_group(session.process, signum, force=force)
             exited = self._wait_for_session_exit(session, int(args.get("wait_ms", 5000)) / 1000.0)
-            if not exited and signum != signal.SIGKILL:
-                signum = signal.SIGKILL
-                signal_sent = signal.SIGKILL.name
-                self._terminate_process_group(session.process, signal.SIGKILL)
+            if not exited and not force:
+                signum = HARD_KILL_SIGNAL
+                force = True
+                signal_sent = "SIGKILL"
+                self._terminate_process_group(session.process, HARD_KILL_SIGNAL, force=True)
                 exited = self._wait_for_session_exit(session, int(args.get("kill_wait_ms", 2000)) / 1000.0)
             if exited:
                 killed = True
-                status = "killed" if signum == signal.SIGKILL else "terminated"
+                status = "killed" if force else "terminated"
             else:
                 killed = False
                 evict = False
@@ -2973,15 +2920,28 @@ class Runtime:
         if session.process.poll() is None:
             self._terminate_process_group(session.process, signal.SIGTERM)
 
+    def cancel_request(self, request_id: str | int) -> None:
+        with self.request_sessions_lock:
+            session_id = self.request_sessions.get(request_id)
+        if session_id is not None:
+            self.cancel_session(session_id)
+
     def _get_session(self, session_id: str) -> ExecSession:
+        self._prune_sessions()
         with self.sessions_lock:
-            session = self.sessions.get(session_id)
+            session = self.sessions.get(session_id) or self.output_sessions.get(session_id)
         if session is None:
             raise ToolFailure("SESSION_NOT_FOUND", "Session not found; stdin access denied.", category="not_found")
         return session
 
-    def _terminate_process_group(self, process: subprocess.Popen[bytes], signum: signal.Signals) -> None:
-        terminate_process_group(process, signum)
+    def _terminate_process_group(
+        self,
+        process: subprocess.Popen[bytes],
+        signum: signal.Signals,
+        *,
+        force: bool = False,
+    ) -> None:
+        terminate_process_group(process, signum, force=force)
 
     def git_status(self, args: dict[str, Any]) -> dict[str, Any]:
         resolved = self.resolve_existing(str(args.get("path", ".")))
@@ -3329,7 +3289,6 @@ class Runtime:
                 category="validation",
                 details={"bytes": len(data), "max_bytes": max_bytes, "resize_attempted": auto_resize, "warnings": warnings},
             )
-        encoded = base64.b64encode(data).decode("ascii")
         payload: dict[str, Any] = {
             "path": resolved.display,
             "mime_type": mime_type,
@@ -3338,184 +3297,32 @@ class Runtime:
             "height": height,
             "resized": resized,
             "original": original,
-            "base64": encoded,
-            "data_url": f"data:{mime_type};base64,{encoded}",
+            "_mcp_image_data": base64.b64encode(data).decode("ascii"),
             "warnings": warnings,
         }
         return payload
 
 
-@dataclass
-class PatchOperation:
-    kind: str
-    path: str
-    add_content: str | None = None
-    hunks: list[list[str]] = field(default_factory=list)
-    move_to: str | None = None
-
-
-def parse_patch(patch: str) -> list[PatchOperation]:
-    lines = patch.splitlines()
-    if not lines or lines[0].strip() != "*** Begin Patch" or lines[-1].strip() != "*** End Patch":
-        raise ToolFailure("PATCH_FAILED", "Patch must use *** Begin Patch / *** End Patch envelope.", category="validation")
-    operations: list[PatchOperation] = []
-    i = 1
-    while i < len(lines) - 1:
-        line = lines[i]
-        if not line:
-            i += 1
-            continue
-        if line.startswith("*** Add File: "):
-            path = line.removeprefix("*** Add File: ").strip()
-            i += 1
-            content_lines: list[str] = []
-            while i < len(lines) - 1 and not lines[i].startswith("*** "):
-                if not lines[i].startswith("+"):
-                    raise ToolFailure("PATCH_FAILED", "Add file lines must start with '+'.", category="validation")
-                content_lines.append(lines[i][1:])
-                i += 1
-            operations.append(PatchOperation("add", path, add_content="\n".join(content_lines) + "\n"))
-            continue
-        if line.startswith("*** Delete File: "):
-            path = line.removeprefix("*** Delete File: ").strip()
-            operations.append(PatchOperation("delete", path))
-            i += 1
-            continue
-        if line.startswith("*** Update File: "):
-            path = line.removeprefix("*** Update File: ").strip()
-            i += 1
-            move_to: str | None = None
-            if i < len(lines) - 1 and lines[i].startswith("*** Move to: "):
-                move_to = lines[i].removeprefix("*** Move to: ").strip()
-                i += 1
-            hunks: list[list[str]] = []
-            current: list[str] = []
-            while i < len(lines) - 1 and not lines[i].startswith("*** "):
-                if lines[i].startswith("@@"):
-                    if current:
-                        hunks.append(current)
-                    current = []
-                else:
-                    current.append(lines[i])
-                i += 1
-            if current:
-                hunks.append(current)
-            operations.append(PatchOperation("update", path, hunks=hunks, move_to=move_to))
-            continue
-        raise ToolFailure("PATCH_FAILED", f"Unrecognized patch line: {line}", category="validation")
-    return operations
-
-
-@dataclass(frozen=True)
-class ParsedHunk:
-    old: list[str]
-    new: list[str]
-
-
-@dataclass(frozen=True)
-class MatchedHunk:
-    hunk_index: int
-    start: int
-    end: int
-    new: list[str]
-
-
-def apply_update_hunks(content: str, hunks: list[list[str]], path: str = "<patch>") -> str:
-    if not hunks:
-        return content
-    bom, text = strip_bom(content)
-    line_ending = detect_line_ending(text)
-    normalized = normalize_to_lf(text)
-    had_trailing_newline = normalized.endswith("\n")
-    lines = normalized.splitlines()
-    parsed = [parse_update_hunk(hunk) for hunk in hunks]
-    matched: list[MatchedHunk] = []
-    for index, hunk in enumerate(parsed):
-        if not hunk.old:
-            match_start = 0
-            match_count = 1
-        else:
-            matches = find_subsequence_all(lines, hunk.old)
-            match_count = len(matches)
-            match_start = matches[0] if matches else -1
-        if match_start < 0:
-            raise ToolFailure("PATCH_FAILED", f"Patch context did not match in {path}.", category="validation")
-        if match_count > 1:
-            raise ToolFailure(
-                "PATCH_FAILED",
-                f"Patch context matched {match_count} locations in {path}; add more context.",
-                category="validation",
-            )
-        matched.append(MatchedHunk(index, match_start, match_start + len(hunk.old), hunk.new))
-
-    matched.sort(key=lambda item: item.start)
-    for previous, current in zip(matched, matched[1:]):
-        if previous.end > current.start:
-            raise ToolFailure(
-                "PATCH_FAILED",
-                f"Patch hunks {previous.hunk_index} and {current.hunk_index} overlap in {path}.",
-                category="validation",
-            )
-
-    updated_lines = list(lines)
-    for matched_hunk in sorted(matched, key=lambda item: item.start, reverse=True):
-        updated_lines = updated_lines[: matched_hunk.start] + matched_hunk.new + updated_lines[matched_hunk.end :]
-    updated = "\n".join(updated_lines)
-    if had_trailing_newline and (updated_lines or updated == ""):
-        updated += "\n"
-    elif not text and updated_lines:
-        updated += "\n"
-    return bom + restore_line_endings(updated, line_ending)
-
-
-def parse_update_hunk(hunk: list[str]) -> ParsedHunk:
-    old: list[str] = []
-    new: list[str] = []
-    for raw in hunk:
-        if raw == "*** End of File":
-            continue
-        if not raw:
-            raise ToolFailure("PATCH_FAILED", "Invalid empty patch line.", category="validation")
-        marker = raw[0]
-        value = raw[1:] if marker in {" ", "-", "+"} else raw
-        if marker == " ":
-            old.append(value)
-            new.append(value)
-        elif marker == "-":
-            old.append(value)
-        elif marker == "+":
-            new.append(value)
-        else:
-            raise ToolFailure("PATCH_FAILED", "Update lines must start with space, '-' or '+'.", category="validation")
-    return ParsedHunk(old=old, new=new)
-
-
-def find_subsequence(lines: list[str], needle: list[str]) -> int:
-    matches = find_subsequence_all(lines, needle)
-    return matches[0] if matches else -1
-
-
-def find_subsequence_all(lines: list[str], needle: list[str]) -> list[int]:
-    if not needle:
-        return [0]
-    limit = len(lines) - len(needle) + 1
-    matches: list[int] = []
-    for index in range(max(0, limit)):
-        if lines[index : index + len(needle)] == needle:
-            matches.append(index)
-    return matches
-
-
-def walk_files(root: Path) -> list[Path]:
+def walk_files(root: Path) -> Iterator[Path]:
     if root.is_file() or root.is_symlink():
-        return [root]
-    results: list[Path] = []
+        yield root
+        return
     for current, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = [name for name in dirs if name not in DEFAULT_EXCLUDED_NAMES]
         current_path = Path(current)
         for name in files:
-            results.append(current_path / name)
-    return results
+            yield current_path / name
+
+
+def path_batches(paths: Iterator[Path], size: int) -> Iterator[list[Path]]:
+    batch: list[Path] = []
+    for path in paths:
+        batch.append(path)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def find_literal(line: str, query: str, case_sensitive: bool) -> Any:
@@ -4191,10 +3998,10 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots
         )
         device_access = landlock_device_access(handled)
         add_landlock_path(ruleset_fd, workspace, workspace_access)
-        for root in write_roots or []:
-            add_landlock_path(ruleset_fd, root, workspace_access, required=False)
-        for root in read_roots:
-            add_landlock_path(ruleset_fd, Path(root), readonly_access, required=False)
+        for write_root in write_roots or []:
+            add_landlock_path(ruleset_fd, write_root, workspace_access, required=False)
+        for read_root in read_roots:
+            add_landlock_path(ruleset_fd, Path(read_root), readonly_access, required=False)
         for special in SPECIAL_DEVICE_PATHS:
             add_landlock_path(ruleset_fd, Path(special), device_access, required=False)
         for special_dir in ("/proc/self", "/proc/thread-self", "/dev/fd"):
@@ -4344,49 +4151,6 @@ def parse_diff_files(diff_text: str) -> list[dict[str, Any]]:
     return files
 
 
-def start_reader_threads(session: ExecSession) -> None:
-    def reader(stream: Any, append: Any) -> None:
-        try:
-            while True:
-                chunk = os.read(stream.fileno(), 4096)
-                if not chunk:
-                    break
-                append(chunk)
-        except Exception:
-            return
-        finally:
-            try:
-                stream.close()
-            except OSError:
-                pass
-
-    if session.process.stdout is not None:
-        thread = threading.Thread(target=reader, args=(session.process.stdout, session.append_stdout), daemon=True)
-        session.reader_threads.append(thread)
-        thread.start()
-    if session.process.stderr is not None:
-        thread = threading.Thread(target=reader, args=(session.process.stderr, session.append_stderr), daemon=True)
-        session.reader_threads.append(thread)
-        thread.start()
-
-
-def start_session_watchdog(session: ExecSession) -> None:
-    if session.timeout_at is None:
-        return
-
-    def watchdog() -> None:
-        delay = session.timeout_at - time.time() if session.timeout_at is not None else 0
-        if delay > 0:
-            time.sleep(delay)
-        if session.process.poll() is not None or session.timed_out:
-            return
-        session.timed_out = True
-        terminate_process_group(session.process, signal.SIGTERM)
-        session.refresh_status()
-
-    threading.Thread(target=watchdog, daemon=True).start()
-
-
 def identify_image(data: bytes, path: Path) -> tuple[str | None, int | None, int | None]:
     if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
         width = int.from_bytes(data[16:20], "big")
@@ -4397,11 +4161,11 @@ def identify_image(data: bytes, path: Path) -> tuple[str | None, int | None, int
         height = int.from_bytes(data[8:10], "little")
         return "image/gif", width, height
     if data.startswith(b"\xff\xd8"):
-        width, height = identify_jpeg_size(data)
-        return "image/jpeg", width, height
+        image_width, image_height = identify_jpeg_size(data)
+        return "image/jpeg", image_width, image_height
     if data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-        width, height = identify_webp_size(data)
-        return "image/webp", width, height
+        image_width, image_height = identify_webp_size(data)
+        return "image/webp", image_width, image_height
     guessed, _ = mimetypes.guess_type(path.name)
     if guessed and guessed.startswith("image/"):
         return guessed, None, None
@@ -4521,64 +4285,6 @@ def resize_image_bytes(
         return None
 
 
-class JsonRpcError(Exception):
-    def __init__(self, code: int, message: str, data: dict[str, Any] | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.data = data
-
-
-def invalid_request_response() -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
-
-
-def validate_rpc_envelope(request: dict[str, Any]) -> None:
-    if request.get("jsonrpc") != "2.0":
-        raise JsonRpcError(-32600, "Invalid Request: jsonrpc must be 2.0", {"reason": "jsonrpc_version"})
-    method = request.get("method")
-    if not isinstance(method, str) or not method:
-        raise JsonRpcError(-32600, "Invalid Request: method must be a string", {"reason": "method"})
-    if "id" in request and not (
-        request["id"] is None
-        or isinstance(request["id"], str)
-        or (isinstance(request["id"], int) and not isinstance(request["id"], bool))
-    ):
-        raise JsonRpcError(-32600, "Invalid Request: id must be string, integer, or null", {"reason": "id"})
-
-
-def rpc_params(request: dict[str, Any]) -> dict[str, Any]:
-    params = request.get("params", {})
-    if params is None:
-        return {}
-    if not isinstance(params, dict):
-        raise JsonRpcError(-32602, "MCP method params must be an object")
-    return params
-
-
-def validate_initialize_params(params: dict[str, Any]) -> None:
-    requested = params.get("protocolVersion")
-    if requested is None:
-        return
-    if not protocol_version_is_supported(requested):
-        raise JsonRpcError(
-            -32602,
-            "Unsupported MCP protocol version",
-            {"supported": [PROTOCOL_VERSION], "received": requested},
-        )
-
-
-def protocol_version_is_supported(version: Any) -> bool:
-    return isinstance(version, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", version) is not None and version >= PROTOCOL_VERSION
-
-
-def tool_result(payload: dict[str, Any], *, is_error: bool, content: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    text = json.dumps(payload, sort_keys=True)
-    result_content = content or []
-    result_content.append({"type": "text", "text": text})
-    return {"content": result_content, "structuredContent": payload, "isError": is_error}
-
-
 def object_schema(properties: dict[str, Any] | None = None, required: list[str] | None = None) -> dict[str, Any]:
     return {
         "type": "object",
@@ -4687,16 +4393,9 @@ def schema_type_name(expected_type: str | list[str]) -> str:
     return expected_type
 
 
-def tool_definition(name: str, *, tool_profile: str = "full") -> dict[str, Any]:
+def tool_definition(name: str) -> dict[str, Any]:
     schemas = input_schemas()
     annotations = tool_annotations(name)
-    if tool_profile == "compat-readonly-all":
-        annotations = {
-            **annotations,
-            "readOnlyHint": True,
-            "destructiveHint": False,
-            "openWorldHint": False,
-        }
     return {
         "name": name,
         "title": annotations["title"],
@@ -4788,7 +4487,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "workdir": {**string, "default": "."},
                 "cwd": {**string},
                 "timeout_ms": {**integer, "minimum": 1, "maximum": 600000, "default": 30000},
-                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 1000},
+                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
@@ -4802,7 +4501,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             {
                 "session_id": {**string, "minLength": 1},
                 "chars": {**string, "default": ""},
-                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 1000},
+                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
@@ -4904,7 +4603,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "max_width": {**integer, "minimum": 1, "maximum": 10000, "default": IMAGE_RESIZE_MAX_DIMENSION},
                 "max_height": {**integer, "minimum": 1, "maximum": 10000, "default": IMAGE_RESIZE_MAX_DIMENSION},
                 "auto_resize": {**boolean, "default": True},
-                "output": {**string, "enum": ["mcp_image", "data_url"], "default": "mcp_image"},
             },
             ["path"],
         ),
@@ -4930,7 +4628,7 @@ def _server_card_auth(runtime: Runtime, *, oauth_base_url: str | None = None) ->
 
 def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) -> dict[str, Any]:
     names = runtime.exposed_tool_names()
-    annotations = {name: tool_definition(name, tool_profile=runtime.tool_profile)["annotations"] for name in names}
+    annotations = {name: tool_definition(name)["annotations"] for name in names}
     read_only = [name for name in names if annotations[name].get("readOnlyHint") is True]
     mutating = [name for name in names if annotations[name].get("readOnlyHint") is not True]
     payload = {
@@ -4943,10 +4641,9 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         "transport": {
             "type": "streamable_http",
             "endpoint": "/mcp",
-            "methods": ["GET", "HEAD", "POST", "OPTIONS"],
+            "methods": ["POST", "DELETE", "OPTIONS"],
         },
         "auth": _server_card_auth(runtime, oauth_base_url=oauth_base_url),
-        "toolProfile": runtime.tool_profile,
         "tools": {
             "count": len(names),
             "names": names,
@@ -4955,22 +4652,17 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         },
         "capabilities": {
             "tools": {"listChanged": False},
-            "logging": {},
         },
     }
-    if runtime.tool_profile == "compat-readonly-all":
-        payload["warnings"] = [
-            "compat-readonly-all advertises every tool as read-only, but mutation-capable tools still mutate local state."
-        ]
     return payload
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "CodingToolsMCP/0.1"
+    server_version = "CodingToolsMCP/0.2"
 
     @property
     def runtime(self) -> Runtime:
-        return self.server.runtime  # type: ignore[attr-defined]
+        return cast(Runtime, getattr(self, "_runtime", self.server.control_runtime))  # type: ignore[attr-defined]
 
     def log_message(self, format: str, *args: Any) -> None:
         print(format % args, file=sys.stderr)
@@ -4980,6 +4672,26 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         self.handle_metadata_request(head_only=True)
+
+    def do_DELETE(self) -> None:
+        request_path = self.path.split("?", 1)[0]
+        if posixpath.normpath(request_path) != "/mcp":
+            self.send_json({"error": "Unknown endpoint"}, status=404)
+            return
+        if not self.is_authorized():
+            self.send_unauthorized()
+            return
+        session_id = self.headers.get("Mcp-Session-Id")
+        if not session_id or not self.server.sessions.delete(session_id):  # type: ignore[attr-defined]
+            self.send_json(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": "Unknown MCP session"}},
+                status=404,
+            )
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.send_cors_headers()
+        self.end_headers()
 
     def do_OPTIONS(self) -> None:
         request_path = self.path.split("?", 1)[0]
@@ -4991,6 +4703,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             "/.well-known/oauth-protected-resource",
             "/oauth/authorize",
             "/oauth/token",
+            "/oauth/register",
         }:
             self.send_json({"error": "Unknown endpoint"}, status=404)
             return
@@ -4999,7 +4712,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "Origin denied"}, status=403)
             return
         self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
+        self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
         self.send_cors_headers()
         self.end_headers()
 
@@ -5023,7 +4736,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if not self.is_authorized():
                 self.send_unauthorized(head_only=head_only)
                 return
-            self.send_json(server_card_payload(self.runtime, oauth_base_url=self.oauth_base_url()), head_only=head_only)
+            self.send_json(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": "SSE GET stream is not supported"}},
+                status=405,
+                extra_headers={"Allow": "POST, DELETE"},
+                head_only=head_only,
+            )
             return
         if normalized in {"/.well-known/mcp.json", "/.well-known/mcp/server-card.json"}:
             self.send_json(server_card_payload(self.runtime, oauth_base_url=self.oauth_base_url()), head_only=head_only)
@@ -5038,6 +4756,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
         if normalized == "/oauth/token":
             self.handle_oauth_token()
+            return
+        if normalized == "/oauth/register":
+            self.handle_oauth_register()
             return
         if normalized != "/mcp":
             self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32601, "message": "Unknown endpoint"}}, status=404)
@@ -5068,24 +4789,10 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     "error": {
                         "code": -32600,
                         "message": "Unsupported MCP protocol version",
-                        "data": {"supported": [PROTOCOL_VERSION], "received": protocol_version},
+                        "data": {"supported": list(SUPPORTED_PROTOCOL_VERSIONS), "received": protocol_version},
                     },
                 },
                 status=400,
-            )
-            return
-        session_id = self.headers.get("Mcp-Session-Id")
-        if session_id and session_id != self.runtime.http_session_id:
-            self.send_json(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {
-                        "code": -32001,
-                        "message": "Unknown MCP session",
-                    },
-                },
-                status=404,
             )
             return
         raw_length = self.headers.get("Content-Length")
@@ -5139,50 +4846,99 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             request = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError:
+        except (UnicodeDecodeError, json.JSONDecodeError):
             self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, status=400)
             return
         if isinstance(request, list):
-            if not request:
-                self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}, status=400)
+            self.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "JSON-RPC batch requests are not supported by Streamable HTTP",
+                    },
+                },
+                status=400,
+            )
+            return
+        if not isinstance(request, dict):
+            self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}, status=400)
+            return
+        try:
+            validate_rpc_envelope(request)
+        except JsonRpcError as exc:
+            error: dict[str, Any] = {"code": exc.code, "message": exc.message}
+            if exc.data is not None:
+                error["data"] = exc.data
+            self.send_json(
+                {"jsonrpc": "2.0", "id": response_id(request), "error": error},
+            )
+            return
+        method = request.get("method")
+        session_id = self.headers.get("Mcp-Session-Id")
+        created_session = False
+        if method == "initialize":
+            if session_id:
+                self.send_json(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "error": {"code": -32600, "message": "initialize must not include Mcp-Session-Id"}},
+                    status=400,
+                )
                 return
-            if len(request) > MAX_JSON_RPC_BATCH_ITEMS:
+            try:
+                self._runtime = self.server.sessions.create()  # type: ignore[attr-defined]
+            except RuntimeError as exc:
+                self.send_json(
+                    {"jsonrpc": "2.0", "id": request.get("id"), "error": {"code": -32000, "message": str(exc)}},
+                    status=503,
+                )
+                return
+            self._send_session_header = True
+            created_session = True
+        elif session_id:
+            runtime = self.server.sessions.get(session_id)  # type: ignore[attr-defined]
+            if runtime is None:
                 self.send_json(
                     {
                         "jsonrpc": "2.0",
-                        "id": None,
+                        "id": response_id(request),
+                        "error": {"code": -32001, "message": "Unknown MCP session"},
+                    },
+                    status=404,
+                )
+                return
+            self._runtime = runtime
+            self._send_session_header = True
+            if protocol_version != runtime.protocol_version:
+                self.send_json(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request.get("id"),
                         "error": {
                             "code": -32600,
-                            "message": "Batch request exceeds maximum item count",
-                            "data": {"max_items": MAX_JSON_RPC_BATCH_ITEMS},
+                            "message": "MCP-Protocol-Version does not match the initialized session",
+                            "data": {"expected": runtime.protocol_version, "received": protocol_version},
                         },
                     },
                     status=400,
                 )
                 return
-            responses: list[dict[str, Any]] = []
-            for item in request:
-                if not isinstance(item, dict):
-                    responses.append({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}})
-                    continue
-                response = self.handle_rpc(item)
-                if response is not None:
-                    responses.append(response)
-            if not responses:
-                self.send_response(202)
-                self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
-                self.send_cors_headers()
-                self.end_headers()
-                return
-            self.send_json(responses)
-            return
-        if not isinstance(request, dict):
-            self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}, status=400)
+        elif method == "ping":
+            self._runtime = self.server.control_runtime  # type: ignore[attr-defined]
+        else:
+            self.send_json(
+                {"jsonrpc": "2.0", "id": request.get("id"), "error": {"code": -32002, "message": "Server not initialized"}},
+                status=400,
+            )
             return
         response = self.handle_rpc(request)
+        if created_session and response is not None and "error" in response:
+            self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
+            self._send_session_header = False
         if response is None:
             self.send_response(202)
-            self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
+            if getattr(self, "_send_session_header", False):
+                self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
             self.send_cors_headers()
             self.end_headers()
             return
@@ -5197,20 +4953,19 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if not self.runtime.initialized and method not in {"initialize", "ping"}:
                 raise JsonRpcError(-32002, "Server not initialized")
             if method == "initialize":
-                validate_initialize_params(params)
+                validate_initialize_request(request)
+                self.runtime.protocol_version = validate_initialize_params(params)
                 result = self.runtime.initialize()
                 self.runtime.initialized = True
             elif method == "notifications/initialized":
                 return None
             elif method == "notifications/cancelled":
-                session_id = params.get("session_id")
-                if isinstance(session_id, str):
-                    self.runtime.cancel_session(session_id)
+                cancelled_request_id = params.get("requestId")
+                if isinstance(cancelled_request_id, (str, int)) and not isinstance(cancelled_request_id, bool):
+                    self.runtime.cancel_request(cancelled_request_id)
                 return None
             elif method == "ping":
                 result = {}
-            elif method == "logging/setLevel":
-                result = self.runtime.set_logging_level(params)
             elif method == "tools/list":
                 result = self.runtime.list_tools()
             elif method == "tools/call":
@@ -5219,7 +4974,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 arguments = params.get("arguments") or {}
                 if not isinstance(arguments, dict):
                     raise JsonRpcError(-32602, "tools/call arguments must be an object")
-                result = self.runtime.call_tool(params["name"], arguments)
+                result = self.runtime.call_tool(params["name"], arguments, request_id=request_id)
             else:
                 raise JsonRpcError(-32601, f"Unknown method: {method}")
             if request_id is None:
@@ -5229,15 +4984,13 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             error: dict[str, Any] = {"code": exc.code, "message": exc.message}
             if exc.data is not None:
                 error["data"] = exc.data
-            response: dict[str, Any] = {"jsonrpc": "2.0", "error": error}
-            if request_id is not None:
-                response["id"] = request_id
-            return response
+            return {"jsonrpc": "2.0", "id": response_id(request), "error": error}
         except Exception as exc:  # noqa: BLE001
-            response = {"jsonrpc": "2.0", "error": {"code": -32603, "message": str(exc)}}
-            if request_id is not None:
-                response["id"] = request_id
-            return response
+            return {
+                "jsonrpc": "2.0",
+                "id": response_id(request),
+                "error": {"code": -32603, "message": str(exc)},
+            }
 
     def is_authorized(self) -> bool:
         if not self.runtime.auth_enabled():
@@ -5248,7 +5001,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 return True
         if self.runtime.oauth_config is not None and header.startswith("Bearer "):
             token = header[len("Bearer "):]
-            if _validate_oauth_token(token, self.runtime.oauth_config, self.oauth_base_url()):
+            if validate_access_token(token, self.runtime.oauth_config, self.oauth_base_url()):
                 return True
         return False
 
@@ -5256,11 +5009,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         cfg = self.runtime.oauth_config
         if cfg is not None and cfg.server_url:
             return cfg.server_url.rstrip("/")
-        proto = _first_header_value(self.headers.get("X-Forwarded-Proto"))
-        if not proto:
+        trust_proxy = truthy_env(os.environ.get(f"{ENV_PREFIX}_TRUST_PROXY_HEADERS"))
+        proto = _first_header_value(self.headers.get("X-Forwarded-Proto")) if trust_proxy else ""
+        if trust_proxy and not proto:
             proto = _forwarded_header_param(self.headers.get("Forwarded"), "proto")
-        host = _safe_external_host(_first_header_value(self.headers.get("X-Forwarded-Host")))
-        if not host:
+        host = _safe_external_host(_first_header_value(self.headers.get("X-Forwarded-Host"))) if trust_proxy else ""
+        if trust_proxy and not host:
             host = _safe_external_host(_forwarded_header_param(self.headers.get("Forwarded"), "host"))
         if not host:
             host = _safe_external_host(self.headers.get("Host", ""))
@@ -5298,10 +5052,11 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 "issuer": base,
                 "authorization_endpoint": f"{base}/oauth/authorize",
                 "token_endpoint": f"{base}/oauth/token",
+                "registration_endpoint": f"{base}/oauth/register",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code"],
                 "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": _oauth_token_auth_methods(cfg),
+                "token_endpoint_auth_methods_supported": _oauth_token_auth_methods(),
             },
             head_only=head_only,
         )
@@ -5326,8 +5081,17 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _oauth_login_page(self, *, client_id: str, redirect_uri: str, code_challenge: str,
-                          code_challenge_method: str, state: str, error: str = "") -> str:
+    def _oauth_login_page(
+        self,
+        *,
+        client_id: str,
+        redirect_uri: str,
+        code_challenge: str,
+        code_challenge_method: str,
+        state: str,
+        resource: str,
+        error: str = "",
+    ) -> str:
         def esc(v: str) -> str:
             return html.escape(v, quote=True)
         error_block = f'<p style="color:red">{html.escape(error)}</p>' if error else ""
@@ -5348,6 +5112,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             f"<input type='hidden' name='code_challenge' value='{esc(code_challenge)}'>"
             f"<input type='hidden' name='code_challenge_method' value='{esc(code_challenge_method)}'>"
             f"<input type='hidden' name='state' value='{esc(state)}'>"
+            f"<input type='hidden' name='resource' value='{esc(resource)}'>"
             "<label>Password<input type='password' name='password' autocomplete='current-password' required></label>"
             "<button type='submit'>Authorize</button>"
             "</form></body></html>"
@@ -5384,20 +5149,27 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         code_challenge = _p("code_challenge")
         code_challenge_method = _p("code_challenge_method")
         state = _p("state")
+        resource = _p("resource")
 
         if _p("response_type") != "code":
             self._send_html("<h2>Error</h2><p>response_type must be 'code'</p>", status=400)
             return
-        if not _oauth_client_id_allowed(client_id, cfg):
+        if cfg.registry.get(client_id) is None:
             self._send_html("<h2>Error</h2><p>Unknown client_id</p>", status=400)
             return
-        if code_challenge_method != "S256" or not code_challenge:
+        if not cfg.registry.accepts_redirect(client_id, redirect_uri):
+            self._send_html("<h2>Error</h2><p>redirect_uri is not registered for this client</p>", status=400)
+            return
+        if code_challenge_method != "S256" or not valid_pkce_challenge(code_challenge):
             self._send_html("<h2>Error</h2><p>code_challenge_method must be S256 and code_challenge is required</p>", status=400)
+            return
+        if resource.rstrip("/") != self.oauth_base_url():
+            self._send_html("<h2>Error</h2><p>resource must identify this MCP server</p>", status=400)
             return
 
         self._send_html(self._oauth_login_page(
             client_id=client_id, redirect_uri=redirect_uri, code_challenge=code_challenge,
-            code_challenge_method=code_challenge_method, state=state,
+            code_challenge_method=code_challenge_method, state=state, resource=resource,
         ))
 
     def handle_oauth_authorize_post(self) -> None:
@@ -5407,6 +5179,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
         body = self._read_oauth_body()
         if body is None:
+            return
+        if self.headers.get_content_type().lower() != "application/x-www-form-urlencoded":
+            self.send_json({"error": "invalid_request", "error_description": "Content-Type must be application/x-www-form-urlencoded"}, status=400)
             return
         params = urllib.parse.parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
 
@@ -5419,40 +5194,54 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         code_challenge = _p("code_challenge")
         code_challenge_method = _p("code_challenge_method")
         state = _p("state")
+        resource = _p("resource")
         password = _p("password")
 
-        if not _oauth_client_id_allowed(client_id, cfg):
+        if cfg.registry.get(client_id) is None or not cfg.registry.accepts_redirect(client_id, redirect_uri):
             self._send_html(self._oauth_login_page(
                 client_id=client_id, redirect_uri=redirect_uri, code_challenge=code_challenge,
-                code_challenge_method=code_challenge_method, state=state, error="Invalid client",
+                code_challenge_method=code_challenge_method, state=state, resource=resource,
+                error="Invalid client or redirect URI",
             ), status=400)
             return
-        if code_challenge_method != "S256" or not code_challenge:
+        if code_challenge_method != "S256" or not valid_pkce_challenge(code_challenge):
             self._send_html(self._oauth_login_page(
                 client_id=client_id, redirect_uri=redirect_uri, code_challenge=code_challenge,
-                code_challenge_method=code_challenge_method, state=state, error="Invalid PKCE parameters",
+                code_challenge_method=code_challenge_method, state=state, resource=resource,
+                error="Invalid PKCE parameters",
+            ), status=400)
+            return
+        if resource.rstrip("/") != self.oauth_base_url():
+            self._send_html(self._oauth_login_page(
+                client_id=client_id, redirect_uri=redirect_uri, code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method, state=state, resource=resource,
+                error="Invalid resource",
             ), status=400)
             return
         if not secrets.compare_digest(password, cfg.password):
             self._send_html(self._oauth_login_page(
                 client_id=client_id, redirect_uri=redirect_uri, code_challenge=code_challenge,
-                code_challenge_method=code_challenge_method, state=state, error="Invalid password",
+                code_challenge_method=code_challenge_method, state=state, resource=resource,
+                error="Invalid password",
             ), status=401)
             return
 
         code = secrets.token_urlsafe(32)
         now = time.time()
-        with self.runtime._pending_codes_lock:
-            expired = [k for k, v in self.runtime._pending_codes.items() if v["expires_at"] < now]
+        with cfg.pending_codes_lock:
+            expired = [k for k, v in cfg.pending_codes.items() if v["expires_at"] < now]
             for k in expired:
-                del self.runtime._pending_codes[k]
-            self.runtime._pending_codes[code] = {
+                del cfg.pending_codes[k]
+            while len(cfg.pending_codes) >= MAX_PENDING_CODES:
+                cfg.pending_codes.pop(next(iter(cfg.pending_codes)))
+            cfg.pending_codes[code] = {
                 "code_challenge": code_challenge,
                 "client_id": client_id,
                 "redirect_uri": redirect_uri,
                 "state": state,
                 "expires_at": now + OAUTH_CODE_TTL_SECONDS,
                 "server_url": self.oauth_base_url(),
+                "resource": resource.rstrip("/"),
             }
 
         qs = urllib.parse.urlencode({"code": code, **({"state": state} if state else {})})
@@ -5493,6 +5282,8 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         code_verifier = _p("code_verifier")
         client_id = _p("client_id")
         client_secret = _p("client_secret")
+        resource = _p("resource").rstrip("/")
+        presented_auth_method = "client_secret_post" if client_secret else "none"
 
         # Also accept HTTP Basic auth for client credentials.
         auth_header = self.headers.get("Authorization", "")
@@ -5504,16 +5295,17 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                     client_id = urllib.parse.unquote(basic_id)
                 if not client_secret:
                     client_secret = urllib.parse.unquote(basic_secret)
+                presented_auth_method = "client_secret_basic"
             except Exception:  # noqa: BLE001
                 pass
 
         if grant_type != "authorization_code":
             _err("unsupported_grant_type", "Only authorization_code is supported")
             return
-        if not _oauth_client_id_allowed(client_id, cfg):
+        if cfg.registry.get(client_id) is None:
             _err("invalid_client", "Unknown client_id")
             return
-        if cfg.client_secret is not None and not secrets.compare_digest(client_secret, cfg.client_secret):
+        if not cfg.registry.authenticates(client_id, client_secret, presented_auth_method):
             _err("invalid_client", "Invalid client_secret")
             return
         if not code:
@@ -5523,8 +5315,8 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             _err("invalid_grant", "Invalid code_verifier")
             return
 
-        with self.runtime._pending_codes_lock:
-            code_data = self.runtime._pending_codes.pop(code, None)
+        with cfg.pending_codes_lock:
+            code_data = cfg.pending_codes.pop(code, None)
 
         if code_data is None:
             _err("invalid_grant", "Unknown or already-used authorization code")
@@ -5538,20 +5330,49 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if not secrets.compare_digest(code_data["redirect_uri"], redirect_uri):
             _err("invalid_grant", "redirect_uri mismatch")
             return
-        if not _verify_pkce(code_verifier, code_data["code_challenge"]):
+        if not resource or not secrets.compare_digest(str(code_data.get("resource") or ""), resource):
+            _err("invalid_target", "resource mismatch")
+            return
+        if not verify_pkce(code_verifier, code_data["code_challenge"]):
             _err("invalid_grant", "PKCE verification failed")
             return
 
-        server_url = str(code_data.get("server_url") or self.oauth_base_url()).rstrip("/")
-        access_token = _create_oauth_token(cfg, server_url)
+        server_url = resource
+        access_token = create_access_token(cfg, server_url, client_id=client_id)
         self.send_json({"access_token": access_token, "token_type": "Bearer", "expires_in": cfg.token_ttl})
+
+    def handle_oauth_register(self) -> None:
+        cfg = self.runtime.oauth_config
+        if cfg is None:
+            self.send_json({"error": "OAuth not configured"}, status=404)
+            return
+        body = self._read_oauth_body()
+        if body is None:
+            return
+        if self.headers.get_content_type().lower() != "application/json":
+            self.send_json({"error": "invalid_client_metadata", "error_description": "Content-Type must be application/json"}, status=400)
+            return
+        try:
+            metadata = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json({"error": "invalid_client_metadata", "error_description": "Body must be valid JSON"}, status=400)
+            return
+        if not isinstance(metadata, dict):
+            self.send_json({"error": "invalid_client_metadata", "error_description": "Metadata must be an object"}, status=400)
+            return
+        try:
+            registered = cfg.registry.register(metadata)
+        except ValueError as exc:
+            self.send_json({"error": "invalid_client_metadata", "error_description": str(exc)}, status=400)
+            return
+        self.send_json(registered, status=201)
 
     def send_cors_headers(self) -> None:
         origin = self.headers.get("Origin")
         if origin and is_allowed_origin(origin, auth_enabled=self.runtime.auth_enabled()):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS")
             self.send_header(
                 "Access-Control-Allow-Headers",
                 "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id",
@@ -5569,7 +5390,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
+        self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_send_session_header", False):
+            self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
         self.send_cors_headers()
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
@@ -5581,9 +5404,21 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], handler: type[MCPHandler], runtime: Runtime) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        handler: type[MCPHandler],
+        control_runtime: Runtime,
+        runtime_factory: Any,
+    ) -> None:
         super().__init__(address, handler)
-        self.runtime = runtime
+        self.control_runtime = control_runtime
+        self.sessions = HTTPSessionManager(runtime_factory)
+
+    def server_close(self) -> None:
+        self.sessions.close()
+        self.control_runtime.close()
+        super().server_close()
 
 
 def build_runtime(
@@ -5592,6 +5427,7 @@ def build_runtime(
     *,
     auth_token: str | None = None,
     oauth_config: OAuthConfig | None = None,
+    emit_warning: bool = True,
 ) -> Runtime:
     workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
     runtime = Runtime(
@@ -5600,11 +5436,10 @@ def build_runtime(
         permission_mode=runtime_policy.permission_mode,
         shell_env_policy=runtime_policy.shell_env_policy,
         allow_network=runtime_policy.allow_network,
-        tool_profile=args.tool_profile,
         auth_token=auth_token,
         oauth_config=oauth_config,
     )
-    if runtime.capabilities.skip_all_permissions:
+    if emit_warning and runtime.capabilities.skip_all_permissions:
         print(
             "WARNING: permission_mode=dangerous disables MCP safety gates. Use only inside an isolated container or VM.",
             file=sys.stderr,
@@ -5652,20 +5487,40 @@ def run_http(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 2
+            if len(token_secret) < 32:
+                print(
+                    f"ERROR: {ENV_PREFIX}_OAUTH_TOKEN_SECRET must contain at least 32 bytes.",
+                    file=sys.stderr,
+                )
+                return 2
         else:
             token_secret = secrets.token_bytes(32)
         try:
             token_ttl = int(os.environ.get(f"{ENV_PREFIX}_OAUTH_TOKEN_TTL") or OAUTH_TOKEN_TTL_SECONDS)
         except ValueError:
-            token_ttl = OAUTH_TOKEN_TTL_SECONDS
+            print(f"ERROR: {ENV_PREFIX}_OAUTH_TOKEN_TTL must be an integer.", file=sys.stderr)
+            return 2
+        if not 60 <= token_ttl <= 604_800:
+            print(f"ERROR: {ENV_PREFIX}_OAUTH_TOKEN_TTL must be between 60 and 604800 seconds.", file=sys.stderr)
+            return 2
         oauth_config = OAuthConfig(
-            client_id=client_id,
-            client_secret=client_secret,
             password=password,
             server_url=server_url,
             token_secret=token_secret,
             token_ttl=token_ttl,
         )
+        if client_id:
+            raw_redirects = os.environ.get(f"{ENV_PREFIX}_OAUTH_REDIRECT_URIS") or "http://127.0.0.1/callback"
+            redirect_uris = tuple(item.strip() for item in raw_redirects.split(",") if item.strip())
+            try:
+                oauth_config.registry.add_preregistered(
+                    client_id,
+                    redirect_uris,
+                    client_secret=client_secret,
+                )
+            except ValueError as exc:
+                print(f"ERROR: invalid OAuth redirect URI configuration: {exc}", file=sys.stderr)
+                return 2
         if auth_token:
             print(
                 "Auth: dual credentials enabled — both static bearer token and OAuth 2.1 access tokens will be accepted.",
@@ -5690,7 +5545,17 @@ def run_http(args: argparse.Namespace) -> int:
         )
         return 2
     runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config)
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
+
+    def runtime_factory() -> Runtime:
+        return build_runtime(
+            args,
+            runtime_policy,
+            auth_token=auth_token,
+            oauth_config=oauth_config,
+            emit_warning=False,
+        )
+
+    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
         suffix = " + bearer" if runtime.auth_token else ""
@@ -5700,7 +5565,7 @@ def run_http(args: argparse.Namespace) -> int:
     else:
         auth_label = "no auth configured"
     base_url = _http_base_for_bind_host(str(args.host), args.port)
-    print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label}, profile={args.tool_profile})", file=sys.stderr)
+    print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -5717,79 +5582,7 @@ def run_stdio(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     runtime = build_runtime(args, runtime_policy)
-    dispatcher = StdioDispatcher(runtime)
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            request = json.loads(line)
-            if isinstance(request, list) and request:
-                response = [item for item in (dispatcher.handle_rpc(part) if isinstance(part, dict) else invalid_request_response() for part in request) if item is not None]
-            elif isinstance(request, list):
-                response = invalid_request_response()
-            elif isinstance(request, dict):
-                response = dispatcher.handle_rpc(request)
-            else:
-                response = invalid_request_response()
-            if response is not None:
-                sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-                sys.stdout.flush()
-        except Exception as exc:  # noqa: BLE001
-            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "error": {"code": -32603, "message": str(exc)}}) + "\n")
-            sys.stdout.flush()
-    return 0
-
-
-class StdioDispatcher:
-    def __init__(self, runtime: Runtime) -> None:
-        self.runtime = runtime
-        self.initialized = False
-
-    def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
-        request_id = request.get("id")
-        try:
-            validate_rpc_envelope(request)
-            method = request["method"]
-            params = rpc_params(request)
-            if not self.initialized and method not in {"initialize", "ping"}:
-                raise JsonRpcError(-32002, "Server not initialized")
-            if method == "initialize":
-                validate_initialize_params(params)
-                result = self.runtime.initialize()
-                self.initialized = True
-            elif method == "notifications/initialized":
-                return None
-            elif method == "notifications/cancelled":
-                session_id = params.get("session_id")
-                if isinstance(session_id, str):
-                    self.runtime.cancel_session(session_id)
-                return None
-            elif method == "ping":
-                result = {}
-            elif method == "logging/setLevel":
-                result = self.runtime.set_logging_level(params)
-            elif method == "tools/list":
-                result = self.runtime.list_tools()
-            elif method == "tools/call":
-                if not isinstance(params.get("name"), str):
-                    raise JsonRpcError(-32602, "tools/call requires a tool name")
-                arguments = params.get("arguments") or {}
-                if not isinstance(arguments, dict):
-                    raise JsonRpcError(-32602, "tools/call arguments must be an object")
-                result = self.runtime.call_tool(params["name"], arguments)
-            else:
-                raise JsonRpcError(-32601, f"Unknown method: {method}")
-            if request_id is None:
-                return None
-            return {"jsonrpc": "2.0", "id": request_id, "result": result}
-        except JsonRpcError as exc:
-            error: dict[str, Any] = {"code": exc.code, "message": exc.message}
-            if exc.data is not None:
-                error["data"] = exc.data
-            response: dict[str, Any] = {"jsonrpc": "2.0", "error": error}
-            if request_id is not None:
-                response["id"] = request_id
-            return response
+    return serve_stdio(runtime)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -5819,14 +5612,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "enable OAuth 2.1 Authorization Code + PKCE; "
             f"{ENV_PREFIX}_SERVER_URL is optional; when unset OAuth metadata uses the request host; "
-            "authorize password is generated when unset; client_id/client_secret are optional"
+            "authorize password is generated when unset; RFC 7591 dynamic registration is enabled"
         ),
-    )
-    parser.add_argument(
-        "--tool-profile",
-        choices=TOOL_PROFILE_CHOICES,
-        default=os.environ.get(f"{ENV_PREFIX}_TOOL_PROFILE", "full"),
-        help="tool exposure profile",
     )
     parser.add_argument(
         "--shell-env-inherit",

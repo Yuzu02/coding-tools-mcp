@@ -69,11 +69,6 @@ class MainWindow(QMainWindow):
         ("bearer", "Bearer Token"),
         ("noauth", "No authentication"),
     ]
-    TOOL_PROFILE_OPTIONS = [
-        ("full", "Full tool set"),
-        ("read-only", "Read-only tools"),
-        ("compat-readonly-all", "Compatibility read-only"),
-    ]
     PERMISSION_MODE_OPTIONS = [
         ("trusted", "Trusted"),
         ("safe", "Safe"),
@@ -288,9 +283,6 @@ class MainWindow(QMainWindow):
         self.local_port.setMaximum(65535)
         self.local_port.setMinimum(1000)
 
-        self.tool_profile = QComboBox()
-        self._fill_combo(self.tool_profile, self.TOOL_PROFILE_OPTIONS)
-
         self.permission_mode = QComboBox()
         self._fill_combo(self.permission_mode, self.PERMISSION_MODE_OPTIONS)
 
@@ -304,7 +296,6 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("font-weight:700; color:#b42318;")
 
         self.runtime_form.addRow(tr("MainWindow", "Local port"), self.local_port)
-        self.runtime_form.addRow(tr("MainWindow", "Tool profile"), self.tool_profile)
         self.runtime_form.addRow(tr("MainWindow", "Permission mode"), self.permission_mode)
         self.runtime_form.addRow(tr("MainWindow", "Custom command"), self.runtime_command)
         self.runtime_form.addRow(tr("MainWindow", "Status"), self.status_label)
@@ -319,13 +310,6 @@ class MainWindow(QMainWindow):
         self._fill_combo(self.auth_type, self.AUTH_OPTIONS)
         self.auth_type.currentIndexChanged.connect(self._refresh_auth_fields)
 
-        self.oauth_client_id_label = QLabel(tr("MainWindow", "OAuth client ID"))
-        self.oauth_client_id = QLineEdit()
-
-        self.oauth_client_secret_label = QLabel(tr("MainWindow", "OAuth client secret"))
-        self.oauth_client_secret = QLineEdit()
-        self.oauth_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
-
         self.oauth_password_label = QLabel(tr("MainWindow", "Authorization password"))
         self.oauth_password = QLineEdit()
         self.oauth_password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -338,8 +322,6 @@ class MainWindow(QMainWindow):
         self.bearer_token.setEchoMode(QLineEdit.EchoMode.Password)
 
         self.auth_form.addRow(tr("MainWindow", "Authentication type"), self.auth_type)
-        self.auth_form.addRow(self.oauth_client_id_label, self.oauth_client_id)
-        self.auth_form.addRow(self.oauth_client_secret_label, self.oauth_client_secret)
         self.auth_form.addRow(self.oauth_password_label, self.oauth_password)
         self.auth_form.addRow(self.bearer_token_label, self.bearer_token)
         layout.addLayout(self.auth_form)
@@ -348,17 +330,9 @@ class MainWindow(QMainWindow):
         oauth_actions_layout = QHBoxLayout(self.oauth_actions)
         oauth_actions_layout.setContentsMargins(0, 0, 0, 0)
         oauth_actions_layout.setSpacing(10)
-        self.copy_client_id_button = QPushButton(tr("MainWindow", "Copy client ID"))
-        self.copy_client_id_button.setProperty("secondary", True)
-        self.copy_client_id_button.clicked.connect(self._copy_oauth_client_id)
-        self.copy_client_secret_button = QPushButton(tr("MainWindow", "Copy client secret"))
-        self.copy_client_secret_button.setProperty("secondary", True)
-        self.copy_client_secret_button.clicked.connect(self._copy_oauth_client_secret)
         self.copy_oauth_password_button = QPushButton(tr("MainWindow", "Copy authorization password"))
         self.copy_oauth_password_button.setProperty("secondary", True)
         self.copy_oauth_password_button.clicked.connect(self._copy_oauth_password)
-        oauth_actions_layout.addWidget(self.copy_client_id_button)
-        oauth_actions_layout.addWidget(self.copy_client_secret_button)
         oauth_actions_layout.addWidget(self.copy_oauth_password_button)
         oauth_actions_layout.addStretch(1)
         layout.addWidget(self.oauth_actions)
@@ -377,8 +351,8 @@ class MainWindow(QMainWindow):
         self.auth_hint = QLabel(
             tr(
                 "MainWindow",
-                "In OAuth mode, enter the client ID and client secret in ChatGPT, then use the authorization "
-                "password during the first authorization.",
+                "In OAuth mode, the MCP client registers automatically. Use the authorization password "
+                "during the first authorization.",
             )
         )
         self.auth_hint.setWordWrap(True)
@@ -407,8 +381,6 @@ class MainWindow(QMainWindow):
             self.frp_server_edit,
             self.subdomain_edit,
             self.runtime_command,
-            self.oauth_client_id,
-            self.oauth_client_secret,
             self.oauth_password,
             self.bearer_token,
         ):
@@ -471,7 +443,6 @@ class MainWindow(QMainWindow):
         self.save_button.setText(tr("MainWindow", "Save configuration"))
 
         self._set_form_label(self.runtime_form, self.local_port, tr("MainWindow", "Local port"))
-        self._set_form_label(self.runtime_form, self.tool_profile, tr("MainWindow", "Tool profile"))
         self._set_form_label(
             self.runtime_form,
             self.permission_mode,
@@ -485,12 +456,8 @@ class MainWindow(QMainWindow):
         self._set_form_label(self.runtime_form, self.status_label, tr("MainWindow", "Status"))
 
         self._set_form_label(self.auth_form, self.auth_type, tr("MainWindow", "Authentication type"))
-        self.oauth_client_id_label.setText(tr("MainWindow", "OAuth client ID"))
-        self.oauth_client_secret_label.setText(tr("MainWindow", "OAuth client secret"))
         self.oauth_password_label.setText(tr("MainWindow", "Authorization password"))
         self.bearer_token_label.setText(tr("MainWindow", "Bearer Token"))
-        self.copy_client_id_button.setText(tr("MainWindow", "Copy client ID"))
-        self.copy_client_secret_button.setText(tr("MainWindow", "Copy client secret"))
         self.copy_oauth_password_button.setText(tr("MainWindow", "Copy authorization password"))
         self.copy_bearer_button.setText(tr("MainWindow", "Copy Bearer Token"))
 
@@ -509,7 +476,6 @@ class MainWindow(QMainWindow):
         self._retranslate_combo(self.tunnel_type, self.TUNNEL_OPTIONS)
         self._retranslate_combo(self.cloudflare_mode, self.CLOUDFLARE_MODE_OPTIONS)
         self._retranslate_combo(self.auth_type, self.AUTH_OPTIONS)
-        self._retranslate_combo(self.tool_profile, self.TOOL_PROFILE_OPTIONS)
         self._retranslate_combo(self.permission_mode, self.PERMISSION_MODE_OPTIONS)
 
         if self.current_profile is None:
@@ -558,12 +524,9 @@ class MainWindow(QMainWindow):
         self.subdomain_edit.setText(profile.tunnel.frp_subdomain)
         self._set_combo_value(self.tunnel_type, profile.tunnel.type)
         self.local_port.setValue(profile.runtime.local_port)
-        self._set_combo_value(self.tool_profile, profile.runtime.tool_profile)
         self._set_combo_value(self.permission_mode, profile.runtime.permission_mode)
         self.runtime_command.setText(profile.runtime.runtime_command)
         self._set_combo_value(self.auth_type, profile.auth.type)
-        self.oauth_client_id.setText(profile.auth.oauth_client_id)
-        self.oauth_client_secret.setText(profile.auth.oauth_client_secret)
         self.oauth_password.setText(profile.auth.oauth_password)
         self.bearer_token.setText(profile.auth.bearer_token)
         self._set_panel_enabled(True)
@@ -585,15 +548,12 @@ class MainWindow(QMainWindow):
         self.cloudflare_token_edit.clear()
         self.frp_server_edit.clear()
         self.subdomain_edit.clear()
-        self.oauth_client_id.clear()
-        self.oauth_client_secret.clear()
         self.oauth_password.clear()
         self.bearer_token.clear()
         self.runtime_command.clear()
         self.local_port.setValue(28766)
         self._set_combo_value(self.tunnel_type, "frp")
         self._set_combo_value(self.cloudflare_mode, "quick")
-        self._set_combo_value(self.tool_profile, "full")
         self._set_combo_value(self.permission_mode, "trusted")
         self._set_combo_value(self.auth_type, "oauth")
         self.status_label.setText(tr("MainWindow", "Not started"))
@@ -666,12 +626,9 @@ class MainWindow(QMainWindow):
         profile.tunnel.frp_server = self.frp_server_edit.text().strip()
         profile.tunnel.frp_subdomain = self.subdomain_edit.text().strip()
         profile.runtime.local_port = self.local_port.value()
-        profile.runtime.tool_profile = self._combo_value(self.tool_profile)
         profile.runtime.permission_mode = self._combo_value(self.permission_mode)
         profile.runtime.runtime_command = self.runtime_command.text().strip()
         profile.auth.type = self._combo_value(self.auth_type)
-        profile.auth.oauth_client_id = self.oauth_client_id.text().strip()
-        profile.auth.oauth_client_secret = self.oauth_client_secret.text().strip()
         profile.auth.oauth_password = self.oauth_password.text().strip()
         profile.auth.bearer_token = self.bearer_token.text().strip()
 
@@ -737,18 +694,6 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(profile.frp_proxy_snippet())
         self.statusBar().showMessage(tr("MainWindow", "FRP proxy snippet copied to the clipboard"), 3000)
 
-    def _copy_oauth_client_id(self) -> None:
-        if not self._save_current():
-            return
-        QApplication.clipboard().setText(self.oauth_client_id.text().strip())
-        self.statusBar().showMessage(tr("MainWindow", "OAuth client ID copied to the clipboard"), 3000)
-
-    def _copy_oauth_client_secret(self) -> None:
-        if not self._save_current():
-            return
-        QApplication.clipboard().setText(self.oauth_client_secret.text().strip())
-        self.statusBar().showMessage(tr("MainWindow", "OAuth client secret copied to the clipboard"), 3000)
-
     def _copy_oauth_password(self) -> None:
         if not self._save_current():
             return
@@ -792,8 +737,6 @@ class MainWindow(QMainWindow):
         auth_type = self._combo_value(self.auth_type)
         is_oauth = auth_type == "oauth"
         is_bearer = auth_type == "bearer"
-        self._set_row_visible(self.oauth_client_id_label, self.oauth_client_id, is_oauth)
-        self._set_row_visible(self.oauth_client_secret_label, self.oauth_client_secret, is_oauth)
         self._set_row_visible(self.oauth_password_label, self.oauth_password, is_oauth)
         self._set_row_visible(self.bearer_token_label, self.bearer_token, is_bearer)
         self.oauth_actions.setVisible(is_oauth)
@@ -802,8 +745,8 @@ class MainWindow(QMainWindow):
             self.auth_hint.setText(
                 tr(
                     "MainWindow",
-                    "Enter the OAuth client ID and client secret in ChatGPT, then use the authorization password "
-                    "during the first authorization.",
+                    "The MCP client registers automatically. Use the authorization password during the first "
+                    "authorization.",
                 )
             )
         elif is_bearer:
@@ -1086,9 +1029,6 @@ class MainWindow(QMainWindow):
             "OAuth": tr("MainWindow", "OAuth"),
             "Bearer Token": tr("MainWindow", "Bearer Token"),
             "No authentication": tr("MainWindow", "No authentication"),
-            "Full tool set": tr("MainWindow", "Full tool set"),
-            "Read-only tools": tr("MainWindow", "Read-only tools"),
-            "Compatibility read-only": tr("MainWindow", "Compatibility read-only"),
             "Trusted": tr("MainWindow", "Trusted"),
             "Safe": tr("MainWindow", "Safe"),
             "Unrestricted": tr("MainWindow", "Unrestricted"),

@@ -19,12 +19,14 @@ from pathlib import Path
 from typing import Any
 
 
-PROTOCOL_VERSION = "2025-06-18"
+PROTOCOL_VERSION = "2025-11-25"
 ROOT = Path(__file__).resolve().parents[2]
 
 REQUIRED_TOOLS = (
     "server_info",
     "check_exec_environment",
+    "get_default_cwd",
+    "set_default_cwd",
     "read_file",
     "list_dir",
     "list_files",
@@ -36,6 +38,9 @@ REQUIRED_TOOLS = (
     "read_output",
     "git_status",
     "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
     "request_permissions",
     "view_image",
 )
@@ -122,11 +127,17 @@ class MCPClient:
             )
 
         env = os.environ.copy()
+        for name in (
+            "CODING_TOOLS_MCP_DANGEROUSLY_SKIP_ALL_PERMISSIONS",
+            "CODING_TOOLS_MCP_ALLOW_NETWORK",
+        ):
+            env.pop(name, None)
         env.update(
             {
                 "AWS_SECRET_ACCESS_KEY": "COMPLIANCE_SHOULD_NOT_LEAK",
                 "OPENAI_API_KEY": "COMPLIANCE_SHOULD_NOT_LEAK",
                 "CODING_TOOLS_MCP_WORKSPACE": str(self.workspace),
+                "CODING_TOOLS_MCP_PERMISSION_MODE": "safe",
             }
         )
         prepend_repo_pythonpath(env)
@@ -137,7 +148,7 @@ class MCPClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
+            **subprocess_group_kwargs(),
         )
         deadline = time.time() + float(os.environ.get("CODING_TOOLS_MCP_STARTUP_TIMEOUT", "10"))
         last_error: Exception | None = None
@@ -176,14 +187,20 @@ class MCPClient:
             return
         try:
             if self.process.poll() is None:
-                try:
-                    os.killpg(self.process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                if os.name == "nt":
+                    self.process.terminate()
+                else:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                 try:
                     self.process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    os.killpg(self.process.pid, signal.SIGKILL)
+                    if os.name == "nt":
+                        self.process.kill()
+                    else:
+                        os.killpg(self.process.pid, signal.SIGKILL)
                     self.process.wait(timeout=2)
         finally:
             for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
@@ -315,6 +332,13 @@ def prepend_repo_pythonpath(env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def subprocess_group_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": creation_flag} if creation_flag else {}
+    return {"start_new_session": True}
+
+
 class StdioMCPClient:
     """Newline-delimited JSON-RPC client around a `coding_tools_mcp --stdio` subprocess."""
 
@@ -328,10 +352,7 @@ class StdioMCPClient:
 
     def __enter__(self) -> StdioMCPClient:
         env = prepend_repo_pythonpath(os.environ.copy())
-        kwargs: dict[str, Any] = {}
-        creation_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        if creation_flag:
-            kwargs["creationflags"] = creation_flag
+        kwargs = subprocess_group_kwargs()
         self.process = subprocess.Popen(
             [
                 sys.executable,

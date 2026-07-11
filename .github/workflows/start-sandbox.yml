@@ -18,11 +18,6 @@ on:
         required: false
         type: string
         default: trusted
-      tool_profile:
-        description: coding-tools-mcp tool profile.
-        required: false
-        type: string
-        default: full
       checkout_repository:
         description: Check out the caller repository into /workspace before starting the sandbox.
         required: false
@@ -81,15 +76,6 @@ on:
           - trusted
           - dangerous
         default: trusted
-      tool_profile:
-        description: coding-tools-mcp tool profile.
-        required: true
-        type: choice
-        options:
-          - full
-          - read-only
-          - compat-readonly-all
-        default: full
       checkout_repository:
         description: Check out this repository into /workspace before starting the sandbox.
         required: true
@@ -157,7 +143,6 @@ jobs:
           MCP_AUTH_TOKEN_SECRET: ${{ secrets.CODING_TOOLS_MCP_AUTH_TOKEN }}
           MCP_PORT_INPUT: ${{ inputs.port }}
           PERMISSION_MODE_INPUT: ${{ inputs.permission_mode }}
-          TOOL_PROFILE_INPUT: ${{ inputs.tool_profile }}
           TUNNEL_HOSTNAME_INPUT: ${{ inputs.tunnel_hostname }}
           TUNNEL_TYPE_INPUT: ${{ inputs.tunnel_type }}
         shell: bash
@@ -189,15 +174,6 @@ jobs:
             safe|trusted|dangerous) ;;
             *)
               echo "permission_mode must be safe, trusted, or dangerous" >&2
-              exit 1
-              ;;
-          esac
-
-          tool_profile="$TOOL_PROFILE_INPUT"
-          case "$tool_profile" in
-            full|read-only|compat-readonly-all) ;;
-            *)
-              echo "tool_profile must be full, read-only, or compat-readonly-all" >&2
               exit 1
               ;;
           esac
@@ -277,7 +253,6 @@ jobs:
             echo "duration=$duration"
             echo "port=$port"
             echo "permission_mode=$permission_mode"
-            echo "tool_profile=$tool_profile"
             echo "token_file=$token_file"
             echo "token_source=$token_source"
             echo "hide_auth_token=$hide_auth_token"
@@ -294,7 +269,6 @@ jobs:
           MCP_TOKEN_FILE: ${{ steps.settings.outputs.token_file }}
           PERMISSION_MODE: ${{ steps.settings.outputs.permission_mode }}
           PUBLIC_SERVER_URL: ${{ steps.settings.outputs.public_server_url }}
-          TOOL_PROFILE: ${{ steps.settings.outputs.tool_profile }}
           GIT_CONFIG: ${{ steps.settings.outputs.git_config }}
         shell: bash
         run: |
@@ -315,7 +289,6 @@ jobs:
             -e "CODING_TOOLS_MCP_PORT=$MCP_PORT"
             -e "CODING_TOOLS_MCP_AUTH_TOKEN=$MCP_TOKEN"
             -e "CODING_TOOLS_MCP_PERMISSION_MODE=$PERMISSION_MODE"
-            -e "CODING_TOOLS_MCP_TOOL_PROFILE=$TOOL_PROFILE"
             -e CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS=/etc/java-17-openjdk:/etc/maven:/etc/coding-tools-mcp
             -e "CODING_TOOLS_MCP_SHELL_ENV_SET=$shell_env_set"
             -v "$GITHUB_WORKSPACE:/workspace"
@@ -330,7 +303,7 @@ jobs:
           for _ in {1..60}; do
             if curl -fsS \
               -H "Authorization: Bearer $MCP_TOKEN" \
-              "http://127.0.0.1:$MCP_PORT/mcp" >/tmp/coding-tools-mcp-card.json; then
+              "http://127.0.0.1:$MCP_PORT/.well-known/mcp.json" >/tmp/coding-tools-mcp-card.json; then
               python3 -m json.tool /tmp/coding-tools-mcp-card.json
               exit 0
             fi
@@ -350,7 +323,6 @@ jobs:
           PUBLIC_SERVER_URL: ${{ steps.settings.outputs.public_server_url }}
           SESSION_DURATION: ${{ steps.settings.outputs.duration }}
           PERMISSION_MODE: ${{ steps.settings.outputs.permission_mode }}
-          TOOL_PROFILE: ${{ steps.settings.outputs.tool_profile }}
           TUNNEL_TYPE: ${{ steps.settings.outputs.tunnel_type }}
         shell: bash
         run: |
@@ -370,7 +342,6 @@ jobs:
               fi
               echo "- Tunnel type: $TUNNEL_TYPE"
               echo "- Permission mode: $PERMISSION_MODE"
-              echo "- Tool profile: $TOOL_PROFILE"
               echo "- Expires after: $SESSION_DURATION minutes"
               echo ""
               echo "Keep this workflow run open while the sandbox is active."
@@ -391,7 +362,7 @@ jobs:
               docker logs coding-tools-mcp-cloudflared > cloudflared.log 2>&1 || true
               if curl -fsS \
                 -H "Authorization: Bearer $MCP_TOKEN" \
-                "$mcp_url" >/tmp/coding-tools-mcp-card-remote.json; then
+                "${PUBLIC_SERVER_URL}/.well-known/mcp.json" >/tmp/coding-tools-mcp-card-remote.json; then
                 echo "url=$mcp_url" >> "$GITHUB_OUTPUT"
                 write_summary "$mcp_url"
                 exit 0
@@ -433,7 +404,6 @@ jobs:
           MCP_TOKEN_FILE: ${{ steps.settings.outputs.token_file }}
           SESSION_DURATION: ${{ steps.settings.outputs.duration }}
           PERMISSION_MODE: ${{ steps.settings.outputs.permission_mode }}
-          TOOL_PROFILE: ${{ steps.settings.outputs.tool_profile }}
         shell: bash
         run: |
           set -euo pipefail
@@ -446,7 +416,6 @@ jobs:
             echo "Authorization header: Bearer $MCP_TOKEN"
           fi
           echo "Permission mode: $PERMISSION_MODE"
-          echo "Tool profile: $TOOL_PROFILE"
           echo "Sandbox expires after: $SESSION_DURATION minutes"
           echo "::notice title=coding-tools-mcp sandbox::URL: $MCP_URL | Expires after: $SESSION_DURATION minutes"
 

@@ -72,7 +72,6 @@ def load_profiles() -> list[WorkspaceProfile]:
         if profile.id in secrets:
             secret = secrets[profile.id]
             profile.tunnel.cloudflare_token = secret.get("cloudflare_token", profile.tunnel.cloudflare_token)
-            profile.auth.oauth_client_secret = secret.get("oauth_client_secret", profile.auth.oauth_client_secret)
             profile.auth.oauth_password = secret.get("oauth_password", profile.auth.oauth_password)
             profile.auth.oauth_token_secret = secret.get("oauth_token_secret", profile.auth.oauth_token_secret)
             profile.auth.bearer_token = secret.get("bearer_token", profile.auth.bearer_token)
@@ -86,14 +85,12 @@ def save_profiles(profiles: list[WorkspaceProfile]) -> None:
     for profile in profiles:
         record = profile.to_record()
         record["tunnel"]["cloudflare_token"] = ""
-        record["auth"]["oauth_client_secret"] = ""
         record["auth"]["oauth_password"] = ""
         record["auth"]["oauth_token_secret"] = ""
         record["auth"]["bearer_token"] = ""
         public_records.append(record)
         secret_records[profile.id] = {
             "cloudflare_token": profile.tunnel.cloudflare_token,
-            "oauth_client_secret": profile.auth.oauth_client_secret,
             "oauth_password": profile.auth.oauth_password,
             "oauth_token_secret": profile.auth.oauth_token_secret,
             "bearer_token": profile.auth.bearer_token,

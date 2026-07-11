@@ -5,13 +5,13 @@
     <name>Health</name>
     <message>
         <location filename="../health.py" line="+59"/>
-        <source>Local /mcp</source>
-        <translation>本地 /mcp</translation>
+        <source>Local discovery</source>
+        <translation>本地发现端点</translation>
     </message>
     <message>
         <location line="+1"/>
-        <source>Public /mcp</source>
-        <translation>公网 /mcp</translation>
+        <source>Public discovery</source>
+        <translation>公网发现端点</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -267,12 +267,6 @@
     </message>
     <message>
         <location line="-166"/>
-        <location line="+167"/>
-        <source>Tool profile</source>
-        <translation>工具档位</translation>
-    </message>
-    <message>
-        <location line="-166"/>
         <location line="+170"/>
         <source>Permission mode</source>
         <translation>权限模式</translation>
@@ -294,18 +288,6 @@
         <location line="+141"/>
         <source>Authentication and ChatGPT setup</source>
         <translation>认证与 ChatGPT 接入</translation>
-    </message>
-    <message>
-        <location line="-133"/>
-        <location line="+166"/>
-        <source>OAuth client ID</source>
-        <translation>OAuth 客户端 ID</translation>
-    </message>
-    <message>
-        <location line="-163"/>
-        <location line="+164"/>
-        <source>OAuth client secret</source>
-        <translation>OAuth 客户端密钥</translation>
     </message>
     <message>
         <location line="-160"/>
@@ -334,18 +316,6 @@
     </message>
     <message>
         <location line="-136"/>
-        <location line="+141"/>
-        <source>Copy client ID</source>
-        <translation>复制客户端 ID</translation>
-    </message>
-    <message>
-        <location line="-138"/>
-        <location line="+139"/>
-        <source>Copy client secret</source>
-        <translation>复制客户端密钥</translation>
-    </message>
-    <message>
-        <location line="-136"/>
         <location line="+137"/>
         <source>Copy authorization password</source>
         <translation>复制授权口令</translation>
@@ -358,8 +328,8 @@
     </message>
     <message>
         <location line="-112"/>
-        <source>In OAuth mode, enter the client ID and client secret in ChatGPT, then use the authorization password during the first authorization.</source>
-        <translation>OAuth 模式下，在 ChatGPT 中填写客户端 ID 和客户端密钥，并在首次授权时输入授权口令。</translation>
+        <source>In OAuth mode, the MCP client registers automatically. Use the authorization password during the first authorization.</source>
+        <translation>OAuth 模式下，MCP 客户端会自动注册；首次授权时请输入授权口令。</translation>
     </message>
     <message>
         <location line="+7"/>
@@ -430,16 +400,6 @@ This removes it from the desktop client but does not delete the directory.</sour
     </message>
     <message>
         <location line="+6"/>
-        <source>OAuth client ID copied to the clipboard</source>
-        <translation>已复制 OAuth 客户端 ID 到剪贴板</translation>
-    </message>
-    <message>
-        <location line="+6"/>
-        <source>OAuth client secret copied to the clipboard</source>
-        <translation>已复制 OAuth 客户端密钥到剪贴板</translation>
-    </message>
-    <message>
-        <location line="+6"/>
         <source>Authorization password copied to the clipboard</source>
         <translation>已复制授权口令到剪贴板</translation>
     </message>
@@ -455,8 +415,8 @@ This removes it from the desktop client but does not delete the directory.</sour
     </message>
     <message>
         <location line="+26"/>
-        <source>Enter the OAuth client ID and client secret in ChatGPT, then use the authorization password during the first authorization.</source>
-        <translation>在 ChatGPT 中填写 OAuth 客户端 ID 和客户端密钥，并在首次授权时输入授权口令。</translation>
+        <source>The MCP client registers automatically. Use the authorization password during the first authorization.</source>
+        <translation>MCP 客户端会自动注册；首次授权时请输入授权口令。</translation>
     </message>
     <message>
         <location line="+4"/>
@@ -588,21 +548,6 @@ This removes it from the desktop client but does not delete the directory.</sour
         <location line="+2"/>
         <source>No authentication</source>
         <translation>不启用认证</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>Full tool set</source>
-        <translation>完整工具</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>Read-only tools</source>
-        <translation>只读工具</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>Compatibility read-only</source>
-        <translation>兼容只读</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -763,11 +708,6 @@ Command: {command}</source>
         <location line="+48"/>
         <source>Workspace directory does not exist: {path}</source>
         <translation>工作区目录不存在：{path}</translation>
-    </message>
-    <message>
-        <location line="+4"/>
-        <source>OAuth mode requires a client ID.</source>
-        <translation>OAuth 模式需要填写客户端 ID。</translation>
     </message>
     <message>
         <location line="+2"/>

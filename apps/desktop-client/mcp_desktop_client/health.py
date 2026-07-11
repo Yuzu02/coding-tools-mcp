@@ -22,8 +22,6 @@ def _check_url(url: str) -> tuple[bool, str]:
         with urllib.request.urlopen(request, timeout=4) as response:
             return True, f"HTTP {response.status}"
     except urllib.error.HTTPError as exc:
-        if exc.code in {200, 401, 404}:
-            return True, f"HTTP {exc.code}"
         return False, f"HTTP {exc.code}"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
@@ -45,19 +43,24 @@ def _check_json_field(url: str, field: str) -> tuple[bool, str]:
 
 
 def run_health_checks(profile: WorkspaceProfile) -> list[HealthItem]:
-    local_ok, local_detail = _check_url(profile.local_endpoint)
-    oauth_ok, oauth_detail = _check_json_field(
-        f"{profile.effective_public_url}/.well-known/oauth-authorization-server",
-        "token_endpoint_auth_methods_supported",
-    )
-    public_ok, public_detail = _check_url(profile.endpoint)
-    protected_ok, protected_detail = _check_json_field(
-        f"{profile.effective_public_url}/.well-known/oauth-protected-resource",
-        "authorization_servers",
-    )
+    local_origin = profile.local_endpoint.removesuffix("/mcp")
+    local_ok, local_detail = _check_url(f"{local_origin}/.well-known/mcp.json")
+    if profile.auth.type == "oauth":
+        oauth_ok, oauth_detail = _check_json_field(
+            f"{profile.effective_public_url}/.well-known/oauth-authorization-server",
+            "token_endpoint_auth_methods_supported",
+        )
+        protected_ok, protected_detail = _check_json_field(
+            f"{profile.effective_public_url}/.well-known/oauth-protected-resource",
+            "authorization_servers",
+        )
+    else:
+        oauth_ok = protected_ok = True
+        oauth_detail = protected_detail = f"Not applicable for {profile.auth.type} auth"
+    public_ok, public_detail = _check_url(f"{profile.effective_public_url}/.well-known/mcp.json")
     return [
-        HealthItem(tr("Health", "Local /mcp"), local_ok, local_detail),
-        HealthItem(tr("Health", "Public /mcp"), public_ok, public_detail),
+        HealthItem(tr("Health", "Local discovery"), local_ok, local_detail),
+        HealthItem(tr("Health", "Public discovery"), public_ok, public_detail),
         HealthItem(tr("Health", "OAuth authorization metadata"), oauth_ok, oauth_detail),
         HealthItem(tr("Health", "OAuth protected-resource metadata"), protected_ok, protected_detail),
     ]
