@@ -7,6 +7,10 @@ inspect repo -> search/read files -> apply structured patches -> run tests/comma
 -> interact with stdin sessions -> inspect git status/diff
 ```
 
+## Demo Video
+
+[![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
+
 It is not a prompt wrapper. It does not expose external agent accounts, memory, cloud tasks, web search, image generation, model routing, plugin marketplace, or subagent orchestration as MCP tools.
 
 ## Documentation Map
