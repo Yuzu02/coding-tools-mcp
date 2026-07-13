@@ -25,7 +25,7 @@ from tests.compliance.mcp_client import (
     REQUIRED_TOOLS,
     default_server_command,
     free_port,
-    prepend_repo_pythonpath,
+    safe_server_env,
     stream_snapshot,
 )
 from tests.compliance.test_support import ComplianceTestCase
@@ -1102,34 +1102,7 @@ class MCPContractTests(ComplianceTestCase):
         digest = hashlib.sha256(verifier.encode("ascii")).digest()
         return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
-    def oauth_register_client(self, base_url: str, client_name: str) -> str:
-        body = json.dumps(
-            {
-                "client_name": client_name,
-                "redirect_uris": ["http://127.0.0.1/callback"],
-                "grant_types": ["authorization_code"],
-                "response_types": ["code"],
-                "token_endpoint_auth_method": "none",
-            }
-        ).encode("utf-8")
-        status, _, response_body = self.raw_base_http_request(
-            base_url,
-            "POST",
-            "/oauth/register",
-            body=body,
-            headers={"Content-Type": "application/json"},
-        )
-        self.assertEqual(status, 201, response_body)
-        response = json.loads(response_body)
-        self.assertNotIn("client_secret", response)
-        return str(response["client_id"])
-
-    def oauth_register_confidential_client(
-        self,
-        base_url: str,
-        client_name: str,
-        auth_method: str,
-    ) -> tuple[str, str]:
+    def oauth_register(self, base_url: str, client_name: str, auth_method: str) -> dict[str, Any]:
         body = json.dumps(
             {
                 "client_name": client_name,
@@ -1147,7 +1120,20 @@ class MCPContractTests(ComplianceTestCase):
             headers={"Content-Type": "application/json"},
         )
         self.assertEqual(status, 201, response_body)
-        response = json.loads(response_body)
+        return json.loads(response_body)
+
+    def oauth_register_client(self, base_url: str, client_name: str) -> str:
+        response = self.oauth_register(base_url, client_name, "none")
+        self.assertNotIn("client_secret", response)
+        return str(response["client_id"])
+
+    def oauth_register_confidential_client(
+        self,
+        base_url: str,
+        client_name: str,
+        auth_method: str,
+    ) -> tuple[str, str]:
+        response = self.oauth_register(base_url, client_name, auth_method)
         self.assertEqual(response.get("token_endpoint_auth_method"), auth_method)
         self.assertIsInstance(response.get("client_secret"), str)
         return str(response["client_id"]), str(response["client_secret"])
@@ -1288,14 +1274,7 @@ class MCPContractTests(ComplianceTestCase):
         return process, f"http://127.0.0.1:{port}/mcp"
 
     def server_process_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        for name in (
-            "CODING_TOOLS_MCP_DANGEROUSLY_SKIP_ALL_PERMISSIONS",
-            "CODING_TOOLS_MCP_ALLOW_NETWORK",
-        ):
-            env.pop(name, None)
-        env["CODING_TOOLS_MCP_PERMISSION_MODE"] = "safe"
-        return prepend_repo_pythonpath(env)
+        return safe_server_env()
 
     def process_stderr_snapshot(self, process: subprocess.Popen[str]) -> str:
         if process.stderr is None:

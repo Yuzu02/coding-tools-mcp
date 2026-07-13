@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -64,14 +64,13 @@ from .processes import (
 from .protocol import (
     PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
+    dispatch_rpc,
     protocol_version_is_supported,
     response_id,
-    rpc_params,
-    validate_initialize_params,
-    validate_initialize_request,
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
+from .textutils import DEFAULT_MAX_LINES, truncate_text_head
 from .tool_results import make_tool_result
 from .transport_http import HTTPSessionManager
 from .transport_stdio import serve_stdio
@@ -93,7 +92,6 @@ DEFAULT_EXCLUDED_NAMES = {
     ".ruff_cache",
     "__pycache__",
 }
-DEFAULT_MAX_LINES = 2000
 GREP_MAX_LINE_CHARS = 500
 IMAGE_RESIZE_MAX_DIMENSION = 2000
 SENSITIVE_ENV_RE = re.compile(r"(token|secret|credential|api[_-]?key|password|passwd|private)", re.I)
@@ -504,7 +502,9 @@ class ToolSpec:
     """Single source of truth for one tool's title, description, and annotation hints.
 
     Handler methods on Runtime are named exactly after the tool. Input schemas live in
-    input_schemas(), keyed by the same names.
+    input_schemas(), keyed by the same names. `error_status` is stamped on failure
+    payloads, and `content_builder` converts a success payload into extra MCP
+    content blocks (beyond the rendered text).
     """
 
     title: str
@@ -513,6 +513,19 @@ class ToolSpec:
     destructive: bool = False
     idempotent: bool = False
     open_world: bool = False
+    error_status: str | None = None
+    content_builder: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None
+
+
+def _image_content(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    encoded = str(payload.pop("_mcp_image_data", ""))
+    return [
+        {
+            "type": "image",
+            "data": encoded,
+            "mimeType": str(payload.get("mime_type", "application/octet-stream")),
+        }
+    ]
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
@@ -573,6 +586,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description="Run a bounded command in the workspace under runtime policy.",
         destructive=True,
         open_world=True,
+        error_status="failed",
     ),
     "write_stdin": ToolSpec(
         title="Write stdin",
@@ -632,6 +646,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description="Return a workspace image as MCP image content.",
         read_only=True,
         idempotent=True,
+        content_builder=_image_content,
     ),
 }
 
@@ -669,8 +684,13 @@ def json_response_payload(payload: Any) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def is_allowed_origin(origin: str, *, auth_enabled: bool = False) -> bool:
-    del auth_enabled  # authentication does not replace browser Origin validation
+@functools.lru_cache(maxsize=8)
+def _configured_allowed_origins(raw: str) -> frozenset[str]:
+    return frozenset(item.strip().rstrip("/") for item in raw.split(",") if item.strip())
+
+
+def is_allowed_origin(origin: str) -> bool:
+    # Authentication does not replace browser Origin validation.
     try:
         parsed = urllib.parse.urlparse(origin)
     except ValueError:
@@ -691,43 +711,12 @@ def is_allowed_origin(origin: str, *, auth_enabled: bool = False) -> bool:
     except ValueError:
         return False
     normalized = origin.rstrip("/")
-    configured = {
-        item.strip().rstrip("/")
-        for item in os.environ.get(f"{ENV_PREFIX}_ALLOWED_ORIGINS", "").split(",")
-        if item.strip()
-    }
+    configured = _configured_allowed_origins(os.environ.get(f"{ENV_PREFIX}_ALLOWED_ORIGINS", ""))
     return parsed.hostname in {"localhost", "127.0.0.1", "::1"} or normalized in configured
 
 
 def is_loopback_bind_host(host: str) -> bool:
     return host in {"localhost", "127.0.0.1", "::1", ""}
-
-
-@dataclass(frozen=True)
-class TextTruncation:
-    content: str
-    truncated: bool
-    truncated_by: str | None
-    total_lines: int
-    total_bytes: int
-    output_lines: int
-    output_bytes: int
-    last_line_partial: bool
-    first_line_exceeds_limit: bool
-    max_lines: int
-    max_bytes: int
-
-    def metadata(self, *, prefix: str = "") -> dict[str, Any]:
-        key = f"{prefix}_" if prefix else ""
-        return {
-            f"{key}truncated_by": self.truncated_by,
-            f"{key}total_lines": self.total_lines,
-            f"{key}total_bytes": self.total_bytes,
-            f"{key}output_lines": self.output_lines,
-            f"{key}output_bytes": self.output_bytes,
-            f"{key}last_line_partial": self.last_line_partial,
-            f"{key}first_line_exceeds_limit": self.first_line_exceeds_limit,
-        }
 
 
 def truncate_bytes(data: bytes, limit: int) -> tuple[str, bool]:
@@ -744,129 +733,6 @@ def truncate_bytes(data: bytes, limit: int) -> tuple[str, bool]:
         else:
             data = data[:limit]
     return data.decode("utf-8", errors="replace"), truncated
-
-
-def truncate_text_head(text: str, *, max_lines: int = DEFAULT_MAX_LINES, max_bytes: int = 50 * 1024) -> TextTruncation:
-    if max_lines <= 0:
-        max_lines = 1
-    if max_bytes <= 0:
-        max_bytes = 1
-    total_bytes = len(text.encode("utf-8"))
-    lines = text.split("\n")
-    total_lines = len(lines)
-    if total_lines <= max_lines and total_bytes <= max_bytes:
-        return TextTruncation(text, False, None, total_lines, total_bytes, total_lines, total_bytes, False, False, max_lines, max_bytes)
-
-    first_line_bytes = len(lines[0].encode("utf-8")) if lines else 0
-    if first_line_bytes > max_bytes:
-        prefix = truncate_string_to_bytes_from_start(lines[0], max_bytes)
-        return TextTruncation(
-            prefix,
-            True,
-            "bytes",
-            total_lines,
-            total_bytes,
-            1 if prefix else 0,
-            len(prefix.encode("utf-8")),
-            False,
-            True,
-            max_lines,
-            max_bytes,
-        )
-
-    output: list[str] = []
-    output_bytes = 0
-    truncated_by = "lines"
-    for index, line in enumerate(lines):
-        if len(output) >= max_lines:
-            truncated_by = "lines"
-            break
-        line_bytes = len(line.encode("utf-8")) + (1 if index > 0 else 0)
-        if output_bytes + line_bytes > max_bytes:
-            truncated_by = "bytes"
-            break
-        output.append(line)
-        output_bytes += line_bytes
-    content = "\n".join(output)
-    return TextTruncation(
-        content,
-        True,
-        truncated_by,
-        total_lines,
-        total_bytes,
-        len(output),
-        len(content.encode("utf-8")),
-        False,
-        False,
-        max_lines,
-        max_bytes,
-    )
-
-
-def truncate_text_tail(text: str, *, max_lines: int = DEFAULT_MAX_LINES, max_bytes: int = 50 * 1024) -> TextTruncation:
-    if max_lines <= 0:
-        max_lines = 1
-    if max_bytes <= 0:
-        max_bytes = 1
-    total_bytes = len(text.encode("utf-8"))
-    lines = text.split("\n")
-    total_lines = len(lines)
-    if total_lines <= max_lines and total_bytes <= max_bytes:
-        return TextTruncation(text, False, None, total_lines, total_bytes, total_lines, total_bytes, False, False, max_lines, max_bytes)
-
-    candidate_lines = lines[:-1] if lines and lines[-1] == "" else lines
-    output: list[str] = []
-    output_bytes = 0
-    truncated_by = "lines"
-    last_line_partial = False
-    for reverse_index, line in enumerate(reversed(candidate_lines)):
-        if len(output) >= max_lines:
-            truncated_by = "lines"
-            break
-        line_bytes = len(line.encode("utf-8")) + (1 if reverse_index > 0 else 0)
-        if output_bytes + line_bytes > max_bytes:
-            truncated_by = "bytes"
-            if not output:
-                partial = truncate_string_to_bytes_from_end(line, max_bytes)
-                output.insert(0, partial)
-                last_line_partial = True
-            break
-        output.insert(0, line)
-        output_bytes += line_bytes
-    content = "\n".join(output)
-    return TextTruncation(
-        content,
-        True,
-        truncated_by,
-        total_lines,
-        total_bytes,
-        len(output),
-        len(content.encode("utf-8")),
-        last_line_partial,
-        False,
-        max_lines,
-        max_bytes,
-    )
-
-
-def truncate_string_to_bytes_from_start(text: str, max_bytes: int) -> str:
-    data = text.encode("utf-8")
-    if len(data) <= max_bytes:
-        return text
-    end = max(0, min(max_bytes, len(data)))
-    while end > 0 and end < len(data) and (data[end] & 0xC0) == 0x80:
-        end -= 1
-    return data[:end].decode("utf-8", errors="replace")
-
-
-def truncate_string_to_bytes_from_end(text: str, max_bytes: int) -> str:
-    data = text.encode("utf-8")
-    if len(data) <= max_bytes:
-        return text
-    start = len(data) - max_bytes
-    while start < len(data) and (data[start] & 0xC0) == 0x80:
-        start += 1
-    return data[start:].decode("utf-8", errors="replace")
 
 
 def truncate_line_chars(line: str, max_chars: int = GREP_MAX_LINE_CHARS) -> tuple[str, bool]:
@@ -1113,6 +979,7 @@ class Workspace:
             pass
         if str(self.root) in unsafe_roots:
             raise ToolFailure("INVALID_ARGUMENT", "Unsafe workspace root rejected.", category="security")
+        self.git_path = shutil.which("git")
 
     def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
         if not isinstance(raw_path, str) or not raw_path:
@@ -1224,7 +1091,7 @@ class Workspace:
     def git_ignored_paths(self, rel_paths: list[str]) -> set[str]:
         if not rel_paths:
             return set()
-        git = shutil.which("git")
+        git = self.git_path
         if not git:
             return set()
         try:
@@ -1255,6 +1122,7 @@ class Runtime:
         allow_network: bool = False,
         auth_token: str | None = None,
         oauth_config: OAuthConfig | None = None,
+        project_context: ProjectContext | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
@@ -1295,7 +1163,12 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
-        self.project_context: ProjectContext = load_project_context(self.workspace.root)
+        # ProjectContext is frozen and derived only from the workspace tree, so
+        # per-session HTTP runtimes reuse the server's copy instead of re-running
+        # discovery (git ls-files / directory walk) on every connect.
+        self.project_context: ProjectContext = (
+            project_context if project_context is not None else load_project_context(self.workspace.root)
+        )
         self.request_sessions: dict[str | int, str] = {}
         self.request_sessions_lock = threading.Lock()
         self.request_context = threading.local()
@@ -1484,6 +1357,7 @@ class Runtime:
         handler = self._tool_handlers.get(name) if name in self.exposed_tool_names() else None
         if handler is None:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
+        spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
         try:
             self.request_context.request_id = request_id
@@ -1496,18 +1370,7 @@ class Runtime:
                 self.request_context.request_id = None
             payload.setdefault("ok", True)
             self.emit_tool_trace(name, args, payload, started_at)
-            content = None
-            if name == "view_image":
-                encoded = str(payload.pop("_mcp_image_data", ""))
-                content = [
-                    {
-                        "type": "image",
-                        "data": encoded,
-                        "mimeType": str(payload.get("mime_type", "application/octet-stream")),
-                    }
-                ]
-            else:
-                payload.pop("_mcp_image_data", None)
+            content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
         except ToolFailure as exc:
             payload = {
@@ -1520,8 +1383,8 @@ class Runtime:
                     "details": exc.details,
                 },
             }
-            if name == "exec_command":
-                payload["status"] = "failed"
+            if spec.error_status:
+                payload["status"] = spec.error_status
             diagnostics = permission_failure_diagnostics(exc)
             if diagnostics:
                 payload["diagnostics"] = diagnostics
@@ -1548,8 +1411,8 @@ class Runtime:
                     "details": {},
                 },
             }
-            if name == "exec_command":
-                payload["status"] = "failed"
+            if spec.error_status:
+                payload["status"] = spec.error_status
             self.emit_tool_trace(name, args, payload, started_at)
             return make_tool_result(name, payload, is_error=True)
 
@@ -1759,9 +1622,15 @@ class Runtime:
         files: list[dict[str, Any]] = []
         truncated = False
         for batch in path_batches(walk_files(resolved.path), 256):
-            rel_paths = [normalize_rel_display(path, self.workspace.root) for path in batch]
-            ignored = set() if include_ignored else self.workspace.git_ignored_paths(rel_paths)
-            for path, rel in zip(batch, rel_paths):
+            # Filter by glob first so git check-ignore only sees candidates.
+            candidates = [
+                (path, rel)
+                for path, rel in ((path, normalize_rel_display(path, self.workspace.root)) for path in batch)
+                if any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in patterns)
+                and not any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in exclude_patterns)
+            ]
+            ignored = set() if include_ignored else self.workspace.git_ignored_paths([rel for _, rel in candidates])
+            for path, rel in candidates:
                 if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
                     continue
                 if self.workspace.is_ignored_path(
@@ -1770,10 +1639,6 @@ class Runtime:
                     include_ignored=include_ignored,
                     git_ignored=ignored,
                 ):
-                    continue
-                if not any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in patterns):
-                    continue
-                if any(fnmatch.fnmatch(rel, pattern) or PurePosixPath(rel).match(pattern) for pattern in exclude_patterns):
                     continue
                 path_stat = path.lstat()
                 files.append(
@@ -1938,51 +1803,60 @@ class Runtime:
             raise ToolFailure("INVALID_ARGUMENT", f"Invalid regex: {exc}", category="validation") from exc
 
         roots = [resolved.path] if resolved.path.is_file() else walk_files(resolved.path)
-        for path in roots:
-            if path.is_dir() or self.workspace.is_ignored_path(path):
-                continue
-            if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
-                continue
-            rel = normalize_rel_display(path, self.workspace.root)
-            if include_globs and not any(fnmatch.fnmatch(rel, pat) or PurePosixPath(rel).match(pat) for pat in include_globs):
-                continue
-            if any(fnmatch.fnmatch(rel, pat) or PurePosixPath(rel).match(pat) for pat in exclude_globs):
-                continue
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
-            if b"\x00" in data[:4096]:
-                continue
-            try:
-                lines = data.decode("utf-8").splitlines()
-            except UnicodeDecodeError:
-                continue
-            for index, line in enumerate(lines):
-                found = compiled.search(line) if compiled else find_literal(line, query, case_sensitive)
-                if not found:
+        for batch in path_batches(roots, 256):
+            # Filter by glob first so git check-ignore runs once per batch of
+            # candidates instead of once per walked file.
+            candidates = []
+            for path in batch:
+                if path.is_dir():
                     continue
-                total += 1
-                if len(matches) >= max_results:
+                if path.is_symlink() and not self.workspace.is_safe_existing_path(path):
                     continue
-                column = found.start() + 1 if hasattr(found, "start") else 1
-                preview, line_truncated = truncate_line_chars(line)
-                preview_truncation = truncate_text_head(preview, max_lines=1, max_bytes=max_preview_bytes)
-                preview = preview_truncation.content
-                before = lines[max(0, index - context_lines) : index]
-                after = lines[index + 1 : index + 1 + context_lines]
-                item = {
-                    "path": rel,
-                    "line": index + 1,
-                    "column": column,
-                    "preview": preview,
-                    "before": before,
-                    "after": after,
-                }
-                if line_truncated or preview_truncation.truncated:
-                    item["preview_truncated"] = True
-                    item["preview_truncated_by"] = "chars" if line_truncated else preview_truncation.truncated_by
-                matches.append(item)
+                rel = normalize_rel_display(path, self.workspace.root)
+                if include_globs and not any(fnmatch.fnmatch(rel, pat) or PurePosixPath(rel).match(pat) for pat in include_globs):
+                    continue
+                if any(fnmatch.fnmatch(rel, pat) or PurePosixPath(rel).match(pat) for pat in exclude_globs):
+                    continue
+                candidates.append((path, rel))
+            ignored = self.workspace.git_ignored_paths([rel for _, rel in candidates])
+            for path, rel in candidates:
+                if self.workspace.is_ignored_path(path, git_ignored=ignored):
+                    continue
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                if b"\x00" in data[:4096]:
+                    continue
+                try:
+                    lines = data.decode("utf-8").splitlines()
+                except UnicodeDecodeError:
+                    continue
+                for index, line in enumerate(lines):
+                    found = compiled.search(line) if compiled else find_literal(line, query, case_sensitive)
+                    if not found:
+                        continue
+                    total += 1
+                    if len(matches) >= max_results:
+                        continue
+                    column = found.start() + 1 if hasattr(found, "start") else 1
+                    preview, line_truncated = truncate_line_chars(line)
+                    preview_truncation = truncate_text_head(preview, max_lines=1, max_bytes=max_preview_bytes)
+                    preview = preview_truncation.content
+                    before = lines[max(0, index - context_lines) : index]
+                    after = lines[index + 1 : index + 1 + context_lines]
+                    item = {
+                        "path": rel,
+                        "line": index + 1,
+                        "column": column,
+                        "preview": preview,
+                        "before": before,
+                        "after": after,
+                    }
+                    if line_truncated or preview_truncation.truncated:
+                        item["preview_truncated"] = True
+                        item["preview_truncated_by"] = "chars" if line_truncated else preview_truncation.truncated_by
+                    matches.append(item)
         return {
             "query": query,
             "matches": matches,
@@ -2172,16 +2046,10 @@ class Runtime:
                     content = prior.content if prior is not None else baseline.text(source.display)
                     assert content is not None
                     updated = apply_update_hunks(content, op.hunks, op.path)
-                    additions += sum(
-                        line.startswith("+")
-                        for hunk in op.hunks
-                        for line in hunk
-                    )
-                    removals += sum(
-                        line.startswith("-")
-                        for hunk in op.hunks
-                        for line in hunk
-                    )
+                    for hunk in op.hunks:
+                        for line in hunk:
+                            additions += line.startswith("+")
+                            removals += line.startswith("-")
                     source_mode = prior.mode if prior is not None else baseline.mode
                     if op.move_to:
                         dest = self.workspace.resolve_for_write(op.move_to)
@@ -2356,13 +2224,11 @@ class Runtime:
                 session.close_stdin()
         initial_wait = max(0, min(yield_ms, 30000)) / 1000.0
 
-        def finish(status: str, **extra: Any) -> dict[str, Any]:
+        def finish() -> dict[str, Any]:
+            # snapshot_since_cursor owns the status mapping (running/exited/
+            # terminated/timeout) so exec, polling, and kill paths agree.
             payload = session.snapshot_since_cursor(max_output_bytes)
-            if status == "exited" and session.signal_name is not None:
-                status = "terminated"
-            payload["status"] = status
             payload["elapsed_ms"] = int((time.time() - start) * 1000)
-            payload.update(extra)
             self._add_exec_diagnostics(payload)
             return self._format_session_output(session, payload, args)
 
@@ -2370,21 +2236,21 @@ class Runtime:
             if process.poll() is not None:
                 session.refresh_status()
                 session.drain_readers()
-                return finish("timeout" if session.timed_out else "exited")
+                return finish()
             now = time.time()
             if not tty and now >= deadline:
                 session.timed_out = True
                 self._terminate_process_group(process, signal.SIGTERM)
                 session.refresh_status()
                 session.drain_readers()
-                return finish("timeout", timed_out=True)
+                return finish()
             with session.lock:
                 tty_has_initial_output = bool(
                     len(session.stdout) > session.stdout_cursor
                     or len(session.stderr) > session.stderr_cursor
                 )
             if now - start >= initial_wait or (tty and tty_has_initial_output):
-                return finish("running")
+                return finish()
             time.sleep(0.02)
 
     def _check_command_policy(self, cmd: str, args: dict[str, Any]) -> None:
@@ -2636,14 +2502,21 @@ class Runtime:
         with self.sessions_lock:
             self.output_sessions.pop(session.session_id, None)
             self.output_sessions[session.session_id] = session
-            while len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS or self._retained_output_bytes_locked() > MAX_RUNTIME_OUTPUT_BYTES:
-                oldest = next(iter(self.output_sessions))
-                self.output_sessions.pop(oldest, None)
+            self._evict_retained_locked()
 
     def _retained_output_bytes_locked(self) -> int:
         return sum(session.retained_bytes for session in self.sessions.values()) + sum(
             session.retained_bytes for session in self.output_sessions.values()
         )
+
+    def _evict_retained_locked(self) -> None:
+        retained = self._retained_output_bytes_locked()
+        while self.output_sessions and (
+            len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS
+            or retained > MAX_RUNTIME_OUTPUT_BYTES
+        ):
+            oldest = self.output_sessions.pop(next(iter(self.output_sessions)))
+            retained -= oldest.retained_bytes
 
     def _complete_session(self, session: ExecSession) -> None:
         session.refresh_status()
@@ -2669,11 +2542,7 @@ class Runtime:
             ]
             for session_id in expired:
                 self.output_sessions.pop(session_id, None)
-            while self.output_sessions and (
-                len(self.output_sessions) > MAX_RETAINED_OUTPUT_SESSIONS
-                or self._retained_output_bytes_locked() > MAX_RUNTIME_OUTPUT_BYTES
-            ):
-                self.output_sessions.pop(next(iter(self.output_sessions)), None)
+            self._evict_retained_locked()
 
     def _get_output_session(self, session_id: str) -> ExecSession:
         self._prune_sessions()
@@ -2696,22 +2565,24 @@ class Runtime:
                     "yield_time_ms": 10000,
                 },
             }
-        if payload.get("truncated"):
+        output_refs = {
+            "stdout": f"session:{session.session_id}:stdout",
+            "stderr": f"session:{session.session_id}:stderr",
+        }
+        output_stream = "stderr" if not payload.get("stdout") and payload.get("stderr") else "stdout"
+        output_ref = output_refs[output_stream]
+        truncated = bool(payload.get("truncated"))
+        if truncated:
             if terminal:
                 self._remember_output_session(session)
-            output_refs = {
-                "stdout": f"session:{session.session_id}:stdout",
-                "stderr": f"session:{session.session_id}:stderr",
-            }
-            output_stream = "stderr" if not payload.get("stdout") and payload.get("stderr") else "stdout"
-            payload["output_ref"] = output_refs[output_stream]
+            payload["output_ref"] = output_ref
             payload["output_stream"] = output_stream
             payload["output_refs"] = output_refs
             payload["output_truncated"] = True
             if terminal:
                 payload["next_action"] = {
                     "tool": "read_output",
-                    "arguments": {"output_ref": payload["output_ref"], "offset": 0, "limit": EXEC_PREVIEW_BYTES},
+                    "arguments": {"output_ref": output_ref, "offset": 0, "limit": EXEC_PREVIEW_BYTES},
                 }
         verbosity = str(args.get("verbosity", "")).strip().lower()
         if not verbosity:
@@ -2722,14 +2593,8 @@ class Runtime:
                 "verbosity must be one of: summary, preview, full.",
                 category="validation",
             )
-        if terminal:
+        if terminal and not truncated:
             self._remember_output_session(session)
-        output_refs = {
-            "stdout": f"session:{session.session_id}:stdout",
-            "stderr": f"session:{session.session_id}:stderr",
-        }
-        output_stream = "stderr" if not payload.get("stdout") and payload.get("stderr") else "stdout"
-        output_ref = output_refs[output_stream]
         payload["summary"] = self._session_output_summary(session, payload)
         payload["output_ref"] = output_ref
         payload["output_stream"] = output_stream
@@ -2877,15 +2742,12 @@ class Runtime:
             signal.SIGTERM,
         )
         evict = True
-        signal_sent = "SIGKILL" if force else signal.Signals(signum).name
         if session.process.poll() is None:
             session.terminating = True
             self._terminate_process_group(session.process, signum, force=force)
             exited = self._wait_for_session_exit(session, int(args.get("wait_ms", 5000)) / 1000.0)
             if not exited and not force:
-                signum = HARD_KILL_SIGNAL
                 force = True
-                signal_sent = "SIGKILL"
                 self._terminate_process_group(session.process, HARD_KILL_SIGNAL, force=True)
                 exited = self._wait_for_session_exit(session, int(args.get("kill_wait_ms", 2000)) / 1000.0)
             if exited:
@@ -2898,6 +2760,7 @@ class Runtime:
         else:
             killed = False
             status = "exited"
+        signal_sent = "SIGKILL" if force else signal.Signals(signum).name
         payload = session.snapshot_since_cursor(int(args.get("max_output_bytes", 65536)))
         payload.update({"killed": killed, "status": status, "evicted": evict, "signal_sent": signal_sent})
         payload = self._format_session_output(session, payload, args)
@@ -4708,7 +4571,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "Unknown endpoint"}, status=404)
             return
         origin = self.headers.get("Origin")
-        if origin and not is_allowed_origin(origin, auth_enabled=self.runtime.auth_enabled()):
+        if origin and not is_allowed_origin(origin):
             self.send_json({"error": "Origin denied"}, status=403)
             return
         self.send_response(204)
@@ -4730,7 +4593,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             return
         if normalized == "/mcp":
             origin = self.headers.get("Origin")
-            if origin and not is_allowed_origin(origin, auth_enabled=self.runtime.auth_enabled()):
+            if origin and not is_allowed_origin(origin):
                 self.send_json({"error": "Origin denied"}, status=403, head_only=head_only)
                 return
             if not self.is_authorized():
@@ -4764,7 +4627,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32601, "message": "Unknown endpoint"}}, status=404)
             return
         origin = self.headers.get("Origin")
-        if origin and not is_allowed_origin(origin, auth_enabled=self.runtime.auth_enabled()):
+        if origin and not is_allowed_origin(origin):
             self.send_json({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Origin denied"}}, status=403)
             return
         if not self.is_authorized():
@@ -4945,47 +4808,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_json(response)
 
     def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
-        request_id = request.get("id")
         try:
-            validate_rpc_envelope(request)
-            method = request["method"]
-            params = rpc_params(request)
-            if not self.runtime.initialized and method not in {"initialize", "ping"}:
-                raise JsonRpcError(-32002, "Server not initialized")
-            if method == "initialize":
-                validate_initialize_request(request)
-                self.runtime.protocol_version = validate_initialize_params(params)
-                result = self.runtime.initialize()
-                self.runtime.initialized = True
-            elif method == "notifications/initialized":
-                return None
-            elif method == "notifications/cancelled":
-                cancelled_request_id = params.get("requestId")
-                if isinstance(cancelled_request_id, (str, int)) and not isinstance(cancelled_request_id, bool):
-                    self.runtime.cancel_request(cancelled_request_id)
-                return None
-            elif method == "ping":
-                result = {}
-            elif method == "tools/list":
-                result = self.runtime.list_tools()
-            elif method == "tools/call":
-                if not isinstance(params.get("name"), str):
-                    raise JsonRpcError(-32602, "tools/call requires a tool name")
-                arguments = params.get("arguments") or {}
-                if not isinstance(arguments, dict):
-                    raise JsonRpcError(-32602, "tools/call arguments must be an object")
-                result = self.runtime.call_tool(params["name"], arguments, request_id=request_id)
-            else:
-                raise JsonRpcError(-32601, f"Unknown method: {method}")
-            if request_id is None:
-                return None
-            return {"jsonrpc": "2.0", "id": request_id, "result": result}
-        except JsonRpcError as exc:
-            error: dict[str, Any] = {"code": exc.code, "message": exc.message}
-            if exc.data is not None:
-                error["data"] = exc.data
-            return {"jsonrpc": "2.0", "id": response_id(request), "error": error}
-        except Exception as exc:  # noqa: BLE001
+            return dispatch_rpc(self.runtime, request)
+        except Exception as exc:  # noqa: BLE001 - HTTP must always answer with JSON-RPC
             return {
                 "jsonrpc": "2.0",
                 "id": response_id(request),
@@ -5369,7 +5194,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
     def send_cors_headers(self) -> None:
         origin = self.headers.get("Origin")
-        if origin and is_allowed_origin(origin, auth_enabled=self.runtime.auth_enabled()):
+        if origin and is_allowed_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS")
@@ -5428,6 +5253,7 @@ def build_runtime(
     auth_token: str | None = None,
     oauth_config: OAuthConfig | None = None,
     emit_warning: bool = True,
+    project_context: ProjectContext | None = None,
 ) -> Runtime:
     workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
     runtime = Runtime(
@@ -5438,6 +5264,7 @@ def build_runtime(
         allow_network=runtime_policy.allow_network,
         auth_token=auth_token,
         oauth_config=oauth_config,
+        project_context=project_context,
     )
     if emit_warning and runtime.capabilities.skip_all_permissions:
         print(
@@ -5553,6 +5380,7 @@ def run_http(args: argparse.Namespace) -> int:
             auth_token=auth_token,
             oauth_config=oauth_config,
             emit_warning=False,
+            project_context=runtime.project_context,
         )
 
     server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)

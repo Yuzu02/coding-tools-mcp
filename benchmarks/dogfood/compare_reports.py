@@ -31,8 +31,6 @@ def load_reports(paths: list[Path]) -> list[dict[str, Any]]:
         if not isinstance(payload, dict) or not isinstance(payload.get("metrics"), dict):
             raise ValueError(f"Not a dogfood report: {path}")
         reports.append(payload)
-    if not reports:
-        raise ValueError("At least one report is required")
     return reports
 
 

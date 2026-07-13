@@ -58,10 +58,10 @@ def _render_error(payload: dict[str, Any]) -> str:
 
 
 def _render_server_info(payload: dict[str, Any]) -> str:
-    name = payload.get("name") or payload.get("server_name") or "coding-tools-mcp"
-    version = payload.get("version") or "unknown"
-    workspace = payload.get("workspace") or payload.get("workspace_root") or "."
-    return f"{name} {version}\nWorkspace: {workspace}"
+    return (
+        f"{payload.get('server', 'coding-tools-mcp')} {payload.get('version', 'unknown')}\n"
+        f"Workspace: {payload.get('workspace', '.')}"
+    )
 
 
 def _render_exec_environment(payload: dict[str, Any]) -> str:
@@ -212,9 +212,7 @@ def _render_git_blame(payload: dict[str, Any]) -> str:
         if not isinstance(item, dict):
             continue
         rendered.append(
-            f"{item.get('line_number', item.get('line', ''))} "
-            f"{item.get('short_hash', item.get('commit', ''))} "
-            f"{item.get('content', '')}"
+            f"{item.get('line', '')} {item.get('commit', '')} {item.get('content', '')}"
         )
     return _bounded_model_text("\n".join(rendered), "Git blame")
 
@@ -225,15 +223,14 @@ def _bounded_model_text(value: str, label: str) -> str:
     encoded = value.encode("utf-8")
     if len(encoded) <= MODEL_TEXT_LIMIT_BYTES:
         return value
-    suffix = f"\n… {label} preview truncated; content continues in structuredContent."
-    for _ in range(2):
-        preview_budget = max(0, MODEL_TEXT_LIMIT_BYTES - len(suffix.encode("utf-8")))
-        preview = encoded[:preview_budget].decode("utf-8", errors="ignore")
-        omitted = len(encoded) - len(preview.encode("utf-8"))
-        suffix = f"\n… {label} preview truncated; {omitted} bytes remain in structuredContent."
-    preview_budget = max(0, MODEL_TEXT_LIMIT_BYTES - len(suffix.encode("utf-8")))
+    # Reserve suffix space for the worst-case omitted count (the whole value),
+    # so the real count rendered below can only be shorter and the total stays
+    # within the limit.
+    reserve = f"\n… {label} preview truncated; {len(encoded)} bytes remain in structuredContent."
+    preview_budget = max(0, MODEL_TEXT_LIMIT_BYTES - len(reserve.encode("utf-8")))
     preview = encoded[:preview_budget].decode("utf-8", errors="ignore")
-    return preview + suffix
+    omitted = len(encoded) - len(preview.encode("utf-8"))
+    return preview + f"\n… {label} preview truncated; {omitted} bytes remain in structuredContent."
 
 
 def _render_image(payload: dict[str, Any]) -> str:

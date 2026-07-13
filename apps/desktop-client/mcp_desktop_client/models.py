@@ -83,23 +83,19 @@ class WorkspaceProfile:
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> "WorkspaceProfile":
-        runtime_record = {
-            key: value
-            for key, value in dict(record.get("runtime", {})).items()
-            if key in RuntimeConfig.__dataclass_fields__
-        }
-        auth_record = {
-            key: value
-            for key, value in dict(record.get("auth", {})).items()
-            if key in AuthConfig.__dataclass_fields__
-        }
+        def known_fields(config_cls: type, key: str) -> dict[str, Any]:
+            # Drop keys removed or renamed in newer releases so stale
+            # profiles.json records keep loading.
+            data = dict(record.get(key, {}))
+            return {name: value for name, value in data.items() if name in config_cls.__dataclass_fields__}
+
         return cls(
             id=record["id"],
             name=record["name"],
             path=record["path"],
-            tunnel=TunnelConfig(**record.get("tunnel", {})),
-            auth=AuthConfig(**auth_record),
-            runtime=RuntimeConfig(**runtime_record),
+            tunnel=TunnelConfig(**known_fields(TunnelConfig, "tunnel")),
+            auth=AuthConfig(**known_fields(AuthConfig, "auth")),
+            runtime=RuntimeConfig(**known_fields(RuntimeConfig, "runtime")),
         )
 
 

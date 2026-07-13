@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from .i18n import tr
@@ -44,20 +45,32 @@ def _check_json_field(url: str, field: str) -> tuple[bool, str]:
 
 def run_health_checks(profile: WorkspaceProfile) -> list[HealthItem]:
     local_origin = profile.local_endpoint.removesuffix("/mcp")
-    local_ok, local_detail = _check_url(f"{local_origin}/.well-known/mcp.json")
-    if profile.auth.type == "oauth":
-        oauth_ok, oauth_detail = _check_json_field(
-            f"{profile.effective_public_url}/.well-known/oauth-authorization-server",
-            "token_endpoint_auth_methods_supported",
-        )
-        protected_ok, protected_detail = _check_json_field(
-            f"{profile.effective_public_url}/.well-known/oauth-protected-resource",
-            "authorization_servers",
-        )
-    else:
-        oauth_ok = protected_ok = True
-        oauth_detail = protected_detail = f"Not applicable for {profile.auth.type} auth"
-    public_ok, public_detail = _check_url(f"{profile.effective_public_url}/.well-known/mcp.json")
+    public_url = profile.effective_public_url
+    oauth = profile.auth.type == "oauth"
+    # Each check is an independent HTTP fetch with its own timeout; run them
+    # concurrently so a down endpoint doesn't serialize the others.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        local_future = pool.submit(_check_url, f"{local_origin}/.well-known/mcp.json")
+        public_future = pool.submit(_check_url, f"{public_url}/.well-known/mcp.json")
+        if oauth:
+            oauth_future = pool.submit(
+                _check_json_field,
+                f"{public_url}/.well-known/oauth-authorization-server",
+                "token_endpoint_auth_methods_supported",
+            )
+            protected_future = pool.submit(
+                _check_json_field,
+                f"{public_url}/.well-known/oauth-protected-resource",
+                "authorization_servers",
+            )
+        local_ok, local_detail = local_future.result()
+        public_ok, public_detail = public_future.result()
+        if oauth:
+            oauth_ok, oauth_detail = oauth_future.result()
+            protected_ok, protected_detail = protected_future.result()
+        else:
+            oauth_ok = protected_ok = True
+            oauth_detail = protected_detail = f"Not applicable for {profile.auth.type} auth"
     return [
         HealthItem(tr("Health", "Local discovery"), local_ok, local_detail),
         HealthItem(tr("Health", "Public discovery"), public_ok, public_detail),

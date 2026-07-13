@@ -126,21 +126,11 @@ class MCPClient:
                 + " ".join(cmd or ["<empty>"])
             )
 
-        env = os.environ.copy()
-        for name in (
-            "CODING_TOOLS_MCP_DANGEROUSLY_SKIP_ALL_PERMISSIONS",
-            "CODING_TOOLS_MCP_ALLOW_NETWORK",
-        ):
-            env.pop(name, None)
-        env.update(
-            {
-                "AWS_SECRET_ACCESS_KEY": "COMPLIANCE_SHOULD_NOT_LEAK",
-                "OPENAI_API_KEY": "COMPLIANCE_SHOULD_NOT_LEAK",
-                "CODING_TOOLS_MCP_WORKSPACE": str(self.workspace),
-                "CODING_TOOLS_MCP_PERMISSION_MODE": "safe",
-            }
+        env = safe_server_env(
+            AWS_SECRET_ACCESS_KEY="COMPLIANCE_SHOULD_NOT_LEAK",
+            OPENAI_API_KEY="COMPLIANCE_SHOULD_NOT_LEAK",
+            CODING_TOOLS_MCP_WORKSPACE=str(self.workspace),
         )
-        prepend_repo_pythonpath(env)
         self.process = subprocess.Popen(
             cmd,
             cwd=str(self.workspace),
@@ -330,6 +320,19 @@ def prepend_repo_pythonpath(env: dict[str, str]) -> dict[str, str]:
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(ROOT) if not existing else str(ROOT) + os.pathsep + existing
     return env
+
+
+def safe_server_env(**overrides: str) -> dict[str, str]:
+    """Env for compliance server processes: dangerous toggles scrubbed, safe mode forced."""
+    env = os.environ.copy()
+    for name in (
+        "CODING_TOOLS_MCP_DANGEROUSLY_SKIP_ALL_PERMISSIONS",
+        "CODING_TOOLS_MCP_ALLOW_NETWORK",
+    ):
+        env.pop(name, None)
+    env["CODING_TOOLS_MCP_PERMISSION_MODE"] = "safe"
+    env.update(overrides)
+    return prepend_repo_pythonpath(env)
 
 
 def subprocess_group_kwargs() -> dict[str, Any]:

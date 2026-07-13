@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.mcp_http import McpHttpClient, McpHttpError  # noqa: E402 - repo path is bootstrapped above
+from benchmarks.runtime_latency import percentile  # noqa: E402 - repo path is bootstrapped above
 
 
 FIXTURE_FILES: dict[str, str] = {
@@ -351,39 +352,31 @@ class DogfoodRunner:
         return case.finalize()
 
     def call(self, tool: str, arguments: dict[str, Any], *, expected_rejection: bool = False) -> dict[str, Any]:
-        started = time.perf_counter()
         argument_bytes = len(json.dumps(arguments, sort_keys=True).encode("utf-8"))
+        started = time.perf_counter()
         try:
             result = self.client.call_tool(tool, arguments)
+            duration_ms = round((time.perf_counter() - started) * 1000, 3)
             ok = not is_error_result(result)
-            self.calls.append(
-                ToolCallRecord(
-                    tool,
-                    arguments,
-                    ok,
-                    expected_rejection,
-                    summarize(result),
-                    argument_bytes,
-                    len(json.dumps(result, sort_keys=True).encode("utf-8")),
-                    round((time.perf_counter() - started) * 1000, 3),
-                )
-            )
-            return result
+            summary = summarize(result)
         except McpHttpError as exc:
+            duration_ms = round((time.perf_counter() - started) * 1000, 3)
             result = {"isError": True, "transport_error": str(exc), "payload": exc.payload}
-            self.calls.append(
-                ToolCallRecord(
-                    tool,
-                    arguments,
-                    False,
-                    expected_rejection,
-                    str(exc),
-                    argument_bytes,
-                    len(json.dumps(result, sort_keys=True).encode("utf-8")),
-                    round((time.perf_counter() - started) * 1000, 3),
-                )
+            ok = False
+            summary = str(exc)
+        self.calls.append(
+            ToolCallRecord(
+                tool,
+                arguments,
+                ok,
+                expected_rejection,
+                summary,
+                argument_bytes,
+                len(json.dumps(result, sort_keys=True).encode("utf-8")),
+                duration_ms,
             )
-            return result
+        )
+        return result
 
 
 def dogfood_fixture_parent() -> Path:
@@ -624,19 +617,6 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def percentile(samples: list[float], percent: float) -> float:
-    if not samples:
-        return 0.0
-    ordered = sorted(samples)
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = (len(ordered) - 1) * percent / 100
-    lower = int(rank)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = rank - lower
-    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
-
-
 def efficiency_metrics(
     calls: list[ToolCallRecord],
     cases: list[CaseResult],
@@ -648,7 +628,7 @@ def efficiency_metrics(
     ]
     successful_first_patches = sum(call.ok for call in first_patch_attempts)
     completed = sum(case.status == "PASS" for case in cases)
-    durations = [call.duration_ms for call in calls]
+    durations = sorted(call.duration_ms for call in calls)
     return {
         "completion_rate": round(completed / len(cases), 3) if cases else 0.0,
         "total_elapsed_ms": round((time.perf_counter() - started_at) * 1000, 3),

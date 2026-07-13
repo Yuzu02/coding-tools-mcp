@@ -31,9 +31,8 @@ from coding_tools_mcp.server import (
     identify_image,
     permission_failure_diagnostics,
     runtime_parent_root,
-    truncate_text_head,
-    truncate_text_tail,
 )
+from coding_tools_mcp.textutils import truncate_text_head, truncate_text_tail
 from tests.compliance.fixtures import git_fixture_preflight_error, init_git
 
 

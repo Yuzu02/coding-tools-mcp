@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 from .errors import ToolFailure
+from .textutils import DEFAULT_MAX_LINES, truncate_text_tail
 
 
 SESSION_BUFFER_BYTES = 524_288
@@ -402,36 +403,16 @@ def _trim_buffer(
     return overflow
 
 
-def truncate_output_bytes_tail(data: bytes, max_bytes: int, max_lines: int = 2000) -> OutputTruncation:
-    text = data.decode("utf-8", errors="replace")
-    encoded_size = len(text.encode("utf-8"))
-    lines = text.split("\n")
-    if len(lines) <= max_lines and encoded_size <= max_bytes:
-        return OutputTruncation(text, False, None, len(lines), encoded_size)
-    candidates = lines[:-1] if lines and lines[-1] == "" else lines
-    output: list[str] = []
-    output_bytes = 0
-    truncated_by = "lines"
-    for reverse_index, line in enumerate(reversed(candidates)):
-        if len(output) >= max_lines:
-            break
-        line_bytes = len(line.encode("utf-8")) + (1 if reverse_index > 0 else 0)
-        if output_bytes + line_bytes > max_bytes:
-            truncated_by = "bytes"
-            if not output:
-                output.insert(0, _utf8_tail(line, max_bytes))
-            break
-        output.insert(0, line)
-        output_bytes += line_bytes
-    content = "\n".join(output)
-    return OutputTruncation(content, True, truncated_by, len(output), len(content.encode("utf-8")))
-
-
-def _utf8_tail(text: str, max_bytes: int) -> str:
-    data = text.encode("utf-8")
-    if len(data) <= max_bytes:
-        return text
-    start = len(data) - max_bytes
-    while start < len(data) and (data[start] & 0xC0) == 0x80:
-        start += 1
-    return data[start:].decode("utf-8", errors="replace")
+def truncate_output_bytes_tail(data: bytes, max_bytes: int, max_lines: int = DEFAULT_MAX_LINES) -> OutputTruncation:
+    truncation = truncate_text_tail(
+        data.decode("utf-8", errors="replace"),
+        max_lines=max_lines,
+        max_bytes=max_bytes,
+    )
+    return OutputTruncation(
+        truncation.content,
+        truncation.truncated,
+        truncation.truncated_by,
+        truncation.output_lines,
+        truncation.output_bytes,
+    )

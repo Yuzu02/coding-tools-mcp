@@ -65,3 +65,55 @@ def validate_initialize_request(request: dict[str, Any]) -> None:
 
 def protocol_version_is_supported(version: Any) -> bool:
     return isinstance(version, str) and version in SUPPORTED_PROTOCOL_VERSIONS
+
+
+def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None:
+    """Dispatch one MCP JSON-RPC request against a runtime, shared by all transports.
+
+    Handshake state lives on ``runtime.initialized``; transports add only their
+    transport-specific framing (session headers, stream handling) around this.
+    Returns None for notifications and requests without an id.
+    """
+
+    request_id = request.get("id")
+    try:
+        validate_rpc_envelope(request)
+        method = request["method"]
+        params = rpc_params(request)
+        if not runtime.initialized and method not in {"initialize", "ping"}:
+            raise JsonRpcError(-32002, "Server not initialized")
+        if method == "initialize":
+            if runtime.initialized:
+                raise JsonRpcError(-32600, "Server is already initialized")
+            validate_initialize_request(request)
+            runtime.protocol_version = validate_initialize_params(params)
+            result = runtime.initialize()
+            runtime.initialized = True
+        elif method == "notifications/initialized":
+            return None
+        elif method == "notifications/cancelled":
+            cancelled_request_id = params.get("requestId")
+            if isinstance(cancelled_request_id, (str, int)) and not isinstance(cancelled_request_id, bool):
+                runtime.cancel_request(cancelled_request_id)
+            return None
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = runtime.list_tools()
+        elif method == "tools/call":
+            if not isinstance(params.get("name"), str):
+                raise JsonRpcError(-32602, "tools/call requires a tool name")
+            arguments = params.get("arguments") or {}
+            if not isinstance(arguments, dict):
+                raise JsonRpcError(-32602, "tools/call arguments must be an object")
+            result = runtime.call_tool(params["name"], arguments, request_id=request_id)
+        else:
+            raise JsonRpcError(-32601, f"Unknown method: {method}")
+        if request_id is None:
+            return None
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+    except JsonRpcError as exc:
+        error: dict[str, Any] = {"code": exc.code, "message": exc.message}
+        if exc.data is not None:
+            error["data"] = exc.data
+        return {"jsonrpc": "2.0", "id": response_id(request), "error": error}

@@ -11,6 +11,12 @@ MAX_HTTP_SESSIONS = 128
 HTTP_SESSION_TTL_SECONDS = 60 * 60
 
 
+def _close_runtime(runtime: Any) -> None:
+    close = getattr(runtime, "close", None)
+    if callable(close):
+        close()
+
+
 @dataclass
 class HTTPSessionRecord:
     runtime: Any
@@ -52,9 +58,7 @@ class HTTPSessionManager:
             with self._lock:
                 self._creating -= 1
             if runtime is not None and not installed:
-                close = getattr(runtime, "close", None)
-                if callable(close):
-                    close()
+                _close_runtime(runtime)
 
     def get(self, session_id: str) -> Any | None:
         self.prune()
@@ -72,9 +76,7 @@ class HTTPSessionManager:
             record = self._sessions.pop(session_id, None)
         if record is None:
             return False
-        close = getattr(record.runtime, "close", None)
-        if callable(close):
-            close()
+        _close_runtime(record.runtime)
         return True
 
     def prune(self) -> None:
@@ -83,9 +85,7 @@ class HTTPSessionManager:
             expired = [session_id for session_id, record in self._sessions.items() if record.last_seen < cutoff]
             records = [self._sessions.pop(session_id) for session_id in expired]
         for record in records:
-            close = getattr(record.runtime, "close", None)
-            if callable(close):
-                close()
+            _close_runtime(record.runtime)
 
     def close(self) -> None:
         with self._lock:
@@ -93,6 +93,4 @@ class HTTPSessionManager:
             records = list(self._sessions.values())
             self._sessions.clear()
         for record in records:
-            close = getattr(record.runtime, "close", None)
-            if callable(close):
-                close()
+            _close_runtime(record.runtime)
