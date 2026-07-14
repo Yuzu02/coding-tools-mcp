@@ -10,9 +10,13 @@
 - Made `apply_patch` the sole direct file-mutation tool and added staged,
   baseline-checked, same-directory atomic replacement with multi-file rollback,
   mode/BOM/newline preservation, and structured retry errors.
-- Changed model-facing `content` from a JSON mirror to bounded per-tool summaries
-  and previews. Clients that parsed text as JSON must read
-  `structuredContent`.
+- Changed model-facing `content` from a JSON mirror to per-tool summaries and
+  previews sized by each tool's own per-call limits, without the former 16 KiB
+  renderer preview cap. A generous emergency ceiling still protects clients
+  from unbounded individual entries. Command results always lead with
+  status/exit code; pageable truncation names executable continuation calls,
+  while non-pageable results state how to narrow or raise their limits. Clients
+  that parsed text as JSON must read `structuredContent`.
 - Changed `exec_command` and `write_stdin` default yield to 10 seconds. Running
   or truncated results now provide explicit machine-readable `next_action`.
 - Split active and retained process sessions and added concurrency, count, byte,

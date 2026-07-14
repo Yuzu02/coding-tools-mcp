@@ -1470,7 +1470,8 @@ class Runtime:
         print(json.dumps(event, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
 
     def read_file(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.resolve_existing(str(args.get("path", "")))
+        requested_path = str(args.get("path", ""))
+        resolved = self.resolve_existing(requested_path)
         if resolved.path.is_dir():
             raise ToolFailure("IS_DIRECTORY", "Path is a directory.", category="validation")
         max_bytes = int(args.get("max_bytes", 131072))
@@ -1528,10 +1529,11 @@ class Runtime:
             warnings.append("content truncated")
         if truncation.first_line_exceeds_limit:
             warnings.append("first selected line exceeds max_bytes")
-        return {
+        result = {
             "path": resolved.display,
             "content": selected,
             "encoding": "utf-8",
+            "max_bytes": max_bytes,
             "start_line": start_line,
             "end_line": actual_end,
             "total_lines": total_lines,
@@ -1539,11 +1541,22 @@ class Runtime:
             "bytes_read": len(selected.encode("utf-8")),
             "truncated": truncated,
             "truncated_by": truncation.truncated_by or ("bytes" if selection_complete else None),
+            "first_line_exceeds_limit": truncation.first_line_exceeds_limit,
             "output_lines": truncation.output_lines,
             "output_bytes": truncation.output_bytes,
             "next_start_line": next_start_line,
             "warnings": warnings,
         }
+        if next_start_line is not None:
+            result["next_action"] = {
+                "tool": "read_file",
+                "arguments": {
+                    "path": requested_path,
+                    "start_line": next_start_line,
+                    "max_bytes": max_bytes,
+                },
+            }
+        return result
 
     def list_dir(self, args: dict[str, Any]) -> dict[str, Any]:
         resolved = self.resolve_existing(str(args.get("path", ".")))
@@ -1974,6 +1987,10 @@ class Runtime:
                 matches.append(item)
         finally:
             timeout.cancel()
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
             try:
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
@@ -2569,21 +2586,46 @@ class Runtime:
             "stdout": f"session:{session.session_id}:stdout",
             "stderr": f"session:{session.session_id}:stderr",
         }
-        output_stream = "stderr" if not payload.get("stdout") and payload.get("stderr") else "stdout"
+        truncated_streams: list[str] = []
+        for stream in ("stdout", "stderr"):
+            omitted = payload.get(f"{stream}_omitted_bytes")
+            if payload.get(f"{stream}_truncated") or (
+                isinstance(omitted, int) and omitted > 0
+            ):
+                truncated_streams.append(stream)
+        output_stream = (
+            truncated_streams[0]
+            if truncated_streams
+            else "stderr"
+            if not payload.get("stdout") and payload.get("stderr")
+            else "stdout"
+        )
         output_ref = output_refs[output_stream]
         truncated = bool(payload.get("truncated"))
         if truncated:
+            if not truncated_streams:
+                truncated_streams.append(output_stream)
             if terminal:
                 self._remember_output_session(session)
             payload["output_ref"] = output_ref
             payload["output_stream"] = output_stream
             payload["output_refs"] = output_refs
             payload["output_truncated"] = True
-            if terminal:
-                payload["next_action"] = {
+            payload["truncated_output_streams"] = truncated_streams
+            read_actions = [
+                {
                     "tool": "read_output",
-                    "arguments": {"output_ref": output_ref, "offset": 0, "limit": EXEC_PREVIEW_BYTES},
+                    "arguments": {
+                        "output_ref": output_refs[stream],
+                        "offset": 0,
+                        "limit": EXEC_PREVIEW_BYTES,
+                    },
                 }
+                for stream in truncated_streams
+            ]
+            payload["next_actions"] = read_actions
+            if terminal:
+                payload["next_action"] = read_actions[0]
         verbosity = str(args.get("verbosity", "")).strip().lower()
         if not verbosity:
             return payload
@@ -2626,6 +2668,27 @@ class Runtime:
             compact["preview"] = preview
             compact["preview_truncated"] = preview_truncated
             compact["truncated"] = bool(compact.get("truncated") or preview_truncated)
+            if preview_truncated and not compact.get("truncated_output_streams"):
+                preview_streams = [
+                    stream
+                    for stream in ("stdout", "stderr")
+                    if session.retained_stream_bytes(stream)[2] > 0
+                ]
+                compact["truncated_output_streams"] = preview_streams
+                preview_actions = [
+                    {
+                        "tool": "read_output",
+                        "arguments": {
+                            "output_ref": output_refs[stream],
+                            "offset": 0,
+                            "limit": EXEC_PREVIEW_BYTES,
+                        },
+                    }
+                    for stream in preview_streams
+                ]
+                compact["next_actions"] = preview_actions
+                if terminal and preview_actions:
+                    compact["next_action"] = preview_actions[0]
         return compact
 
     def _session_output_summary(self, session: ExecSession, payload: dict[str, Any]) -> str:
@@ -2675,7 +2738,7 @@ class Runtime:
             warnings.append(f"older {stream} output was dropped from the rolling session buffer")
         if ref_stream == "full":
             warnings.append("legacy full output_ref defaults to stdout; use output_refs for stable stream paging")
-        return {
+        result = {
             "output_ref": output_ref,
             "stream_output_ref": f"session:{session.session_id}:{stream}",
             "stream": stream,
@@ -2695,6 +2758,16 @@ class Runtime:
             "ok": True,
             "warnings": warnings,
         }
+        if next_offset is not None:
+            result["next_action"] = {
+                "tool": "read_output",
+                "arguments": {
+                    "output_ref": result["stream_output_ref"],
+                    "offset": next_offset,
+                    "limit": limit,
+                },
+            }
+        return result
 
     def write_stdin(self, args: dict[str, Any]) -> dict[str, Any]:
         session_id = str(args.get("session_id", ""))
@@ -2949,7 +3022,8 @@ class Runtime:
 
     def git_log(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
-        resolved = self.resolve_existing(str(args.get("path", ".")))
+        requested_path = str(args.get("path", "."))
+        resolved = self.resolve_existing(requested_path)
         if not self._is_git_repo(resolved.path):
             return {"is_repo": False, "commits": [], "truncated": False, "warnings": []}
         ref = validate_git_ref(str(args.get("ref", "HEAD")))
@@ -2988,14 +3062,27 @@ class Runtime:
                 }
             )
         truncated = len(commits) > max_count
-        return {
+        result = {
             "is_repo": True,
             "ref": ref,
             "path": path_filter,
+            "max_count": max_count,
+            "skip": skip,
             "commits": commits[:max_count],
             "truncated": truncated,
             "warnings": ["commit limit reached"] if truncated else [],
         }
+        if truncated:
+            result["next_action"] = {
+                "tool": "git_log",
+                "arguments": {
+                    "path": requested_path,
+                    "ref": ref,
+                    "max_count": max_count,
+                    "skip": skip + max_count,
+                },
+            }
+        return result
 
     def git_show(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
@@ -3045,7 +3132,8 @@ class Runtime:
 
     def git_blame(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
-        resolved = self.resolve_existing(str(args.get("path", "")))
+        requested_path = str(args.get("path", ""))
+        resolved = self.resolve_existing(requested_path)
         if resolved.path.is_dir():
             raise ToolFailure("IS_DIRECTORY", "Path is a directory.", category="validation")
         if not self._is_git_repo(self.workspace.root):
@@ -3056,14 +3144,14 @@ class Runtime:
         end_line = args.get("end_line")
         max_lines = int(args.get("max_lines", 200))
         if end_line is None:
-            final_line = start_line + max_lines - 1
+            requested_final_line = start_line + max_lines - 1
         else:
-            final_line = int(end_line)
-        if final_line < start_line:
+            requested_final_line = int(end_line)
+        if requested_final_line < start_line:
             raise ToolFailure("INVALID_ARGUMENT", "end_line must be >= start_line.", category="validation")
-        requested_lines = final_line - start_line + 1
+        requested_lines = requested_final_line - start_line + 1
         truncated = requested_lines > max_lines
-        final_line = min(final_line, start_line + max_lines - 1)
+        final_line = min(requested_final_line, start_line + max_lines - 1)
         cmd = [
             git,
             "-C",
@@ -3083,16 +3171,31 @@ class Runtime:
         if len(lines) > max_lines:
             lines = lines[:max_lines]
             truncated = True
-        return {
+        result = {
             "is_repo": True,
             "path": resolved.display,
             "rev": ref,
             "start_line": start_line,
             "end_line": final_line,
+            "max_lines": max_lines,
             "lines": lines,
             "truncated": truncated,
             "warnings": ["line limit reached"] if truncated else [],
         }
+        if truncated and final_line < requested_final_line:
+            next_arguments: dict[str, Any] = {
+                "path": requested_path,
+                "start_line": final_line + 1,
+                "end_line": requested_final_line,
+                "max_lines": max_lines,
+            }
+            if ref:
+                next_arguments["rev"] = ref
+            result["next_action"] = {
+                "tool": "git_blame",
+                "arguments": next_arguments,
+            }
+        return result
 
     def request_permissions(self, args: dict[str, Any]) -> dict[str, Any]:
         if self.dangerously_skip_all_permissions:

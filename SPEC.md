@@ -37,8 +37,10 @@ fixed.
 - Every HTTP `Mcp-Session-Id` owns an independent `Runtime`.
 - JSON-RPC batches are rejected, cancellation follows `requestId`, and
   unimplemented logging is not advertised.
-- `content` is bounded, agent-readable text. `structuredContent` is the complete
-  stable machine result. `_meta` is optional UI space only.
+- `content` is agent-readable text normally sized by each tool's per-call
+  limits, with a documented emergency safety ceiling for pathological entries.
+  `structuredContent` is the complete stable machine result. `_meta` is
+  optional UI space only.
 - Root project instructions enter the initialization context automatically.
 
 ## Correctness guarantees

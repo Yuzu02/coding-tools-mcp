@@ -33,6 +33,10 @@ from coding_tools_mcp.server import (
     runtime_parent_root,
 )
 from coding_tools_mcp.textutils import truncate_text_head, truncate_text_tail
+from coding_tools_mcp.tool_results import (
+    MODEL_TEXT_SAFETY_LIMIT_BYTES,
+    make_tool_result,
+)
 from tests.compliance.fixtures import git_fixture_preflight_error, init_git
 
 
@@ -845,10 +849,12 @@ Maven home: /usr/share/maven
             self.assertIs(apply_patch_tool["annotations"].get("destructiveHint"), True)
             self.assertIs(apply_patch_tool["annotations"].get("readOnlyHint"), False)
 
-    def test_agent_text_is_bounded_while_structured_content_stays_complete(self) -> None:
+    def test_agent_text_matches_per_tool_limits_without_renderer_truncation(self) -> None:
+        # Per-call tool limits (here read_file max_bytes) are the only budget:
+        # the renderer must not apply a second, hidden truncation layer.
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            content = "x" * 50_000
+            content = ("x" * 49_999) + "!"
             (workspace / "large.txt").write_text(content, encoding="utf-8")
             result = Runtime(workspace).call_tool(
                 "read_file",
@@ -862,8 +868,253 @@ Maven home: /usr/share/maven
                 if item.get("type") == "text"
             )
             self.assertEqual(payload["content"], content)
-            self.assertLessEqual(len(model_text.encode("utf-8")), 16_384)
-            self.assertIn("preview truncated", model_text)
+            self.assertEqual(model_text, content)
+            self.assertNotIn("preview truncated", model_text)
+
+    def agent_text(self, result: dict[str, object]) -> str:
+        return "\n".join(
+            str(item.get("text"))
+            for item in result.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+
+    def test_agent_text_has_an_emergency_safety_ceiling(self) -> None:
+        oversized_context = "x" * (MODEL_TEXT_SAFETY_LIMIT_BYTES + 1024)
+        result = make_tool_result(
+            "search_text",
+            {
+                "matches": [
+                    {
+                        "path": "large.txt",
+                        "line": 2,
+                        "column": 1,
+                        "preview": "needle",
+                        "before": [oversized_context],
+                        "after": [],
+                    }
+                ],
+                "truncated": False,
+            },
+            is_error=False,
+        )
+        model_text = self.agent_text(result)
+        self.assertLessEqual(
+            len(model_text.encode("utf-8")),
+            MODEL_TEXT_SAFETY_LIMIT_BYTES,
+        )
+        self.assertIn("model text reached", model_text)
+        self.assertIn("safety ceiling", model_text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell command syntax")
+    def test_exec_model_text_always_carries_exit_status(self) -> None:
+        # A failing command whose stdout looks like success must still be
+        # legible as a failure from the model text alone.
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {"cmd": "echo All checks completed.; exit 7", "timeout_ms": 10000},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn("Status: exited", model_text)
+            self.assertIn("exit code 7", model_text)
+            self.assertIn("All checks completed.", model_text)
+
+    def test_exec_truncated_model_text_names_a_real_output_ref(self) -> None:
+        with TemporaryDirectory() as tmp:
+            command = f"{sys.executable} -c \"print('x' * 5000)\""
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {"cmd": command, "timeout_ms": 10000, "max_output_bytes": 512},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn('read_output(output_ref="session:', model_text)
+            self.assertIn(":stdout", model_text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell redirection syntax")
+    def test_exec_truncation_continues_the_stream_that_was_truncated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {
+                    "cmd": "printf ok; printf 12345678901234567890 >&2",
+                    "timeout_ms": 10000,
+                    "max_output_bytes": 5,
+                },
+            )
+            payload = result["structuredContent"]
+            self.assertIs(payload.get("stdout_truncated"), False)
+            self.assertIs(payload.get("stderr_truncated"), True)
+            self.assertEqual(payload.get("output_stream"), "stderr")
+            self.assertEqual(payload.get("truncated_output_streams"), ["stderr"])
+            self.assertTrue(str(payload.get("output_ref", "")).endswith(":stderr"))
+            next_ref = payload.get("next_action", {}).get("arguments", {}).get("output_ref")
+            self.assertTrue(str(next_ref).endswith(":stderr"))
+            model_text = self.agent_text(result)
+            self.assertIn("stderr output truncated", model_text)
+            self.assertIn(":stderr", model_text)
+            self.assertNotIn('output_ref="session:' + str(payload["session_id"]) + ':stdout"', model_text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell redirection syntax")
+    def test_exec_truncation_names_both_stream_continuations(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {
+                    "cmd": "printf 1234567890; printf abcdefghij >&2",
+                    "timeout_ms": 10000,
+                    "max_output_bytes": 5,
+                },
+            )
+            payload = result["structuredContent"]
+            self.assertEqual(
+                payload.get("truncated_output_streams"),
+                ["stdout", "stderr"],
+            )
+            next_actions = payload.get("next_actions")
+            self.assertIsInstance(next_actions, list)
+            self.assertEqual(len(next_actions), 2)
+            action_refs = [
+                action.get("arguments", {}).get("output_ref")
+                for action in next_actions
+                if isinstance(action, dict)
+            ]
+            self.assertTrue(str(action_refs[0]).endswith(":stdout"))
+            self.assertTrue(str(action_refs[1]).endswith(":stderr"))
+            model_text = self.agent_text(result)
+            self.assertIn("stdout output truncated", model_text)
+            self.assertIn("stderr output truncated", model_text)
+
+    def test_exec_running_model_text_names_the_poll_call(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {"cmd": "sleep 1", "timeout_ms": 10000, "yield_time_ms": 0},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn("Status: running", model_text)
+            self.assertIn('write_stdin(session_id="', model_text)
+
+    def test_read_file_truncation_is_visible_with_continuation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            content = "\n".join(f"line-{index}" for index in range(1, 2501)) + "\n"
+            (workspace / "long.txt").write_text(content, encoding="utf-8")
+            result = Runtime(workspace).call_tool("read_file", {"path": "long.txt"})
+            model_text = self.agent_text(result)
+            self.assertIn("Showing lines 1-2000 of 2500", model_text)
+            self.assertIn(
+                'continue with read_file(path="long.txt", start_line=2001',
+                model_text,
+            )
+            self.assertIn("line-2000", model_text)
+            self.assertNotIn("line-2001\n", model_text)
+
+    def test_read_file_continuation_preserves_default_cwd_relative_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            nested = workspace / "nested"
+            nested.mkdir()
+            (nested / "long.txt").write_text(
+                "".join(f"line-{index}\n" for index in range(1, 20)),
+                encoding="utf-8",
+            )
+            runtime = Runtime(workspace)
+            runtime.set_default_cwd({"path": "nested"})
+            first = runtime.call_tool(
+                "read_file",
+                {"path": "long.txt", "max_bytes": 16},
+            )
+            first_payload = first["structuredContent"]
+            action = first_payload.get("next_action")
+            self.assertIsInstance(action, dict)
+            self.assertEqual(action.get("tool"), "read_file")
+            self.assertEqual(action.get("arguments", {}).get("path"), "long.txt")
+            second = runtime.call_tool(action["tool"], action["arguments"])
+            self.assertIs(second.get("isError"), False)
+            self.assertEqual(
+                second["structuredContent"].get("start_line"),
+                first_payload.get("next_start_line"),
+            )
+
+    def test_read_file_partial_single_line_is_not_rendered_as_complete(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "single-line.txt").write_text("x" * 100, encoding="utf-8")
+            result = Runtime(workspace).call_tool(
+                "read_file",
+                {"path": "single-line.txt", "max_bytes": 16},
+            )
+            payload = result["structuredContent"]
+            self.assertIs(payload.get("truncated"), True)
+            self.assertIs(payload.get("first_line_exceeds_limit"), True)
+            self.assertIsNone(payload.get("next_start_line"))
+            model_text = self.agent_text(result)
+            self.assertIn("content truncated", model_text)
+            self.assertIn("raise max_bytes", model_text)
+
+    def test_git_pagination_actions_are_rendered(self) -> None:
+        error = git_fixture_preflight_error()
+        if error is not None:
+            self.skipTest(error)
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            tracked = workspace / "tracked.txt"
+            tracked.write_text("one\ntwo\nthree\n", encoding="utf-8")
+            init_git(workspace)
+            tracked.write_text("one changed\ntwo\nthree\n", encoding="utf-8")
+            committed = subprocess.run(
+                ["git", "commit", "-q", "-am", "second commit"],
+                cwd=workspace,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            runtime = Runtime(workspace)
+
+            log_result = runtime.call_tool("git_log", {"max_count": 1})
+            log_payload = log_result["structuredContent"]
+            self.assertIs(log_payload.get("truncated"), True)
+            self.assertEqual(
+                log_payload.get("next_action", {}).get("arguments", {}).get("skip"),
+                1,
+            )
+            log_text = self.agent_text(log_result)
+            self.assertIn("more commits available", log_text)
+            self.assertIn("git_log(", log_text)
+            self.assertIn("skip=1", log_text)
+
+            blame_result = runtime.call_tool(
+                "git_blame",
+                {
+                    "path": "tracked.txt",
+                    "start_line": 1,
+                    "end_line": 3,
+                    "max_lines": 1,
+                },
+            )
+            blame_payload = blame_result["structuredContent"]
+            self.assertIs(blame_payload.get("truncated"), True)
+            self.assertEqual(
+                blame_payload.get("next_action", {}).get("arguments", {}).get("start_line"),
+                2,
+            )
+            blame_text = self.agent_text(blame_result)
+            self.assertIn("blame lines truncated", blame_text)
+            self.assertIn("git_blame(", blame_text)
+            self.assertIn("start_line=2", blame_text)
+
+    def test_search_truncation_reports_match_counts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "data.txt").write_text("needle\n" * 5, encoding="utf-8")
+            result = Runtime(workspace).call_tool(
+                "search_text",
+                {"query": "needle", "max_results": 2},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn("showing 2 of", model_text)
+            self.assertIn("max_results", model_text)
 
     def test_exec_command_tool_errors_use_failed_status(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -963,8 +1214,18 @@ Maven home: /usr/share/maven
                     "yield_time_ms": 5000,
                 }
             )
+            # The tty fast-path intentionally returns as soon as the first
+            # output arrives, which can race the exit becoming observable.
+            # Follow the documented next_action contract and poll to completion.
+            stdout = str(result.get("stdout", ""))
+            deadline = time.time() + 5
+            while result.get("status") == "running" and time.time() < deadline:
+                result = runtime.write_stdin(
+                    {"session_id": result["session_id"], "chars": "", "yield_time_ms": 500}
+                )
+                stdout += str(result.get("stdout", ""))
             self.assertEqual(result.get("status"), "exited", result)
-            self.assertIn("True True True", result.get("stdout", ""))
+            self.assertIn("True True True", stdout)
 
     def test_completed_sessions_are_evicted_from_active_storage(self) -> None:
         with TemporaryDirectory() as tmp:
