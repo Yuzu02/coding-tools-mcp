@@ -42,7 +42,6 @@ curl -X POST "https://<worker-host>/start" \
   --data '{
     "duration_minutes": "120",
     "permission_mode": "trusted",
-    "tool_profile": "full",
     "tunnel_type": "named",
     "tunnel_hostname": "mcp.example.com"
   }'
@@ -93,7 +92,6 @@ After the control MCP is connected, the agent can call `start_coding_tools_sandb
 {
   "duration_minutes": "120",
   "permission_mode": "trusted",
-  "tool_profile": "full",
   "tunnel_type": "named",
   "tunnel_hostname": "mcp.example.com"
 }

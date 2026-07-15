@@ -16,7 +16,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from coding_tools_mcp.server import MAX_HTTP_REQUEST_BYTES, MAX_JSON_RPC_BATCH_ITEMS
+from coding_tools_mcp.server import MAX_HTTP_REQUEST_BYTES
 from tests.compliance.mcp_client import (
     FORBIDDEN_TOOL_NAMES,
     FORBIDDEN_TOOL_TERMS,
@@ -25,7 +25,7 @@ from tests.compliance.mcp_client import (
     REQUIRED_TOOLS,
     default_server_command,
     free_port,
-    prepend_repo_pythonpath,
+    safe_server_env,
     stream_snapshot,
 )
 from tests.compliance.test_support import ComplianceTestCase
@@ -37,14 +37,10 @@ class MCPContractTests(ComplianceTestCase):
         self.assertIsInstance(tools, list)
         self.assertGreater(len(tools), 0)
 
-    def test_advertised_logging_capability_accepts_set_level(self) -> None:
-        result = self.client.rpc("logging/setLevel", {"level": "debug"})
-        self.assertEqual(result, {})
-
+    def test_unimplemented_logging_capability_is_not_advertised(self) -> None:
         with self.assertRaises(MCPError) as cm:
-            self.client.rpc("logging/setLevel", {"level": "verbose"})
-        self.assertEqual(cm.exception.error.get("code"), -32602)
-        self.assertIn("logging level", cm.exception.error.get("message", ""))
+            self.client.rpc("logging/setLevel", {"level": "debug"})
+        self.assertEqual(cm.exception.error.get("code"), -32601)
 
     def test_tools_list_contains_all_required_p0_tools(self) -> None:
         names = {tool.get("name") for tool in self.client.list_tools()}
@@ -62,6 +58,25 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(sibling_catalog, first, "fresh MCP clients must be able to retrieve tools")
         self.assertEqual(len(first), len({tool["name"] for tool in first}), "tool names must be unique")
         self.assertTrue({tool["name"] for tool in first} >= set(REQUIRED_TOOLS))
+
+    def test_http_sessions_isolate_cwd_and_process_sessions(self) -> None:
+        self.client.call_tool("set_default_cwd", {"path": "src"})
+        with MCPClient(self.workspace.root, url=self.client.url) as sibling:
+            sibling_cwd = self.assert_tool_success(sibling.call_tool("get_default_cwd", {}))
+            self.assertEqual(sibling_cwd.get("default_cwd"), ".")
+            sibling.call_tool("set_default_cwd", {"path": "test"})
+
+            started = self.client.call_tool(
+                "exec_command",
+                {"cmd": "sleep 1", "timeout_ms": 5000, "yield_time_ms": 0},
+            )
+            session_id = self.assert_tool_success(started).get("session_id")
+            denied = sibling.call_tool("write_stdin", {"session_id": session_id, "chars": "", "yield_time_ms": 0})
+            self.assertTrue(denied.get("isError"), denied)
+            self.client.call_tool("kill_session", {"session_id": session_id, "signal": "KILL"})
+
+        original_cwd = self.assert_tool_success(self.client.call_tool("get_default_cwd", {}))
+        self.assertEqual(original_cwd.get("default_cwd"), "src")
 
     def test_tools_list_excludes_forbidden_product_layer_tools(self) -> None:
         names = {str(tool.get("name", "")) for tool in self.client.list_tools()}
@@ -92,7 +107,7 @@ class MCPContractTests(ComplianceTestCase):
             "server_info": (True, False, True, False),
             "check_exec_environment": (True, False, True, False),
             "get_default_cwd": (True, False, True, False),
-            "set_default_cwd": (True, False, True, False),
+            "set_default_cwd": (False, False, True, False),
             "read_file": (True, False, True, False),
             "list_dir": (True, False, True, False),
             "list_files": (True, False, True, False),
@@ -122,27 +137,36 @@ class MCPContractTests(ComplianceTestCase):
                 self.assertEqual(annotations.get("idempotentHint"), idempotent)
                 self.assertEqual(annotations.get("openWorldHint"), open_world)
 
-    def test_success_and_failure_paths_return_structured_tool_results(self) -> None:
+    def test_success_and_failure_paths_return_structured_and_agent_readable_results(self) -> None:
         success = self.client.call_tool("read_file", {"path": "src/math.js"})
         payload = self.assert_tool_success(success)
         self.assertTrue(payload or self.tool_text(success))
-        self.assert_content_text_mirrors_structured_content(success)
+        text = self.assert_content_text_is_agent_readable(success)
+        self.assertIn("return a - b", text)
+        self.assertNotEqual(text, json.dumps(payload, sort_keys=True))
 
         failure = self.assert_denied_or_permission_required("read_file", {"path": "../outside-secret.txt"})
         self.assertTrue(failure)
 
-    def test_tool_error_result_has_mcp_error_shape_and_mirrored_text(self) -> None:
+    def test_tool_error_result_has_mcp_error_shape_and_readable_text(self) -> None:
         result = self.client.call_tool("read_file", {"path": "../outside-secret.txt"})
         self.assertTrue(result.get("isError"), f"expected tool error, got {result!r}")
-        payload = self.assert_content_text_mirrors_structured_content(result)
+        text = self.assert_content_text_is_agent_readable(result)
+        payload = result.get("structuredContent")
+        self.assertIsInstance(payload, dict)
         self.assertIs(payload.get("ok"), False)
         error = payload.get("error")
         self.assertIsInstance(error, dict)
         self.assertIsInstance(error.get("code"), str)
         self.assertIsInstance(error.get("message"), str)
-        self.assertIn(error.get("category"), {"validation", "security", "permission", "runtime", "not_found", "internal"})
+        self.assertIn(
+            error.get("category"),
+            {"validation", "security", "permission", "runtime", "not_found", "conflict", "internal"},
+        )
         self.assertIsInstance(error.get("retryable"), bool)
         self.assertIsInstance(error.get("details"), dict)
+        self.assertIn(str(error.get("code")), text)
+        self.assertIn(str(error.get("message")), text)
 
     def test_unknown_tool_returns_standard_json_rpc_error_or_tool_error(self) -> None:
         try:
@@ -236,15 +260,15 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(oversized_body.get("error", {}).get("code"), -32600)
         self.assertEqual(oversized_body.get("error", {}).get("data", {}).get("max_bytes"), MAX_HTTP_REQUEST_BYTES)
 
-    def test_http_rejects_oversized_json_rpc_batches(self) -> None:
+    def test_http_rejects_json_rpc_batches(self) -> None:
         payload = [
             {"jsonrpc": "2.0", "id": i, "method": "ping", "params": {}}
-            for i in range(MAX_JSON_RPC_BATCH_ITEMS + 1)
+            for i in range(2)
         ]
         status, body = self.raw_http_post(json.dumps(payload).encode("utf-8"))
         self.assertEqual(status, 400)
         self.assertEqual(body.get("error", {}).get("code"), -32600)
-        self.assertEqual(body.get("error", {}).get("data", {}).get("max_items"), MAX_JSON_RPC_BATCH_ITEMS)
+        self.assertIn("batch", body.get("error", {}).get("message", "").lower())
 
     def test_http_origin_policy_requires_exact_loopback_host(self) -> None:
         body = b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}'
@@ -257,6 +281,9 @@ class MCPContractTests(ComplianceTestCase):
         denied_origins = (
             "http://localhost.evil.example",
             "http://127.0.0.1.evil.example",
+            "http://localhost:3000/path",
+            "http://localhost:3000?query=1",
+            "http://localhost@evil.example",
             "https://example.com",
             "null",
         )
@@ -277,29 +304,56 @@ class MCPContractTests(ComplianceTestCase):
 
         rejected_status, rejected = self.raw_http_post(body, headers={"Mcp-Session-Id": "not-the-current-session"})
         self.assertEqual(rejected_status, 404)
+        self.assertEqual(rejected.get("id"), 1)
         self.assertEqual(rejected.get("error", {}).get("code"), -32001)
         self.assertIn("Unknown MCP session", rejected.get("error", {}).get("message", ""))
+
+    def test_http_delete_terminates_only_the_selected_session(self) -> None:
+        self.assertIsNotNone(self.client.url)
+        with MCPClient(self.workspace.root, url=self.client.url) as sibling:
+            sibling_session = str(sibling.session_id)
+            parsed = urllib.parse.urlparse(str(self.client.url))
+            base = f"{parsed.scheme}://{parsed.netloc}"
+            status, _, body = self.raw_base_http_request(
+                base,
+                "DELETE",
+                parsed.path or "/mcp",
+                headers={
+                    "Mcp-Session-Id": sibling_session,
+                    "MCP-Protocol-Version": "2025-06-18",
+                },
+            )
+            self.assertEqual(status, 200, body)
+            rejected_status, rejected = self.raw_http_post(
+                b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}',
+                headers={"Mcp-Session-Id": sibling_session},
+            )
+            self.assertEqual(rejected_status, 404)
+            self.assertEqual(rejected.get("error", {}).get("code"), -32001)
+
+        still_alive = self.client.rpc("ping", {})
+        self.assertEqual(still_alive, {})
 
     def test_http_discovery_endpoints_return_server_card_metadata(self) -> None:
         self.assertIsNotNone(self.client.url)
         parsed = urllib.parse.urlparse(str(self.client.url))
         base = f"{parsed.scheme}://{parsed.netloc}"
-        for path in ("/mcp", "/.well-known/mcp.json", "/.well-known/mcp/server-card.json"):
+        for path in ("/.well-known/mcp.json", "/.well-known/mcp/server-card.json"):
             with self.subTest(path=path):
                 request = urllib.request.Request(base + path, method="GET")
                 with urllib.request.urlopen(request, timeout=5) as response:
                     body = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(body.get("protocolVersion"), "2025-06-18")
+                self.assertEqual(body.get("protocolVersion"), "2025-11-25")
                 self.assertEqual(body.get("server", {}).get("name"), "coding-tools-mcp")
                 self.assertEqual(body.get("transport", {}).get("endpoint"), "/mcp")
                 self.assertEqual(body.get("auth", {}).get("type"), "none")
-                self.assertIn("toolProfile", body)
                 self.assertIn("tools", body)
 
-        head = urllib.request.Request(base + "/mcp", method="HEAD")
-        with urllib.request.urlopen(head, timeout=5) as response:
-            self.assertEqual(response.status, 200)
-            self.assertEqual(response.read(), b"")
+        for method in ("GET", "HEAD"):
+            request = urllib.request.Request(base + "/mcp", method=method)
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(raised.exception.code, 405)
 
     def test_bearer_auth_rejects_missing_or_wrong_token_and_accepts_valid_token(self) -> None:
         port = free_port()
@@ -341,7 +395,7 @@ class MCPContractTests(ComplianceTestCase):
             self.assertEqual(ok_status, 200)
             self.assertEqual(ok.get("result"), {})
 
-            request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"}, method="GET")
+            request = urllib.request.Request(well_known, headers={"Authorization": f"Bearer {token}"}, method="GET")
             with urllib.request.urlopen(request, timeout=5) as response:
                 card = json.loads(response.read().decode("utf-8"))
             self.assertEqual(card.get("auth", {}).get("type"), "bearer")
@@ -354,12 +408,18 @@ class MCPContractTests(ComplianceTestCase):
         env = self.oauth_server_env(
             CODING_TOOLS_MCP_OAUTH_PASSWORD="test-password",
             CODING_TOOLS_MCP_OAUTH_TOKEN_SECRET=bytes(range(32)).hex(),
+            CODING_TOOLS_MCP_TRUST_PROXY_HEADERS="1",
         )
         process = self.start_oauth_server(port, env)
         try:
             metadata = self.wait_for_json(f"{base_url}/.well-known/oauth-authorization-server")
             self.assertEqual(metadata.get("issuer"), base_url)
-            self.assertEqual(metadata.get("token_endpoint_auth_methods_supported"), ["none"])
+            self.assertEqual(
+                set(metadata.get("token_endpoint_auth_methods_supported", [])),
+                {"none", "client_secret_basic", "client_secret_post"},
+            )
+            self.assertEqual(metadata.get("registration_endpoint"), f"{base_url}/oauth/register")
+            client_id = self.oauth_register_client(base_url, "MCP CLI")
 
             forwarded_headers = {"X-Forwarded-Host": "example.trycloudflare.com", "X-Forwarded-Proto": "https"}
             forwarded_status, _, forwarded_body = self.raw_base_http_request(
@@ -375,14 +435,14 @@ class MCPContractTests(ComplianceTestCase):
             forwarded_verifier = "e" * 43
             forwarded_code = self.oauth_authorization_code(
                 base_url,
-                "mcp-cli",
+                client_id,
                 "test-password",
                 forwarded_verifier,
                 headers=forwarded_headers,
             )
             forwarded_token_status, forwarded_token = self.oauth_token_request(
                 base_url,
-                "mcp-cli",
+                client_id,
                 forwarded_code,
                 forwarded_verifier,
                 headers=forwarded_headers,
@@ -397,8 +457,8 @@ class MCPContractTests(ComplianceTestCase):
             self.assertEqual(forwarded_ok.get("result"), {})
 
             verifier = "a" * 43
-            code = self.oauth_authorization_code(base_url, "mcp-cli", "test-password", verifier)
-            token_status, token_response = self.oauth_token_request(base_url, "mcp-cli", code, verifier)
+            code = self.oauth_authorization_code(base_url, client_id, "test-password", verifier)
+            token_status, token_response = self.oauth_token_request(base_url, client_id, code, verifier)
             self.assertEqual(token_status, 200)
             access_token = token_response.get("access_token")
             self.assertIsInstance(access_token, str)
@@ -407,10 +467,63 @@ class MCPContractTests(ComplianceTestCase):
             self.assertEqual(ok_status, 200)
             self.assertEqual(ok.get("result"), {})
 
-            bad_code = self.oauth_authorization_code(base_url, "mcp-cli", "test-password", verifier)
-            bad_status, bad = self.oauth_token_request(base_url, "mcp-cli", bad_code, "b" * 43)
+            bad_code = self.oauth_authorization_code(base_url, client_id, "test-password", verifier)
+            bad_status, bad = self.oauth_token_request(base_url, client_id, bad_code, "b" * 43)
             self.assertEqual(bad_status, 400)
             self.assertEqual(bad.get("error"), "invalid_grant")
+        finally:
+            self.stop_process(process)
+
+    def test_oauth_confidential_client_authentication_method_is_bound(self) -> None:
+        port = free_port()
+        base_url = f"http://127.0.0.1:{port}"
+        env = self.oauth_server_env(
+            CODING_TOOLS_MCP_OAUTH_PASSWORD="test-password",
+            CODING_TOOLS_MCP_OAUTH_TOKEN_SECRET=bytes(range(32)).hex(),
+        )
+        process = self.start_oauth_server(port, env)
+        try:
+            self.wait_for_json(f"{base_url}/.well-known/oauth-authorization-server")
+            for index, method in enumerate(("client_secret_post", "client_secret_basic")):
+                with self.subTest(method=method):
+                    client_id, client_secret = self.oauth_register_confidential_client(
+                        base_url,
+                        f"Confidential client {index}",
+                        method,
+                    )
+                    verifier = chr(ord("f") + index) * 43
+                    code = self.oauth_authorization_code(
+                        base_url,
+                        client_id,
+                        "test-password",
+                        verifier,
+                    )
+                    wrong_method = (
+                        "client_secret_basic"
+                        if method == "client_secret_post"
+                        else "client_secret_post"
+                    )
+                    wrong_status, wrong = self.oauth_token_request(
+                        base_url,
+                        client_id,
+                        code,
+                        verifier,
+                        client_secret=client_secret,
+                        client_auth_method=wrong_method,
+                    )
+                    self.assertEqual(wrong_status, 400)
+                    self.assertEqual(wrong.get("error"), "invalid_client")
+
+                    token_status, token = self.oauth_token_request(
+                        base_url,
+                        client_id,
+                        code,
+                        verifier,
+                        client_secret=client_secret,
+                        client_auth_method=method,
+                    )
+                    self.assertEqual(token_status, 200)
+                    self.assertIsInstance(token.get("access_token"), str)
         finally:
             self.stop_process(process)
 
@@ -439,9 +552,10 @@ class MCPContractTests(ComplianceTestCase):
             self.assertEqual(static_status, 200)
             self.assertEqual(static_response.get("result"), {})
 
+            client_id = self.oauth_register_client(base_url, "Claude Desktop")
             verifier = "c" * 43
-            code = self.oauth_authorization_code(base_url, "claude-desktop", "test-password", verifier)
-            token_status, token_response = self.oauth_token_request(base_url, "claude-desktop", code, verifier)
+            code = self.oauth_authorization_code(base_url, client_id, "test-password", verifier)
+            token_status, token_response = self.oauth_token_request(base_url, client_id, code, verifier)
             self.assertEqual(token_status, 200)
             oauth_status, oauth_response = self.raw_post_to_auth_server(
                 f"{base_url}/mcp",
@@ -490,6 +604,69 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
+    def test_oauth_dynamic_registration_rejects_unsafe_and_unregistered_redirects(self) -> None:
+        port = free_port()
+        base_url = f"http://127.0.0.1:{port}"
+        env = self.oauth_server_env(
+            CODING_TOOLS_MCP_OAUTH_PASSWORD="test-password",
+            CODING_TOOLS_MCP_OAUTH_TOKEN_SECRET=bytes(range(32)).hex(),
+        )
+        process = self.start_oauth_server(port, env)
+        try:
+            self.wait_for_json(f"{base_url}/.well-known/oauth-authorization-server")
+            unsafe_body = json.dumps(
+                {
+                    "redirect_uris": ["http://attacker.example/callback"],
+                    "token_endpoint_auth_method": "none",
+                }
+            ).encode("utf-8")
+            status, _, response_body = self.raw_base_http_request(
+                base_url,
+                "POST",
+                "/oauth/register",
+                body=unsafe_body,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(response_body).get("error"), "invalid_client_metadata")
+
+            malformed_body = json.dumps(
+                {
+                    "redirect_uris": ["http://127.0.0.1/callback"],
+                    "grant_types": [["authorization_code"]],
+                }
+            ).encode("utf-8")
+            malformed_status, malformed_headers, malformed_response = self.raw_base_http_request(
+                base_url,
+                "POST",
+                "/oauth/register",
+                body=malformed_body,
+                headers={"Content-Type": "application/json"},
+            )
+            self.assertEqual(malformed_status, 400)
+            self.assertEqual(json.loads(malformed_response).get("error"), "invalid_client_metadata")
+            self.assertEqual(malformed_headers.get("cache-control"), "no-store")
+
+            client_id = self.oauth_register_client(base_url, "Redirect Test")
+            query = urllib.parse.urlencode(
+                {
+                    "response_type": "code",
+                    "client_id": client_id,
+                    "redirect_uri": "https://attacker.example/callback",
+                    "code_challenge": self.pkce_challenge("z" * 43),
+                    "code_challenge_method": "S256",
+                }
+            )
+            denied_status, _, denied_body = self.raw_base_http_request(
+                base_url,
+                "GET",
+                f"/oauth/authorize?{query}",
+            )
+            self.assertEqual(denied_status, 400)
+            self.assertIn("not registered", denied_body)
+        finally:
+            self.stop_process(process)
+
     def test_http_pre_dispatch_errors_include_null_json_rpc_id(self) -> None:
         cases = [
             (
@@ -529,15 +706,40 @@ class MCPContractTests(ComplianceTestCase):
                 self.assertEqual(response.get("jsonrpc"), "2.0")
                 self.assertEqual(response.get("error", {}).get("code"), code)
 
+        status, response = self.raw_http_post(b"\xff")
+        self.assertEqual(status, 400)
+        self.assertIsNone(response.get("id"))
+        self.assertEqual(response.get("error", {}).get("code"), -32700)
+
     def test_http_rejects_tools_before_initialize(self) -> None:
         process, url = self.start_raw_http_server()
         try:
             self.wait_for_ping(url)
-            response = self.raw_post_to(url, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.raw_post_to(url, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            response = json.loads(raised.exception.read().decode("utf-8"))
             self.assertEqual(response.get("error", {}).get("code"), -32002)
             self.assertIn("not initialized", response.get("error", {}).get("message", "").lower())
         finally:
             self.stop_process(process)
+
+    def test_initialize_notification_is_rejected(self) -> None:
+        status, response = self.raw_http_post(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "invalid-notification", "version": "1"},
+                    },
+                }
+            ).encode("utf-8"),
+            headers={"MCP-Protocol-Version": "2025-11-25"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(response.get("error", {}).get("code"), -32600)
 
     def test_initialize_with_newer_client_protocol_negotiates_server_version(self) -> None:
         payload = {
@@ -553,14 +755,14 @@ class MCPContractTests(ComplianceTestCase):
         response = self.raw_post(
             payload
         )
-        self.assertEqual(response.get("result", {}).get("protocolVersion"), "2025-06-18")
+        self.assertEqual(response.get("result", {}).get("protocolVersion"), "2025-11-25")
 
         header_response = self.raw_post_to(
             str(self.client.url),
             payload,
             protocol_version="2025-11-25",
         )
-        self.assertEqual(header_response.get("result", {}).get("protocolVersion"), "2025-06-18")
+        self.assertEqual(header_response.get("result", {}).get("protocolVersion"), "2025-11-25")
 
     def test_http_rejects_older_protocol_version_header(self) -> None:
         status, response = self.raw_http_post(
@@ -615,6 +817,12 @@ class MCPContractTests(ComplianceTestCase):
             start_new_session=True,
         )
         try:
+            self.assertIsNotNone(process.stdin)
+            process.stdin.write("{not-json}\n")
+            process.stdin.flush()
+            malformed = self.stdio_read_response(process, {})
+            self.assertEqual(malformed.get("error", {}).get("code"), -32700)
+
             initialize = self.stdio_rpc(
                 process,
                 {
@@ -632,13 +840,13 @@ class MCPContractTests(ComplianceTestCase):
             self.assertIsInstance(result, dict)
             self.assertEqual(result.get("protocolVersion"), "2025-06-18")
             self.assertIn("tools", result.get("capabilities", {}))
-            self.assertIn("logging", result.get("capabilities", {}))
+            self.assertNotIn("logging", result.get("capabilities", {}))
 
-            logging_level = self.stdio_rpc(
+            logging_level = self.stdio_rpc_allow_error(
                 process,
                 {"jsonrpc": "2.0", "id": 2, "method": "logging/setLevel", "params": {"level": "debug"}},
             )
-            self.assertEqual(logging_level.get("result"), {})
+            self.assertEqual(logging_level.get("error", {}).get("code"), -32601)
 
             self.stdio_send(process, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
             self.assert_no_stdio_response(process)
@@ -699,22 +907,20 @@ class MCPContractTests(ComplianceTestCase):
 
             self.stdio_send(
                 process,
-                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"session_id": "missing"}},
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "missing"}},
             )
             self.assert_no_stdio_response(process)
         finally:
             self.stop_process(process)
 
-    def assert_content_text_mirrors_structured_content(self, result: dict[str, Any]) -> dict[str, Any]:
+    def assert_content_text_is_agent_readable(self, result: dict[str, Any]) -> str:
         structured = result.get("structuredContent")
         self.assertIsInstance(structured, dict, f"structuredContent must be an object: {result!r}")
         content = result.get("content")
         self.assertIsInstance(content, list, f"content must be a list: {result!r}")
         text_items = [item.get("text") for item in content if isinstance(item, dict) and item.get("type") == "text"]
-        self.assertTrue(text_items, f"content must include a text mirror: {result!r}")
-        mirrored = json.loads(str(text_items[0]))
-        self.assertEqual(mirrored, structured)
-        return structured
+        self.assertTrue(text_items, f"content must include agent-readable text: {result!r}")
+        return "\n".join(str(item) for item in text_items)
 
     def stdio_send(self, process: subprocess.Popen[str], payload: dict[str, Any]) -> None:
         self.assertIsNotNone(process.stdin)
@@ -812,7 +1018,7 @@ class MCPContractTests(ComplianceTestCase):
             connection.putheader("Accept", "application/json, text/event-stream")
             connection.putheader("Content-Type", content_type)
             if not headers or "MCP-Protocol-Version" not in headers:
-                connection.putheader("MCP-Protocol-Version", "2025-06-18")
+                connection.putheader("MCP-Protocol-Version", "2025-11-25")
             connection.putheader("Content-Length", str(len(body) if content_length is None else content_length))
             for name, value in (headers or {}).items():
                 connection.putheader(name, value)
@@ -857,9 +1063,11 @@ class MCPContractTests(ComplianceTestCase):
             "CODING_TOOLS_MCP_OAUTH_PASSWORD",
             "CODING_TOOLS_MCP_OAUTH_TOKEN_SECRET",
             "CODING_TOOLS_MCP_OAUTH_TOKEN_TTL",
+            "CODING_TOOLS_MCP_OAUTH_REDIRECT_URIS",
             "CODING_TOOLS_MCP_SERVER_URL",
             "CODING_TOOLS_MCP_AUTH_TOKEN",
             "CODING_TOOLS_MCP_OAUTH_MODE",
+            "CODING_TOOLS_MCP_TRUST_PROXY_HEADERS",
         ):
             env.pop(name, None)
         env.update(overrides)
@@ -894,6 +1102,42 @@ class MCPContractTests(ComplianceTestCase):
         digest = hashlib.sha256(verifier.encode("ascii")).digest()
         return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
+    def oauth_register(self, base_url: str, client_name: str, auth_method: str) -> dict[str, Any]:
+        body = json.dumps(
+            {
+                "client_name": client_name,
+                "redirect_uris": ["http://127.0.0.1/callback"],
+                "grant_types": ["authorization_code"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": auth_method,
+            }
+        ).encode("utf-8")
+        status, _, response_body = self.raw_base_http_request(
+            base_url,
+            "POST",
+            "/oauth/register",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(status, 201, response_body)
+        return json.loads(response_body)
+
+    def oauth_register_client(self, base_url: str, client_name: str) -> str:
+        response = self.oauth_register(base_url, client_name, "none")
+        self.assertNotIn("client_secret", response)
+        return str(response["client_id"])
+
+    def oauth_register_confidential_client(
+        self,
+        base_url: str,
+        client_name: str,
+        auth_method: str,
+    ) -> tuple[str, str]:
+        response = self.oauth_register(base_url, client_name, auth_method)
+        self.assertEqual(response.get("token_endpoint_auth_method"), auth_method)
+        self.assertIsInstance(response.get("client_secret"), str)
+        return str(response["client_id"]), str(response["client_secret"])
+
     def oauth_authorization_code(
         self,
         base_url: str,
@@ -904,6 +1148,7 @@ class MCPContractTests(ComplianceTestCase):
         headers: dict[str, str] | None = None,
     ) -> str:
         redirect_uri = "http://127.0.0.1/callback"
+        resource = self.oauth_resource(base_url, headers)
         challenge = self.pkce_challenge(verifier)
         query = urllib.parse.urlencode(
             {
@@ -913,6 +1158,7 @@ class MCPContractTests(ComplianceTestCase):
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
                 "state": "test-state",
+                "resource": resource,
             }
         )
         get_status, _, get_body = self.raw_base_http_request(
@@ -931,6 +1177,7 @@ class MCPContractTests(ComplianceTestCase):
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
                 "state": "test-state",
+                "resource": resource,
                 "password": password,
             }
         ).encode("utf-8")
@@ -956,6 +1203,7 @@ class MCPContractTests(ComplianceTestCase):
         verifier: str,
         *,
         client_secret: str | None = None,
+        client_auth_method: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> tuple[int, dict[str, Any]]:
         params = {
@@ -964,11 +1212,15 @@ class MCPContractTests(ComplianceTestCase):
             "redirect_uri": "http://127.0.0.1/callback",
             "code_verifier": verifier,
             "client_id": client_id,
+            "resource": self.oauth_resource(base_url, headers),
         }
-        if client_secret is not None:
+        if client_secret is not None and client_auth_method != "client_secret_basic":
             params["client_secret"] = client_secret
         body = urllib.parse.urlencode(params).encode("utf-8")
         request_headers = {**(headers or {}), "Content-Type": "application/x-www-form-urlencoded"}
+        if client_secret is not None and client_auth_method == "client_secret_basic":
+            credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+            request_headers["Authorization"] = f"Basic {credentials}"
         status, _, response_body = self.raw_base_http_request(
             base_url,
             "POST",
@@ -977,6 +1229,14 @@ class MCPContractTests(ComplianceTestCase):
             headers=request_headers,
         )
         return status, json.loads(response_body)
+
+    def oauth_resource(self, base_url: str, headers: dict[str, str] | None) -> str:
+        headers = headers or {}
+        host = headers.get("X-Forwarded-Host")
+        proto = headers.get("X-Forwarded-Proto")
+        if host and proto:
+            return f"{proto}://{host}"
+        return base_url.rstrip("/")
 
     def raw_base_http_request(
         self,
@@ -1014,7 +1274,7 @@ class MCPContractTests(ComplianceTestCase):
         return process, f"http://127.0.0.1:{port}/mcp"
 
     def server_process_env(self) -> dict[str, str]:
-        return prepend_repo_pythonpath(os.environ.copy())
+        return safe_server_env()
 
     def process_stderr_snapshot(self, process: subprocess.Popen[str]) -> str:
         if process.stderr is None:

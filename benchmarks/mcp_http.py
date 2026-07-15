@@ -43,7 +43,7 @@ class McpHttpClient:
         endpoint: str,
         *,
         timeout: float = 30.0,
-        protocol_version: str = "2025-06-18",
+        protocol_version: str = "2025-11-25",
     ) -> None:
         self.endpoint = endpoint
         self.timeout = timeout
@@ -63,6 +63,9 @@ class McpHttpClient:
                 },
             },
         )
+        negotiated = result.get("protocolVersion")
+        if isinstance(negotiated, str) and negotiated:
+            self.protocol_version = negotiated
         self.notify("notifications/initialized", {})
         return result
 

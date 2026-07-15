@@ -4,11 +4,9 @@ const DEFAULT_IMAGE = "ghcr.io/xytom/coding-tools-mcp-sandbox:latest";
 const DEFAULT_PORT = "8765";
 const DEFAULT_DURATION_MINUTES = "120";
 const DEFAULT_PERMISSION_MODE = "trusted";
-const DEFAULT_TOOL_PROFILE = "full";
 const DEFAULT_TUNNEL_TYPE = "named";
 
 const PERMISSION_MODES = new Set(["safe", "trusted", "dangerous"]);
-const TOOL_PROFILES = new Set(["full", "read-only", "compat-readonly-all"]);
 const TUNNEL_TYPES = new Set(["quick", "named"]);
 
 const START_TOOL = {
@@ -20,7 +18,6 @@ const START_TOOL = {
       ref: { type: "string", description: "Git ref to run the workflow on. Defaults to GITHUB_REF." },
       duration_minutes: { type: "string", description: "Sandbox lifetime, 5-330 minutes." },
       permission_mode: { type: "string", enum: [...PERMISSION_MODES] },
-      tool_profile: { type: "string", enum: [...TOOL_PROFILES] },
       tunnel_type: { type: "string", enum: [...TUNNEL_TYPES] },
       tunnel_hostname: { type: "string", description: "Stable hostname for tunnel_type=named, for example mcp.example.com." },
       checkout_repository: { type: "boolean" },
@@ -98,7 +95,7 @@ async function handleMcpRequest(body, env) {
 
   if (body.method === "initialize") {
     return jsonRpcResult(id, {
-      protocolVersion: "2025-06-18",
+      protocolVersion: "2025-11-25",
       capabilities: { tools: {} },
       serverInfo: { name: "coding-tools-sandbox-control", version: "0.1.0" },
     });
@@ -384,7 +381,6 @@ function buildWorkflowInputs(input, env) {
     image,
     port: cleanPort(input.port ?? env.DEFAULT_PORT ?? DEFAULT_PORT),
     permission_mode: permissionMode,
-    tool_profile: cleanEnum(input.tool_profile ?? env.DEFAULT_TOOL_PROFILE ?? DEFAULT_TOOL_PROFILE, TOOL_PROFILES, "tool_profile"),
     checkout_repository: cleanBoolean(input.checkout_repository ?? true, "checkout_repository"),
     duration_minutes: cleanDuration(input.duration_minutes ?? env.DEFAULT_DURATION_MINUTES ?? DEFAULT_DURATION_MINUTES),
     auth_token: "",

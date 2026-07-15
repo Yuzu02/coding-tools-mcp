@@ -6,13 +6,12 @@ source "$SCRIPT_DIR/tunnel-common.sh"
 
 WORKSPACE="${1:-${CODING_TOOLS_MCP_WORKSPACE:-$PWD}}"
 PORT="${CODING_TOOLS_MCP_PORT:-8765}"
-PROFILE="${CODING_TOOLS_MCP_TOOL_PROFILE:-read-only}"
 SERVER_BIN="${CODING_TOOLS_MCP_SERVER_BIN:-coding-tools-mcp}"
 AUTH_MODE="${CODING_TOOLS_MCP_AUTH_MODE:-bearer}"
 
 resolve_auth_credentials
 
 ensure_tunnel_command devtunnel
-start_coding_tools_mcp "$WORKSPACE" "$PORT" "$PROFILE" "$AUTH_MODE" "$TOKEN" "$SERVER_BIN"
-print_tunnel_config "Microsoft Dev Tunnel" "devtunnel-host" "$PORT" "$PROFILE" "$AUTH_MODE" "$TOKEN"
+start_coding_tools_mcp "$WORKSPACE" "$PORT" "$AUTH_MODE" "$TOKEN" "$SERVER_BIN"
+print_tunnel_config "Microsoft Dev Tunnel" "devtunnel-host" "$PORT" "$AUTH_MODE" "$TOKEN"
 devtunnel host --port "$PORT" --protocol http --allow-anonymous

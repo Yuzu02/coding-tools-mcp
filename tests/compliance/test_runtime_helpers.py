@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import builtins
 import os
+import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from collections.abc import Iterator
@@ -13,10 +16,13 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from coding_tools_mcp import server as server_module
+from coding_tools_mcp import processes as processes_module
+from coding_tools_mcp.patching import AtomicPatchCommitter, FileBaseline, StagedFile
 from coding_tools_mcp.server import (
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
     LANDLOCK_ACCESS_FS_TRUNCATE,
     LANDLOCK_ACCESS_FS_WRITE_FILE,
+    MAX_ACTIVE_EXEC_SESSIONS,
     Runtime,
     ShellEnvPolicy,
     ToolFailure,
@@ -25,8 +31,11 @@ from coding_tools_mcp.server import (
     identify_image,
     permission_failure_diagnostics,
     runtime_parent_root,
-    truncate_text_head,
-    truncate_text_tail,
+)
+from coding_tools_mcp.textutils import truncate_text_head, truncate_text_tail
+from coding_tools_mcp.tool_results import (
+    MODEL_TEXT_SAFETY_LIMIT_BYTES,
+    make_tool_result,
 )
 from tests.compliance.fixtures import git_fixture_preflight_error, init_git
 
@@ -75,6 +84,188 @@ def fake_landlock_exec() -> Iterator[dict[str, object]]:
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_windows_tty_request_reports_explicit_unsupported_error(self) -> None:
+        with TemporaryDirectory() as tmp, patch.object(processes_module.os, "name", "nt"):
+            with self.assertRaises(ToolFailure) as raised:
+                processes_module.spawn_process(
+                    "ignored",
+                    cwd=tmp,
+                    shell=True,
+                    env={},
+                    tty=True,
+                    popen_kwargs={},
+                )
+        self.assertEqual(raised.exception.code, "TTY_UNSUPPORTED")
+        self.assertEqual(raised.exception.details.get("platform"), "nt")
+
+    def test_windows_process_termination_distinguishes_graceful_and_force(self) -> None:
+        class FakeProcess:
+            pid = 123
+
+            def __init__(self) -> None:
+                self.calls: list[object] = []
+
+            def send_signal(self, value: object) -> None:
+                self.calls.append(("send_signal", value))
+
+            def wait(self, timeout: float) -> int:
+                self.calls.append(("wait", timeout))
+                return 0
+
+            def terminate(self) -> None:
+                self.calls.append("terminate")
+
+            def kill(self) -> None:
+                self.calls.append("kill")
+
+        def fake_hasattr(value: object, name: str) -> bool:
+            if value is processes_module.os and name == "killpg":
+                return False
+            return builtins.hasattr(value, name)
+
+        with (
+            patch.object(processes_module.os, "name", "nt"),
+            patch.object(processes_module, "hasattr", side_effect=fake_hasattr, create=True),
+            patch.object(processes_module.signal, "CTRL_BREAK_EVENT", 999, create=True),
+        ):
+            graceful = FakeProcess()
+            processes_module.terminate_process_group(  # type: ignore[arg-type]
+                graceful,
+                signal.SIGTERM,
+            )
+            forced = FakeProcess()
+            processes_module.terminate_process_group(  # type: ignore[arg-type]
+                forced,
+                processes_module.HARD_KILL_SIGNAL,
+                force=True,
+            )
+
+        self.assertEqual(graceful.calls, [("send_signal", 999), ("wait", 1)])
+        self.assertEqual(forced.calls, ["kill", ("wait", 1)])
+
+    def test_atomic_patch_commit_rolls_back_all_files_after_mid_commit_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.txt"
+            second = root / "second.txt"
+            first.write_text("first-before\n", encoding="utf-8")
+            second.write_text("second-before\n", encoding="utf-8")
+            changes = [
+                StagedFile("first.txt", first, "first-after\n", FileBaseline.capture(first), 0o644),
+                StagedFile("second.txt", second, "second-after\n", FileBaseline.capture(second), 0o644),
+            ]
+            real_replace = os.replace
+
+            def fail_second_install(source: os.PathLike[str] | str, destination: os.PathLike[str] | str) -> None:
+                source_path = Path(source)
+                if source_path.name.startswith(".coding-tools-patch-") and Path(destination) == second:
+                    raise OSError("injected second-file install failure")
+                real_replace(source, destination)
+
+            with patch("coding_tools_mcp.patching.os.replace", side_effect=fail_second_install):
+                with self.assertRaises(OSError):
+                    AtomicPatchCommitter().commit(changes)
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "first-before\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second-before\n")
+            self.assertEqual(list(root.glob(".coding-tools-*-*")), [])
+
+    def test_atomic_patch_commit_rejects_stale_baseline(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "file.txt"
+            path.write_text("before\n", encoding="utf-8")
+            baseline = FileBaseline.capture(path)
+            path.write_text("external-change\n", encoding="utf-8")
+            change = StagedFile("file.txt", path, "patch-change\n", baseline, 0o644)
+
+            with self.assertRaises(ToolFailure) as raised:
+                AtomicPatchCommitter().commit([change])
+
+            self.assertEqual(raised.exception.code, "PATCH_CONFLICT")
+            self.assertTrue(raised.exception.retryable)
+            self.assertEqual(path.read_text(encoding="utf-8"), "external-change\n")
+
+    def test_atomic_patch_commit_preserves_backup_when_rollback_fails(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "file.txt"
+            target.write_text("before\n", encoding="utf-8")
+            change = StagedFile(
+                "file.txt",
+                target,
+                "after\n",
+                FileBaseline.capture(target),
+                0o644,
+            )
+            real_replace = os.replace
+
+            def fail_install_and_restore(
+                source: os.PathLike[str] | str,
+                destination: os.PathLike[str] | str,
+            ) -> None:
+                source_path = Path(source)
+                if source_path.name.startswith(".coding-tools-patch-"):
+                    raise OSError("injected install failure")
+                if source_path.name.startswith(".coding-tools-backup-"):
+                    raise OSError("injected rollback failure")
+                real_replace(source, destination)
+
+            with patch("coding_tools_mcp.patching.os.replace", side_effect=fail_install_and_restore):
+                with self.assertRaises(ToolFailure) as raised:
+                    AtomicPatchCommitter().commit([change])
+
+            self.assertEqual(raised.exception.code, "PATCH_ROLLBACK_FAILED")
+            backups = raised.exception.details.get("recovery_backups", {})
+            self.assertEqual(set(backups), {"file.txt"})
+            recovery_path = Path(backups["file.txt"])
+            self.assertTrue(recovery_path.exists())
+            self.assertEqual(recovery_path.read_text(encoding="utf-8"), "before\n")
+
+    def test_atomic_patch_backup_cleanup_failure_does_not_rollback_committed_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "file.txt"
+            target.write_text("before\n", encoding="utf-8")
+            change = StagedFile(
+                "file.txt",
+                target,
+                "after\n",
+                FileBaseline.capture(target),
+                0o644,
+            )
+            real_unlink = Path.unlink
+            backup_unlinks = 0
+
+            def fail_backup_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+                nonlocal backup_unlinks
+                if path.name.startswith(".coding-tools-backup-"):
+                    backup_unlinks += 1
+                    if backup_unlinks > 1:
+                        raise OSError("injected backup cleanup failure")
+                real_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", fail_backup_cleanup):
+                AtomicPatchCommitter().commit([change])
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
+            retained_backups = list(root.glob(".coding-tools-backup-*"))
+            self.assertEqual(len(retained_backups), 1)
+            self.assertEqual(retained_backups[0].read_text(encoding="utf-8"), "before\n")
+
+    def test_atomic_patch_commit_does_not_overwrite_new_target_race(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "new.txt"
+            baseline = FileBaseline.capture(path)
+            path.write_text("external-create\n", encoding="utf-8")
+
+            with self.assertRaises(ToolFailure) as raised:
+                AtomicPatchCommitter().commit(
+                    [StagedFile("new.txt", path, "patch-create\n", baseline, None)]
+                )
+
+            self.assertEqual(raised.exception.code, "PATCH_CONFLICT")
+            self.assertEqual(path.read_text(encoding="utf-8"), "external-create\n")
+
     def test_image_identification_reads_jpeg_and_webp_dimensions(self) -> None:
         jpeg = (
             b"\xff\xd8"
@@ -643,35 +834,346 @@ Maven home: /usr/share/maven
                 )
                 self.assertEqual(permission_failure_diagnostics(exc)[0]["code"], expected)
 
-    def test_tool_profiles_filter_tools_and_compat_annotations(self) -> None:
+    def test_runtime_exposes_one_stable_truthfully_annotated_tool_catalog(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
-            full = Runtime(workspace, tool_profile="full")
-            full_tools = full.list_tools()["tools"]
-            full_names = {tool["name"] for tool in full_tools}
-            self.assertIn("apply_patch", full_names)
-            self.assertIn("git_log", full_names)
-            self.assertIn("server_info", full_names)
+            first = Runtime(workspace).list_tools()["tools"]
+            second = Runtime(workspace).list_tools()["tools"]
+            self.assertEqual(first, second)
+            names = {tool["name"] for tool in first}
+            self.assertIn("apply_patch", names)
+            self.assertIn("exec_command", names)
+            self.assertIn("read_file", names)
+            self.assertNotIn("edit_file", names)
+            apply_patch_tool = next(tool for tool in first if tool["name"] == "apply_patch")
+            self.assertIs(apply_patch_tool["annotations"].get("destructiveHint"), True)
+            self.assertIs(apply_patch_tool["annotations"].get("readOnlyHint"), False)
 
-            read_only = Runtime(workspace, tool_profile="read-only")
-            read_only_names = {tool["name"] for tool in read_only.list_tools()["tools"]}
-            self.assertIn("server_info", read_only_names)
-            self.assertIn("set_default_cwd", read_only_names)
-            self.assertIn("git_blame", read_only_names)
-            self.assertIn("read_output", read_only_names)
-            self.assertNotIn("apply_patch", read_only_names)
-            self.assertNotIn("exec_command", read_only_names)
-            self.assertNotIn("write_stdin", read_only_names)
-            self.assertNotIn("request_permissions", read_only_names)
+    def test_agent_text_matches_per_tool_limits_without_renderer_truncation(self) -> None:
+        # Per-call tool limits (here read_file max_bytes) are the only budget:
+        # the renderer must not apply a second, hidden truncation layer.
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            content = ("x" * 49_999) + "!"
+            (workspace / "large.txt").write_text(content, encoding="utf-8")
+            result = Runtime(workspace).call_tool(
+                "read_file",
+                {"path": "large.txt", "max_bytes": 60_000},
+            )
 
-            compat = Runtime(workspace, tool_profile="compat-readonly-all")
-            compat_tools = compat.list_tools()["tools"]
-            self.assertEqual({tool["name"] for tool in compat_tools}, full_names)
-            for tool in compat_tools:
-                annotations = tool["annotations"]
-                self.assertIs(annotations.get("readOnlyHint"), True)
-                self.assertIs(annotations.get("destructiveHint"), False)
-                self.assertIs(annotations.get("openWorldHint"), False)
+            payload = result["structuredContent"]
+            model_text = "\n".join(
+                item["text"]
+                for item in result["content"]
+                if item.get("type") == "text"
+            )
+            self.assertEqual(payload["content"], content)
+            self.assertEqual(model_text, content)
+            self.assertNotIn("preview truncated", model_text)
+
+    def agent_text(self, result: dict[str, object]) -> str:
+        return "\n".join(
+            str(item.get("text"))
+            for item in result.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+
+    def test_agent_text_has_an_emergency_safety_ceiling(self) -> None:
+        oversized_context = "x" * (MODEL_TEXT_SAFETY_LIMIT_BYTES + 1024)
+        result = make_tool_result(
+            "search_text",
+            {
+                "matches": [
+                    {
+                        "path": "large.txt",
+                        "line": 2,
+                        "column": 1,
+                        "preview": "needle",
+                        "before": [oversized_context],
+                        "after": [],
+                    }
+                ],
+                "truncated": False,
+            },
+            is_error=False,
+        )
+        model_text = self.agent_text(result)
+        self.assertLessEqual(
+            len(model_text.encode("utf-8")),
+            MODEL_TEXT_SAFETY_LIMIT_BYTES,
+        )
+        self.assertIn("model text reached", model_text)
+        self.assertIn("safety ceiling", model_text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell command syntax")
+    def test_exec_model_text_always_carries_exit_status(self) -> None:
+        # A failing command whose stdout looks like success must still be
+        # legible as a failure from the model text alone.
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {"cmd": "echo All checks completed.; exit 7", "timeout_ms": 10000},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn("Status: exited", model_text)
+            self.assertIn("exit code 7", model_text)
+            self.assertIn("All checks completed.", model_text)
+
+    def test_exec_truncated_model_text_names_a_real_output_ref(self) -> None:
+        with TemporaryDirectory() as tmp:
+            command = f"{sys.executable} -c \"print('x' * 5000)\""
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {"cmd": command, "timeout_ms": 10000, "max_output_bytes": 512},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn('read_output(output_ref="session:', model_text)
+            self.assertIn(":stdout", model_text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell redirection syntax")
+    def test_exec_truncation_continues_the_stream_that_was_truncated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {
+                    "cmd": "printf ok; printf 12345678901234567890 >&2",
+                    "timeout_ms": 10000,
+                    "max_output_bytes": 5,
+                },
+            )
+            payload = result["structuredContent"]
+            self.assertIs(payload.get("stdout_truncated"), False)
+            self.assertIs(payload.get("stderr_truncated"), True)
+            self.assertEqual(payload.get("output_stream"), "stderr")
+            self.assertEqual(payload.get("truncated_output_streams"), ["stderr"])
+            self.assertTrue(str(payload.get("output_ref", "")).endswith(":stderr"))
+            next_ref = payload.get("next_action", {}).get("arguments", {}).get("output_ref")
+            self.assertTrue(str(next_ref).endswith(":stderr"))
+            model_text = self.agent_text(result)
+            self.assertIn("stderr output truncated", model_text)
+            self.assertIn(":stderr", model_text)
+            self.assertNotIn('output_ref="session:' + str(payload["session_id"]) + ':stdout"', model_text)
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell redirection syntax")
+    def test_exec_truncation_names_both_stream_continuations(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {
+                    "cmd": "printf 1234567890; printf abcdefghij >&2",
+                    "timeout_ms": 10000,
+                    "max_output_bytes": 5,
+                },
+            )
+            payload = result["structuredContent"]
+            self.assertEqual(
+                payload.get("truncated_output_streams"),
+                ["stdout", "stderr"],
+            )
+            next_actions = payload.get("next_actions")
+            self.assertIsInstance(next_actions, list)
+            self.assertEqual(len(next_actions), 2)
+            action_refs = [
+                action.get("arguments", {}).get("output_ref")
+                for action in next_actions
+                if isinstance(action, dict)
+            ]
+            self.assertTrue(str(action_refs[0]).endswith(":stdout"))
+            self.assertTrue(str(action_refs[1]).endswith(":stderr"))
+            model_text = self.agent_text(result)
+            self.assertIn("stdout output truncated", model_text)
+            self.assertIn("stderr output truncated", model_text)
+
+    def test_exec_running_model_text_names_the_poll_call(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {"cmd": "sleep 1", "timeout_ms": 10000, "yield_time_ms": 0},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn("Status: running", model_text)
+            self.assertIn('write_stdin(session_id="', model_text)
+
+    def test_read_file_truncation_is_visible_with_continuation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            content = "\n".join(f"line-{index}" for index in range(1, 2501)) + "\n"
+            (workspace / "long.txt").write_text(content, encoding="utf-8")
+            result = Runtime(workspace).call_tool("read_file", {"path": "long.txt"})
+            model_text = self.agent_text(result)
+            self.assertIn("Showing lines 1-2000 of 2500", model_text)
+            self.assertIn(
+                'continue with read_file(path="long.txt", start_line=2001',
+                model_text,
+            )
+            self.assertIn("line-2000", model_text)
+            self.assertNotIn("line-2001\n", model_text)
+
+    def test_read_file_continuation_preserves_default_cwd_relative_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            nested = workspace / "nested"
+            nested.mkdir()
+            (nested / "long.txt").write_text(
+                "".join(f"line-{index}\n" for index in range(1, 20)),
+                encoding="utf-8",
+            )
+            runtime = Runtime(workspace)
+            runtime.set_default_cwd({"path": "nested"})
+            first = runtime.call_tool(
+                "read_file",
+                {"path": "long.txt", "max_bytes": 16},
+            )
+            first_payload = first["structuredContent"]
+            action = first_payload.get("next_action")
+            self.assertIsInstance(action, dict)
+            self.assertEqual(action.get("tool"), "read_file")
+            self.assertEqual(action.get("arguments", {}).get("path"), "long.txt")
+            second = runtime.call_tool(action["tool"], action["arguments"])
+            self.assertIs(second.get("isError"), False)
+            self.assertEqual(
+                second["structuredContent"].get("start_line"),
+                first_payload.get("next_start_line"),
+            )
+
+    def test_read_file_partial_single_line_is_not_rendered_as_complete(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "single-line.txt").write_text("x" * 100, encoding="utf-8")
+            result = Runtime(workspace).call_tool(
+                "read_file",
+                {"path": "single-line.txt", "max_bytes": 16},
+            )
+            payload = result["structuredContent"]
+            self.assertIs(payload.get("truncated"), True)
+            self.assertIs(payload.get("first_line_exceeds_limit"), True)
+            self.assertIsNone(payload.get("next_start_line"))
+            model_text = self.agent_text(result)
+            self.assertIn("content truncated", model_text)
+            self.assertIn("raise max_bytes", model_text)
+
+    def test_git_pagination_actions_are_rendered(self) -> None:
+        error = git_fixture_preflight_error()
+        if error is not None:
+            self.skipTest(error)
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            tracked = workspace / "tracked.txt"
+            tracked.write_text("one\ntwo\nthree\n", encoding="utf-8")
+            init_git(workspace)
+            tracked.write_text("one changed\ntwo\nthree\n", encoding="utf-8")
+            committed = subprocess.run(
+                ["git", "commit", "-q", "-am", "second commit"],
+                cwd=workspace,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            runtime = Runtime(workspace)
+
+            log_result = runtime.call_tool("git_log", {"max_count": 1})
+            log_payload = log_result["structuredContent"]
+            self.assertIs(log_payload.get("truncated"), True)
+            self.assertEqual(
+                log_payload.get("next_action", {}).get("arguments", {}).get("skip"),
+                1,
+            )
+            log_text = self.agent_text(log_result)
+            self.assertIn("more commits available", log_text)
+            self.assertIn("git_log(", log_text)
+            self.assertIn("skip=1", log_text)
+
+            blame_result = runtime.call_tool(
+                "git_blame",
+                {
+                    "path": "tracked.txt",
+                    "start_line": 1,
+                    "end_line": 3,
+                    "max_lines": 1,
+                },
+            )
+            blame_payload = blame_result["structuredContent"]
+            self.assertIs(blame_payload.get("truncated"), True)
+            self.assertEqual(
+                blame_payload.get("next_action", {}).get("arguments", {}).get("start_line"),
+                2,
+            )
+            blame_text = self.agent_text(blame_result)
+            self.assertIn("blame lines truncated", blame_text)
+            self.assertIn("git_blame(", blame_text)
+            self.assertIn("start_line=2", blame_text)
+
+    def test_search_truncation_reports_match_counts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "data.txt").write_text("needle\n" * 5, encoding="utf-8")
+            result = Runtime(workspace).call_tool(
+                "search_text",
+                {"query": "needle", "max_results": 2},
+            )
+            model_text = self.agent_text(result)
+            self.assertIn("showing 2 of", model_text)
+            self.assertIn("max_results", model_text)
+
+    def test_exec_command_tool_errors_use_failed_status(self) -> None:
+        with TemporaryDirectory() as tmp:
+            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
+                "exec_command",
+                {"cmd": "pwd", "workdir": "missing"},
+            )
+            self.assertIs(result.get("isError"), True)
+            self.assertEqual(result.get("structuredContent", {}).get("status"), "failed")
+
+    @unittest.skipIf(os.name == "nt", "POSIX signal status test")
+    def test_exec_command_reports_signal_exit_as_terminated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            result = runtime.exec_command(
+                {"cmd": "kill -TERM $$", "timeout_ms": 5_000, "yield_time_ms": 5_000}
+            )
+            self.assertEqual(result.get("status"), "terminated", result)
+            self.assertEqual(result.get("signal"), "SIGTERM", result)
+
+    def test_active_process_limit_counts_running_commands(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            session_ids: list[str] = []
+            try:
+                for _ in range(MAX_ACTIVE_EXEC_SESSIONS):
+                    result = runtime.exec_command(
+                        {"cmd": "sleep 5", "timeout_ms": 10_000, "yield_time_ms": 0}
+                    )
+                    session_ids.append(str(result["session_id"]))
+                with self.assertRaises(ToolFailure) as raised:
+                    runtime.exec_command(
+                        {"cmd": "sleep 5", "timeout_ms": 10_000, "yield_time_ms": 0}
+                    )
+                self.assertEqual(raised.exception.code, "SESSION_LIMIT_REACHED")
+            finally:
+                for session_id in session_ids:
+                    try:
+                        runtime.kill_session(
+                            {"session_id": session_id, "signal": "KILL", "wait_ms": 1000}
+                        )
+                    except ToolFailure:
+                        pass
+                runtime.close()
+
+    def test_initialize_injects_root_instructions_and_indexes_nested_instructions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "AGENTS.md").write_text("Run the focused test suite.\n", encoding="utf-8")
+            nested = workspace / "packages" / "api" / "AGENTS.md"
+            nested.parent.mkdir(parents=True)
+            nested.write_text("API-only nested rule.\n", encoding="utf-8")
+
+            initialized = Runtime(workspace).initialize()
+            instructions = initialized.get("instructions", "")
+            self.assertIn("Run the focused test suite.", instructions)
+            self.assertIn("packages/api/AGENTS.md", instructions)
+            self.assertNotIn("API-only nested rule.", instructions)
+            self.assertIn("apply_patch", instructions)
 
     def test_exec_command_compact_preview_and_read_output(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -698,6 +1200,81 @@ Maven home: /usr/share/maven
             self.assertIn("beta", page.get("content", ""))
             self.assertEqual(page.get("stream"), "stdout")
             self.assertIsNone(page.get("next_offset"))
+
+    @unittest.skipIf(os.name == "nt", "this build explicitly reports ConPTY as unsupported")
+    def test_exec_command_tty_uses_a_real_pseudo_terminal(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            script = "import os; print(os.isatty(0), os.isatty(1), os.isatty(2), flush=True)"
+            result = runtime.exec_command(
+                {
+                    "cmd": f"{sys.executable} -c {script!r}",
+                    "tty": True,
+                    "timeout_ms": 5000,
+                    "yield_time_ms": 5000,
+                }
+            )
+            # The tty fast-path intentionally returns as soon as the first
+            # output arrives, which can race the exit becoming observable.
+            # Follow the documented next_action contract and poll to completion.
+            stdout = str(result.get("stdout", ""))
+            deadline = time.time() + 5
+            while result.get("status") == "running" and time.time() < deadline:
+                result = runtime.write_stdin(
+                    {"session_id": result["session_id"], "chars": "", "yield_time_ms": 500}
+                )
+                stdout += str(result.get("stdout", ""))
+            self.assertEqual(result.get("status"), "exited", result)
+            self.assertIn("True True True", stdout)
+
+    def test_completed_sessions_are_evicted_from_active_storage(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            session_ids: list[str] = []
+            for _ in range(20):
+                result = runtime.exec_command(
+                    {"cmd": "sleep 0.02", "timeout_ms": 2000, "yield_time_ms": 0, "max_output_bytes": 64}
+                )
+                session_ids.append(str(result["session_id"]))
+            time.sleep(0.2)
+            runtime._prune_sessions()
+            self.assertEqual(runtime.sessions, {})
+            self.assertLessEqual(len(runtime.output_sessions), 20)
+            self.assertTrue(set(runtime.output_sessions).issubset(set(session_ids)))
+            deadline = time.time() + 1
+            while time.time() < deadline and any(
+                thread.name.startswith("coding-tools-watchdog-")
+                for thread in threading.enumerate()
+            ):
+                time.sleep(0.01)
+            self.assertFalse(
+                any(
+                    thread.name.startswith("coding-tools-watchdog-")
+                    for thread in threading.enumerate()
+                )
+            )
+
+    def test_running_and_truncated_commands_return_explicit_next_actions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            running = runtime.exec_command(
+                {"cmd": "sleep 1", "timeout_ms": 5000, "yield_time_ms": 0, "max_output_bytes": 64}
+            )
+            self.assertEqual(running.get("status"), "running")
+            self.assertEqual(running.get("next_action", {}).get("tool"), "write_stdin")
+            runtime.kill_session({"session_id": running["session_id"], "signal": "KILL"})
+
+            truncated = runtime.exec_command(
+                {
+                    "cmd": "printf 'abcdefghijklmnopqrstuvwxyz'",
+                    "timeout_ms": 5000,
+                    "yield_time_ms": 5000,
+                    "max_output_bytes": 8,
+                }
+            )
+            self.assertTrue(truncated.get("output_truncated"), truncated)
+            self.assertEqual(truncated.get("next_action", {}).get("tool"), "read_output")
+            self.assertIn("output_ref", truncated)
 
     def test_read_output_pages_streams_independently(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -755,6 +1332,12 @@ Maven home: /usr/share/maven
                 self.assertEqual(page.get("content"), "cdef")
                 self.assertEqual(page.get("omitted_bytes"), 2)
                 self.assertEqual(page.get("retained_start_offset"), 2)
+
+                session.stdout_cursor = 0
+                snapshot = session.snapshot_since_cursor(10)
+                self.assertEqual(snapshot.get("stdout"), "cdef")
+                self.assertEqual(snapshot.get("stdout_omitted_bytes"), 2)
+                self.assertIs(snapshot.get("truncated"), True)
 
     def test_default_cwd_and_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:

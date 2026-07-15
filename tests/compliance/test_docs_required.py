@@ -28,7 +28,7 @@ class RequiredDocsTests(unittest.TestCase):
             "docs/limitations.md",
             "docs/troubleshooting.md",
             "docs/competitive-analysis.md",
-            "docs/profile-v0.1.md",
+            "docs/runtime-contract-v0.2.md",
             "Dockerfile",
             ".dockerignore",
             "docker-compose.yml",
