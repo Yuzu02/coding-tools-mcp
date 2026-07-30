@@ -59,7 +59,7 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(len(first), len({tool["name"] for tool in first}), "tool names must be unique")
         self.assertTrue({tool["name"] for tool in first} >= set(REQUIRED_TOOLS))
 
-    def test_http_sessions_isolate_cwd_and_process_sessions(self) -> None:
+    def test_http_sessions_isolate_cwd_but_share_workspace_runs(self) -> None:
         self.client.call_tool("set_default_cwd", {"path": "src"})
         with MCPClient(self.workspace.root, url=self.client.url) as sibling:
             sibling_cwd = self.assert_tool_success(sibling.call_tool("get_default_cwd", {}))
@@ -70,13 +70,37 @@ class MCPContractTests(ComplianceTestCase):
                 "exec_command",
                 {"cmd": "sleep 1", "timeout_ms": 5000, "yield_time_ms": 0},
             )
-            session_id = self.assert_tool_success(started).get("session_id")
-            denied = sibling.call_tool("write_stdin", {"session_id": session_id, "chars": "", "yield_time_ms": 0})
-            self.assertTrue(denied.get("isError"), denied)
-            self.client.call_tool("kill_session", {"session_id": session_id, "signal": "KILL"})
+            payload = self.assert_tool_success(started)
+            session_id = payload.get("session_id")
+            self.assertIsInstance(session_id, str)
+            polled = self.assert_tool_success(
+                sibling.call_tool("write_stdin", {"session_id": session_id, "chars": "", "yield_time_ms": 0})
+            )
+            self.assertEqual(polled.get("session_id"), session_id)
+            sibling.call_tool("kill_session", {"session_id": session_id, "signal": "KILL"})
 
         original_cwd = self.assert_tool_success(self.client.call_tool("get_default_cwd", {}))
         self.assertEqual(original_cwd.get("default_cwd"), "src")
+
+    def test_http_session_delete_does_not_terminate_workspace_run(self) -> None:
+        with MCPClient(self.workspace.root, url=self.client.url) as owner:
+            started = self.assert_tool_success(
+                owner.call_tool(
+                    "exec_command",
+                    {"cmd": "sleep 5", "timeout_ms": 10000, "yield_time_ms": 0},
+                )
+            )
+            session_id = started.get("session_id")
+            self.assertIsInstance(session_id, str)
+
+        polled = self.assert_tool_success(
+            self.client.call_tool("write_stdin", {"session_id": session_id, "chars": "", "yield_time_ms": 0})
+        )
+        self.assertEqual(polled.get("status"), "running")
+        killed = self.assert_tool_success(
+            self.client.call_tool("kill_session", {"session_id": session_id, "signal": "KILL"})
+        )
+        self.assertIn(killed.get("status"), {"killed", "exited"})
 
     def test_tools_list_excludes_forbidden_product_layer_tools(self) -> None:
         names = {str(tool.get("name", "")) for tool in self.client.list_tools()}

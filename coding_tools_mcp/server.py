@@ -1201,6 +1201,40 @@ class Workspace:
         return {path for path in completed.stdout.split("\0") if path}
 
 
+class WorkspaceRunManager:
+    """Own process runs for one workspace independently of MCP transport sessions."""
+
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace.expanduser().resolve(strict=True)
+        self.server_instance_id = secrets.token_urlsafe(12)
+        self.runtime_dir = runtime_dir_for_workspace(self.workspace, self.server_instance_id)
+        self.fallback_runtime_dir = fallback_runtime_dir_for_workspace(
+            self.workspace, self.server_instance_id
+        )
+        self.sessions: dict[str, ExecSession] = {}
+        self.output_sessions: dict[str, ExecSession] = {}
+        self.lock = threading.Lock()
+        self.starting_sessions = 0
+        self.closed = False
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            sessions = list(self.sessions.values())
+            self.sessions.clear()
+            self.output_sessions.clear()
+        for session in sessions:
+            session.refresh_status()
+            if session.process.poll() is None:
+                terminate_process_group(session.process, signal.SIGTERM)
+            session.drain_readers()
+        shutil.rmtree(self.runtime_dir, ignore_errors=True)
+        if self.fallback_runtime_dir is not None:
+            shutil.rmtree(self.fallback_runtime_dir, ignore_errors=True)
+
+
 class Runtime:
     def __init__(
         self,
@@ -1215,6 +1249,7 @@ class Runtime:
         project_context: ProjectContext | None = None,
         fake_readonly_annotations: bool = False,
         transport: str = "stdio",
+        run_manager: WorkspaceRunManager | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
@@ -1256,14 +1291,18 @@ class Runtime:
         self.allow_network = allow_network or self.capabilities.network
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
-        self.server_instance_id = secrets.token_urlsafe(12)
-        self._set_runtime_dir(runtime_dir_for_workspace(self.workspace.root, self.server_instance_id))
-        self.fallback_runtime_dir = fallback_runtime_dir_for_workspace(self.workspace.root, self.server_instance_id)
+        self.run_manager = run_manager or WorkspaceRunManager(self.workspace.root)
+        if self.run_manager.workspace != self.workspace.root:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "run_manager belongs to a different workspace.",
+                category="validation",
+            )
+        self._owns_run_manager = run_manager is None
+        self.server_instance_id = self.run_manager.server_instance_id
+        self._set_runtime_dir(self.run_manager.runtime_dir)
+        self.fallback_runtime_dir = self.run_manager.fallback_runtime_dir
         self.default_cwd = self.workspace.root
-        self.sessions: dict[str, ExecSession] = {}
-        self.output_sessions: dict[str, ExecSession] = {}
-        self.sessions_lock = threading.Lock()
-        self.starting_sessions = 0
         self._closed = False
         self.http_session_id = secrets.token_urlsafe(24)
         self.protocol_version = PROTOCOL_VERSION
@@ -1290,20 +1329,32 @@ class Runtime:
         self.cache_dir = self.runtime_dir / "cache"
 
     def close(self) -> None:
-        with self.sessions_lock:
-            if self._closed:
-                return
-            self._closed = True
-            sessions = list(self.sessions.values())
-            self.sessions.clear()
-            self.output_sessions.clear()
-        for session in sessions:
-            session.refresh_status()
-            if session.process.poll() is None:
-                terminate_process_group(session.process, signal.SIGTERM)
-            session.drain_readers()
-        shutil.rmtree(self.runtime_dir, ignore_errors=True)
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_run_manager:
+            self.run_manager.close()
         self.telemetry.finish()
+
+    @property
+    def sessions(self) -> dict[str, ExecSession]:
+        return self.run_manager.sessions
+
+    @property
+    def output_sessions(self) -> dict[str, ExecSession]:
+        return self.run_manager.output_sessions
+
+    @property
+    def sessions_lock(self) -> threading.Lock:
+        return self.run_manager.lock
+
+    @property
+    def starting_sessions(self) -> int:
+        return self.run_manager.starting_sessions
+
+    @starting_sessions.setter
+    def starting_sessions(self, value: int) -> None:
+        self.run_manager.starting_sessions = value
 
     def _ensure_runtime_dirs(self) -> None:
         candidates = [self.runtime_dir]
@@ -2260,10 +2311,10 @@ class Runtime:
                     raise
                 landlock_warning = landlock_unavailable_warning(exc)
         with self.sessions_lock:
-            if self._closed:
+            if self._closed or self.run_manager.closed:
                 if landlock_fd is not None:
                     os.close(landlock_fd)
-                raise ToolFailure("SESSION_CLOSED", "Runtime is closed.", category="runtime")
+                raise ToolFailure("SESSION_CLOSED", "Workspace run manager is closed.", category="runtime")
             if len(self.sessions) + self.starting_sessions >= MAX_ACTIVE_EXEC_SESSIONS:
                 if landlock_fd is not None:
                     os.close(landlock_fd)
@@ -2297,7 +2348,7 @@ class Runtime:
             with self.sessions_lock:
                 self.starting_sessions -= 1
                 slot_released = True
-                if not self._closed:
+                if not self._closed and not self.run_manager.closed:
                     self.sessions[session.session_id] = session
                     registered = True
             if not registered:
@@ -5334,6 +5385,7 @@ def build_runtime(
     emit_warning: bool = True,
     project_context: ProjectContext | None = None,
     transport: str = "stdio",
+    run_manager: WorkspaceRunManager | None = None,
 ) -> Runtime:
     workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
     runtime = Runtime(
@@ -5347,6 +5399,7 @@ def build_runtime(
         project_context=project_context,
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
         transport=transport,
+        run_manager=run_manager,
     )
     if emit_warning and runtime.capabilities.skip_all_permissions:
         print(
@@ -5484,6 +5537,7 @@ def run_http(args: argparse.Namespace) -> int:
             emit_warning=False,
             project_context=runtime.project_context,
             transport="http",
+            run_manager=runtime.run_manager,
         )
 
     server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)

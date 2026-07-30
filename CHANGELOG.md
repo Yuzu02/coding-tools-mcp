@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Command runs and retained output are now owned by the workspace server rather
+  than by an individual `Mcp-Session-Id`. Multiple authenticated clients for
+  the same workspace can continue, read, or terminate a run after reconnecting
+  or creating a new MCP transport session using the existing command
+  `session_id` returned by `exec_command`.
+- Closing or expiring an HTTP transport session no longer terminates workspace
+  command runs. Runs are still bounded by the existing active-count, retained
+  output, byte, timeout, and TTL limits and are terminated when the workspace
+  server shuts down.
+
 ## 0.2.2 - 2026-07-28
 
 ### Fixed
