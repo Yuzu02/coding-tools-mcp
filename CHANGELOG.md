@@ -4,15 +4,23 @@
 
 ### Changed
 
-- Command runs and retained output are now owned by the workspace server rather
+- **Breaking:** command handles are now named `command_id`; `kill_session` is
+  now `kill_command`; retained output references use
+  `command:<command_id>:stdout|stderr`. The former command `session_id`,
+  `kill_session`, and `session:` output references are not accepted.
+- Commands and retained output are now owned by the workspace server rather
   than by an individual `Mcp-Session-Id`. Multiple authenticated clients for
-  the same workspace can continue, read, or terminate a run after reconnecting
-  or creating a new MCP transport session using the existing command
-  `session_id` returned by `exec_command`.
+  the same workspace can continue, read, or terminate a command after
+  reconnecting or creating a new MCP transport session using the `command_id`
+  returned by `exec_command`.
 - Closing or expiring an HTTP transport session no longer terminates workspace
-  command runs. Runs are still bounded by the existing active-count, retained
+  commands. Commands are still bounded by the existing active-count, retained
   output, byte, timeout, and TTL limits and are terminated when the workspace
   server shuts down.
+- `default_cwd` remains scoped to one MCP transport session and may reset after
+  reconnect. Tool descriptions now direct remote clients to pass explicit
+  `path`/`workdir` arguments and include concrete examples for patching and
+  command continuation.
 
 ## 0.2.2 - 2026-07-28
 
