@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -174,6 +174,14 @@ POSIX_CORE_ENV_NAMES = {"PATH", "LANG", "LC_ALL", "TERM"}
 # exec_command share the host's global git config (e.g. safe.directory entries).
 GIT_ENV_NAMES = {"GIT_CONFIG_GLOBAL"}
 WINDOWS_CORE_ENV_NAMES = {"PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR"}
+WINDOWS_ENV_CANONICAL_NAMES = {
+    "PATH": "Path",
+    "PATHEXT": "PATHEXT",
+    "COMSPEC": "ComSpec",
+    "SYSTEMROOT": "SystemRoot",
+    "WINDIR": "WinDir",
+}
+WINDOWS_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 NETWORK_RE = re.compile(
     r"(https?://|urllib\.request|urllib3|requests\.|http\.client|\bHTTPConnection\b|\bHTTPSConnection\b|socket\.|aiohttp|httpx|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\bftp\b)",
     re.I,
@@ -394,6 +402,32 @@ def is_core_command_env_name(name: str) -> bool:
     if os.name == "nt":
         return upper in WINDOWS_CORE_ENV_NAMES
     return upper in POSIX_CORE_ENV_NAMES or upper in GIT_ENV_NAMES or upper.startswith("LC_")
+
+
+def set_command_env_value(env: dict[str, str], name: str, value: str) -> None:
+    """Set one environment value using Windows' case-insensitive key semantics."""
+
+    if os.name != "nt":
+        env[name] = value
+        return
+    upper = name.upper()
+    for existing in tuple(env):
+        if existing.upper() == upper:
+            del env[existing]
+    env[WINDOWS_ENV_CANONICAL_NAMES.get(upper, name)] = value
+
+
+def normalize_command_env(env: dict[str, str]) -> dict[str, str]:
+    """Canonicalize Windows environment keys and restore required shell metadata."""
+
+    if os.name != "nt":
+        return env
+    normalized: dict[str, str] = {}
+    for name, value in env.items():
+        set_command_env_value(normalized, name, value)
+    if "Path" in normalized and "PATHEXT" not in normalized:
+        normalized["PATHEXT"] = WINDOWS_DEFAULT_PATHEXT
+    return normalized
 
 
 def split_env_patterns(value: str | None) -> tuple[str, ...]:
@@ -2598,21 +2632,22 @@ class Runtime:
                 for key, value in env.items()
                 if env_pattern_matches(key, self.shell_env_policy.include_only)
             }
-        env.update({str(key): str(value) for key, value in self.shell_env_policy.set.items()})
+        for key, value in self.shell_env_policy.set.items():
+            set_command_env_value(env, str(key), str(value))
         self._ensure_runtime_dirs()
         tmp_dir = self.command_tmp_dir()
-        env["HOME"] = str(self.command_home_dir())
-        env["TMPDIR"] = str(tmp_dir)
+        set_command_env_value(env, "HOME", str(self.command_home_dir()))
+        set_command_env_value(env, "TMPDIR", str(tmp_dir))
         if os.name == "nt":
-            env["TEMP"] = str(tmp_dir)
-            env["TMP"] = str(tmp_dir)
+            set_command_env_value(env, "TEMP", str(tmp_dir))
+            set_command_env_value(env, "TMP", str(tmp_dir))
         if isinstance(extra, dict):
             for key, value in extra.items():
                 key_text = str(key)
                 value_text = str(value)
                 if not self.dangerously_skip_all_permissions and is_filtered_env_var(key_text, value_text):
                     continue
-                env[key_text] = value_text
+                set_command_env_value(env, key_text, value_text)
         return env
 
     def _git_env(self) -> dict[str, str]:
@@ -2671,12 +2706,12 @@ class Runtime:
         if self.shell_env_policy.inherit == "none":
             return {}
         if self.shell_env_policy.inherit == "all":
-            return {str(key): str(value) for key, value in os.environ.items()}
-        return {
+            return normalize_command_env({str(key): str(value) for key, value in os.environ.items()})
+        return normalize_command_env({
             str(key): str(value)
             for key, value in os.environ.items()
             if is_core_command_env_name(str(key))
-        }
+        })
 
     def _make_command(
         self,
@@ -3417,7 +3452,7 @@ def walk_files(root: Path) -> Iterator[Path]:
             yield current_path / name
 
 
-def path_batches(paths: Iterator[Path], size: int) -> Iterator[list[Path]]:
+def path_batches(paths: Iterable[Path], size: int) -> Iterator[list[Path]]:
     batch: list[Path] = []
     for path in paths:
         batch.append(path)
@@ -4095,7 +4130,10 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots
 
 def add_landlock_path(ruleset_fd: int, path: Path, allowed_access: int, *, required: bool = True) -> None:
     try:
-        fd = os.open(path, getattr(os, "O_PATH", os.O_RDONLY) | os.O_CLOEXEC)
+        fd = os.open(
+            path,
+            getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0),
+        )
     except OSError as exc:
         if required:
             raise ToolFailure(
