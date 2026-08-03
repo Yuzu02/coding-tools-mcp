@@ -154,7 +154,7 @@ def build_project_catalog(workspace: Path) -> ProjectCatalog:
     warnings: list[str] = []
     root_markers = _project_markers(root)
     if root_markers:
-        projects = (
+        root_projects = (
             ProjectRecord(
                 project_id=".",
                 root=root,
@@ -164,15 +164,15 @@ def build_project_catalog(workspace: Path) -> ProjectCatalog:
                 parent_project_id=None,
             ),
         )
-        return ProjectCatalog(root, projects)
+        return ProjectCatalog(root, root_projects)
 
-    projects: list[ProjectRecord] = []
+    main_projects: list[ProjectRecord] = []
     try:
         children = sorted(root.iterdir(), key=lambda path: path.name.casefold())
     except OSError as exc:
         return ProjectCatalog(root, (), (f"Could not list workspace projects: {exc}",))
     for child in children:
-        if len(projects) >= MAX_MAIN_PROJECTS:
+        if len(main_projects) >= MAX_MAIN_PROJECTS:
             _append_warning(warnings, f"Main project list truncated to {MAX_MAIN_PROJECTS} entries.")
             break
         if child.name in EXCLUDED_PROJECT_DIRS or not child.is_dir():
@@ -188,7 +188,7 @@ def build_project_catalog(workspace: Path) -> ProjectCatalog:
         if not markers:
             continue
         display = _display_path(child, root)
-        projects.append(
+        main_projects.append(
             ProjectRecord(
                 project_id=display,
                 root=child.resolve(strict=True),
@@ -198,7 +198,7 @@ def build_project_catalog(workspace: Path) -> ProjectCatalog:
                 parent_project_id=None,
             )
         )
-    return ProjectCatalog(root, tuple(projects), tuple(warnings))
+    return ProjectCatalog(root, tuple(main_projects), tuple(warnings))
 
 
 def _project_markers(path: Path) -> tuple[str, ...]:

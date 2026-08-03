@@ -27,6 +27,8 @@ REQUIRED_TOOLS = (
     "check_exec_environment",
     "get_default_cwd",
     "set_default_cwd",
+    "list_skills",
+    "read_skill",
     "read_file",
     "list_dir",
     "list_files",

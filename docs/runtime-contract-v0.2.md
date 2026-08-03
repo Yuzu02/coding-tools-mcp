@@ -112,7 +112,7 @@ Tool failures keep the same envelope with `isError: true`, a readable error in
 Known tool error codes include:
 
 ```json
-["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "COMMAND_STARTING", "COMMAND_START_FAILED", "IDEMPOTENCY_CONFLICT", "SHELL_NOT_FOUND", "SHELL_VERSION_UNSUPPORTED", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
+["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "PROJECT_NOT_FOUND", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SKILL_INVALID", "SKILL_NOT_FOUND", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "COMMAND_STARTING", "COMMAND_START_FAILED", "IDEMPOTENCY_CONFLICT", "SHELL_NOT_FOUND", "SHELL_VERSION_UNSUPPORTED", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
 ```
 
 Error categories are `validation`, `security`, `permission`, `runtime`,
@@ -177,7 +177,7 @@ survive tunnel churn. Forwarded headers are ignored unless
 
 ## Stable tool inventory
 
-The default catalog has 22 tools, including `view_image`. Setting
+The default catalog has 24 tools, including `view_image`. Setting
 `CODING_TOOLS_MCP_ENABLE_VIEW_IMAGE=0` is the sole installation capability gate
 and removes only that optional binary-content tool. It is not a tool profile.
 
@@ -224,6 +224,39 @@ modify files. Reliable multi-call workflows should pass `path` or `workdir`
 explicitly instead of depending on this value surviving a reconnect.
 
 Example: `{"path":"src"}`.
+
+### list_skills
+
+Inputs: `"workdir"`.
+
+Annotations: `{"title":"List project skills","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Resolves the containing main project and applicable nested project chain from
+an explicit existing directory. The result contains the resolved workdir,
+applicable instruction-file paths, bounded warnings, and effective skill
+metadata (`name`, `description`, owner, scope, source, and source format). It
+does not return skill bodies. A workdir outside all discovered projects returns
+an empty catalog rather than guessing.
+
+Example: `{"workdir":"seace-minor-sdk/src"}`.
+
+Main-project skills are inserted first. Applicable nested projects may add new
+skill names but cannot replace an existing effective name. `.agents` is the
+canonical source when `.claude` resolves to the same physical skill.
+
+### read_skill
+
+Inputs: `"workdir"`, `"skill"`.
+
+Annotations: `{"title":"Read project skill","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Computes the same effective catalog as `list_skills`, selects one skill by
+name, and returns bounded UTF-8 `SKILL.md` content plus metadata, byte counts,
+and a truncation flag. The caller cannot provide a raw source path or bypass
+root-project precedence. `SKILL_NOT_FOUND` reports only names effective for the
+requested workdir; out-of-scope skill locations are not disclosed.
+
+Example: `{"workdir":"seace-minor-sdk/src","skill":"effect-ts"}`.
 
 ### read_file
 

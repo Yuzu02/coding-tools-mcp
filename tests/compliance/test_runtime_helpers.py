@@ -1363,20 +1363,35 @@ Maven home: /usr/share/maven
             finally:
                 runtime.close()
 
-    def test_initialize_injects_root_instructions_and_indexes_nested_instructions(self) -> None:
+    def test_initialize_injects_only_workspace_root_and_lists_nested_context_on_demand(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
+            (workspace / "package.json").write_text("{}", encoding="utf-8")
             (workspace / "AGENTS.md").write_text("Run the focused test suite.\n", encoding="utf-8")
             nested = workspace / "packages" / "api" / "AGENTS.md"
             nested.parent.mkdir(parents=True)
+            (nested.parent / "package.json").write_text("{}", encoding="utf-8")
             nested.write_text("API-only nested rule.\n", encoding="utf-8")
 
-            initialized = Runtime(workspace).initialize()
-            instructions = initialized.get("instructions", "")
-            self.assertIn("Run the focused test suite.", instructions)
-            self.assertIn("packages/api/AGENTS.md", instructions)
-            self.assertNotIn("API-only nested rule.", instructions)
-            self.assertIn("apply_patch", instructions)
+            runtime = Runtime(workspace)
+            try:
+                initialized = runtime.initialize()
+                instructions = initialized.get("instructions", "")
+                self.assertIn("Run the focused test suite.", instructions)
+                self.assertEqual(instructions.count("Run the focused test suite."), 1)
+                self.assertNotIn("packages/api/AGENTS.md", instructions)
+                self.assertNotIn("API-only nested rule.", instructions)
+                self.assertIn("list_skills", instructions)
+                self.assertIn("read_skill", instructions)
+                self.assertIn("apply_patch", instructions)
+
+                context = runtime.list_skills({"workdir": "packages/api"})
+                self.assertEqual(
+                    context["instruction_files"],
+                    ["AGENTS.md", "packages/api/AGENTS.md"],
+                )
+            finally:
+                runtime.close()
 
     def test_exec_command_compact_preview_and_read_output(self) -> None:
         with TemporaryDirectory() as tmp:

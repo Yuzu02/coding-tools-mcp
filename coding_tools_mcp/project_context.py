@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 CONTEXT_FILE_NAMES = frozenset({"AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"})
+ROOT_CONTEXT_FILE_ORDER = ("AGENTS.md", "CLAUDE.md", "AGENTS.MD", "CLAUDE.MD")
 SKIPPED_CONTEXT_DIRS = frozenset(
     {
         ".git",
@@ -66,11 +67,22 @@ class ProjectContext:
 
 
 def load_project_context(root: Path) -> ProjectContext:
+    return _load_project_context(root, discover_nested=True)
+
+
+def load_workspace_context(root: Path) -> ProjectContext:
+    """Load only instruction files located directly at the configured workspace root."""
+
+    return _load_project_context(root, discover_nested=False)
+
+
+def _load_project_context(root: Path, *, discover_nested: bool) -> ProjectContext:
     resolved_root = root.expanduser().resolve(strict=True)
     loaded: list[LoadedContextFile] = []
     warnings: list[str] = []
     remaining = MAX_ROOT_CONTEXT_BYTES
-    for name in sorted(CONTEXT_FILE_NAMES):
+    seen_root_files: set[tuple[int, int] | str] = set()
+    for name in ROOT_CONTEXT_FILE_ORDER:
         path = resolved_root / name
         if not path.is_file():
             continue
@@ -80,6 +92,10 @@ def load_project_context(root: Path) -> ProjectContext:
         except (OSError, ValueError):
             warnings.append(f"Skipped unsafe root instruction path: {name}")
             continue
+        identity = _physical_file_identity(resolved)
+        if identity in seen_root_files:
+            continue
+        seen_root_files.add(identity)
         if remaining <= 0:
             warnings.append("Root instruction byte limit reached.")
             break
@@ -99,7 +115,11 @@ def load_project_context(root: Path) -> ProjectContext:
         remaining -= len(content.encode("utf-8"))
 
     loaded_names = {item.path for item in loaded}
-    nested = [path for path in _discover_context_files(resolved_root, warnings) if path not in loaded_names]
+    nested = (
+        [path for path in _discover_context_files(resolved_root, warnings) if path not in loaded_names]
+        if discover_nested
+        else []
+    )
     if len(nested) > MAX_NESTED_CONTEXT_FILES:
         nested = nested[:MAX_NESTED_CONTEXT_FILES]
         warnings.append(f"Nested instruction list truncated to {MAX_NESTED_CONTEXT_FILES} files.")
@@ -184,3 +204,13 @@ def _decode_utf8_prefix(data: bytes) -> str:
         if exc.reason != "unexpected end of data":
             raise
         return data[: exc.start].decode("utf-8")
+
+
+def _physical_file_identity(path: Path) -> tuple[int, int] | str:
+    try:
+        metadata = path.stat()
+    except OSError:
+        return os.path.normcase(str(path))
+    if metadata.st_ino:
+        return metadata.st_dev, metadata.st_ino
+    return os.path.normcase(str(path))

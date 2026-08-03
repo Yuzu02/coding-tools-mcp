@@ -85,6 +85,52 @@ def _render_cwd(payload: dict[str, Any]) -> str:
     return f"Default working directory: {payload.get('default_cwd', '.')}"
 
 
+def _render_list_skills(payload: dict[str, Any]) -> str:
+    main_project = payload.get("main_project")
+    skills = payload.get("skills")
+    if not main_project:
+        return f"No project-scoped skills apply to workdir {payload.get('workdir', '.')}."
+    lines = [
+        f"Project skills for {payload.get('workdir', '.')} (main project: {main_project}):"
+    ]
+    instruction_files = payload.get("instruction_files")
+    if isinstance(instruction_files, list) and instruction_files:
+        lines.append("Applicable instruction files:")
+        lines.extend(f"- {path}" for path in instruction_files)
+    if isinstance(skills, list) and skills:
+        lines.append("Effective skills:")
+        for item in skills:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name", "unknown")
+            description = item.get("description", "")
+            owner = item.get("owner_project", "unknown")
+            lines.append(f"- {name}: {description} [owner: {owner}]")
+    else:
+        lines.append("No effective skills found.")
+    warnings = payload.get("warnings")
+    if isinstance(warnings, list):
+        lines.extend(f"Warning: {warning}" for warning in warnings)
+    return "\n".join(lines)
+
+
+def _render_read_skill(payload: dict[str, Any]) -> str:
+    skill = payload.get("skill")
+    metadata = skill if isinstance(skill, dict) else {}
+    name = metadata.get("name", "unknown")
+    source = metadata.get("source", "unknown")
+    content = payload.get("content")
+    if not isinstance(content, str):
+        content = ""
+    header = f"Skill {name} from {source}"
+    if payload.get("truncated"):
+        header += (
+            f" [truncated to {payload.get('returned_bytes', '?')} of "
+            f"{payload.get('total_bytes', '?')} bytes]"
+        )
+    return f"{header}\n{content}"
+
+
 def _render_read_file(payload: dict[str, Any]) -> str:
     content = payload.get("content")
     if not isinstance(content, str):
@@ -414,6 +460,8 @@ _RENDERERS = {
     "check_exec_environment": _render_exec_environment,
     "get_default_cwd": _render_cwd,
     "set_default_cwd": _render_cwd,
+    "list_skills": _render_list_skills,
+    "read_skill": _render_read_skill,
     "read_file": _render_read_file,
     "list_dir": _render_list,
     "list_files": _render_list,

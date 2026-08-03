@@ -75,7 +75,14 @@ from .protocol import (
     response_id,
     validate_rpc_envelope,
 )
-from .project_context import ProjectContext, load_project_context
+from .project_catalog import ProjectCatalog, build_project_catalog
+from .project_context import ProjectContext, load_workspace_context
+from .skill_catalog import (
+    ProjectNotFoundError,
+    SkillCatalog,
+    SkillInvalidError,
+    SkillNotFoundError,
+)
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
@@ -670,6 +677,24 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
             "Set the default cwd only for the current MCP transport session. Prefer explicit path/workdir "
             "arguments when calls must survive reconnects. Example: {\"path\":\"src\"}."
         ),
+        idempotent=True,
+    ),
+    "list_skills": ToolSpec(
+        title="List project skills",
+        description=(
+            "List project-scoped instructions and skill metadata for an explicit workdir. "
+            "Skill bodies are omitted; call read_skill when a description applies."
+        ),
+        read_only=True,
+        idempotent=True,
+    ),
+    "read_skill": ToolSpec(
+        title="Read project skill",
+        description=(
+            "Read one effective project-scoped SKILL.md by name for an explicit workdir. "
+            "The caller cannot provide a raw source path or bypass root-project precedence."
+        ),
+        read_only=True,
         idempotent=True,
     ),
     "read_file": ToolSpec(
@@ -1448,6 +1473,8 @@ class Runtime:
         auth_token: str | None = None,
         oauth_config: OAuthConfig | None = None,
         project_context: ProjectContext | None = None,
+        project_catalog: ProjectCatalog | None = None,
+        skill_catalog: SkillCatalog | None = None,
         fake_readonly_annotations: bool = False,
         transport: str = "stdio",
         command_manager: WorkspaceCommandManager | None = None,
@@ -1510,12 +1537,26 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
-        # ProjectContext is frozen and derived only from the workspace tree, so
-        # per-session HTTP runtimes reuse the server's copy instead of re-running
-        # discovery (git ls-files / directory walk) on every connect.
+        # ProjectContext is frozen and restricted to the configured workspace
+        # root. Project/skill catalogs are likewise shared by ephemeral HTTP
+        # runtimes so discovery and parsing never repeat per transport session.
         self.project_context: ProjectContext = (
-            project_context if project_context is not None else load_project_context(self.workspace.root)
+            project_context if project_context is not None else load_workspace_context(self.workspace.root)
         )
+        self.project_catalog = project_catalog or build_project_catalog(self.workspace.root)
+        if self.project_catalog.workspace != self.workspace.root:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "project_catalog belongs to a different workspace.",
+                category="validation",
+            )
+        self.skill_catalog = skill_catalog or SkillCatalog(self.project_catalog)
+        if self.skill_catalog.workspace != self.workspace.root:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "skill_catalog belongs to a different workspace.",
+                category="validation",
+            )
         self.request_commands: dict[str | int, str] = {}
         self.request_commands_lock = threading.Lock()
         self.request_context = threading.local()
@@ -1623,6 +1664,14 @@ class Runtime:
 
     def initialize(self, client_info: dict[str, Any] | None = None) -> dict[str, Any]:
         self.telemetry.record_session_start(client_info, self.protocol_version)
+        instructions = self.project_context.server_instructions()
+        instructions += (
+            "\n\nProject-scoped instructions and reusable skills are resolved from explicit paths. "
+            "Call list_skills with the relevant workdir before substantial work when project guidance may apply. "
+            "The result contains metadata only; call read_skill for any listed skill whose description matches "
+            "the task, then follow the returned SKILL.md. Prefer explicit workdir values because default cwd is "
+            "session-local and may reset after reconnects."
+        )
         return {
             "protocolVersion": self.protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
@@ -1631,7 +1680,7 @@ class Runtime:
                 "title": SERVER_TITLE,
                 "version": __version__,
             },
-            "instructions": self.project_context.server_instructions(),
+            "instructions": instructions,
         }
 
     def list_tools(self) -> dict[str, Any]:
@@ -1709,6 +1758,7 @@ class Runtime:
                 "nested_instruction_files": list(self.project_context.nested_files),
                 "warnings": list(self.project_context.warnings),
             },
+            "project_catalog": self.project_catalog.summary(),
             "tools": tools,
             "tool_count": len(tools),
         }
@@ -1822,6 +1872,43 @@ class Runtime:
             "workspace": str(self.workspace.root),
             "default_cwd": resolved.display,
         }
+
+    def list_skills(self, args: dict[str, Any]) -> dict[str, Any]:
+        workdir = self.resolve_existing(str(args.get("workdir", ".")))
+        if not workdir.path.is_dir():
+            raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
+        return self.skill_catalog.list_for(workdir.path).payload()
+
+    def read_skill(self, args: dict[str, Any]) -> dict[str, Any]:
+        workdir = self.resolve_existing(str(args.get("workdir", ".")))
+        if not workdir.path.is_dir():
+            raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
+        name = str(args.get("skill", "")).strip()
+        if not name:
+            raise ToolFailure("INVALID_ARGUMENT", "skill is required.", category="validation")
+        try:
+            return self.skill_catalog.read(workdir.path, name).payload()
+        except ProjectNotFoundError as exc:
+            raise ToolFailure(
+                "PROJECT_NOT_FOUND",
+                str(exc),
+                category="validation",
+                details={"workdir": workdir.display},
+            ) from exc
+        except SkillNotFoundError as exc:
+            raise ToolFailure(
+                "SKILL_NOT_FOUND",
+                str(exc),
+                category="validation",
+                details={"workdir": workdir.display, "available": list(exc.available)},
+            ) from exc
+        except SkillInvalidError as exc:
+            raise ToolFailure(
+                "SKILL_INVALID",
+                str(exc),
+                category="filesystem",
+                details={"workdir": workdir.display, "skill": name},
+            ) from exc
 
     def emit_tool_trace(self, name: str, args: dict[str, Any], payload: dict[str, Any], started_at: float) -> None:
         raw_error = payload.get("error")
@@ -4944,6 +5031,18 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "path": {**string, "default": "."},
             }
         ),
+        "list_skills": object_schema(
+            {
+                "workdir": {**string, "default": "."},
+            }
+        ),
+        "read_skill": object_schema(
+            {
+                "workdir": {**string, "default": "."},
+                "skill": {**string, "minLength": 1},
+            },
+            ["skill"],
+        ),
         "read_file": object_schema(
             {
                 "path": {**string, "minLength": 1},
@@ -5887,6 +5986,8 @@ def build_runtime(
     oauth_config: OAuthConfig | None = None,
     emit_warning: bool = True,
     project_context: ProjectContext | None = None,
+    project_catalog: ProjectCatalog | None = None,
+    skill_catalog: SkillCatalog | None = None,
     transport: str = "stdio",
     command_manager: WorkspaceCommandManager | None = None,
 ) -> Runtime:
@@ -5900,6 +6001,8 @@ def build_runtime(
         auth_token=auth_token,
         oauth_config=oauth_config,
         project_context=project_context,
+        project_catalog=project_catalog,
+        skill_catalog=skill_catalog,
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
         transport=transport,
         command_manager=command_manager,
@@ -6039,6 +6142,8 @@ def run_http(args: argparse.Namespace) -> int:
             oauth_config=oauth_config,
             emit_warning=False,
             project_context=runtime.project_context,
+            project_catalog=runtime.project_catalog,
+            skill_catalog=runtime.skill_catalog,
             transport="http",
             command_manager=runtime.command_manager,
         )

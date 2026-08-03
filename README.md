@@ -152,9 +152,27 @@ rollback.
 | Execution | `exec_command` · `list_commands` · `get_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
 | Runtime | `server_info` · `check_exec_environment` · `get_default_cwd` · `set_default_cwd` |
+| Project context | `list_skills` · `read_skill` |
 
-Root `AGENTS.md`/`CLAUDE.md` files load into the initialize context
-automatically. Tool `content` is concise agent-facing text;
+Only `AGENTS.md`/`CLAUDE.md` files at the configured workspace root load into
+the initialize context automatically. For a repository inside a multi-project
+workspace, call `list_skills` with an explicit `workdir`; it returns applicable
+instruction paths and skill metadata without injecting complete skill bodies.
+Call `read_skill` by name when a description matches the task. Root-project
+skills win collisions, while applicable nested repositories may add distinct
+skills. `.agents/skills/<name>/SKILL.md` and `.claude/skills/<name>/SKILL.md`
+are recognized and physical aliases are deduplicated.
+
+```json
+{"workdir":"seace-minor-sdk/src"}
+```
+
+```json
+{"workdir":"seace-minor-sdk/src","skill":"effect-ts"}
+```
+
+Explicit `workdir` values remain correct across HTTP reconnects; skill scripts
+are never executed automatically. Tool `content` is concise agent-facing text;
 `structuredContent` carries the complete machine result. Schemas and result
 envelopes: [docs/tools-and-schemas.md](docs/tools-and-schemas.md) ·
 [docs/runtime-contract-v0.2.md](docs/runtime-contract-v0.2.md).

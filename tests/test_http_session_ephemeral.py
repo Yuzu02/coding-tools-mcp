@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.compliance.mcp_client import MCPClient
+from tests.compliance.mcp_client import MCPClient, REQUIRED_TOOLS
 
 
 class EphemeralHTTPSessionTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class EphemeralHTTPSessionTests(unittest.TestCase):
                 for _ in range(12):
                     with MCPClient(workspace, url=owner.url) as sibling:
                         session_ids.add(str(sibling.session_id))
-                        self.assertEqual(len(sibling.list_tools()), 22)
+                        self.assertEqual(len(sibling.list_tools()), len(REQUIRED_TOOLS))
 
         self.assertEqual(len(session_ids), 13)
 

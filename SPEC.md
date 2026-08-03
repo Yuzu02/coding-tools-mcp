@@ -17,10 +17,11 @@ no dynamic `tools/list_changed`, and no required `open_workspace` call.
 `apply_patch` is the only direct file-write tool. `safe`, `trusted`, and
 `dangerous` are command permission policies and never alter `tools/list`.
 
-The default catalog contains 22 tools:
+The default catalog contains 24 tools:
 
 - runtime/context: `server_info`, `check_exec_environment`, `get_default_cwd`,
   `set_default_cwd`
+- project context: `list_skills`, `read_skill`
 - workspace inspection: `read_file`, `list_dir`, `list_files`, `search_text`
 - mutation: `apply_patch`
 - processes: `exec_command`, `list_commands`, `get_command`, `write_stdin`,
@@ -28,7 +29,7 @@ The default catalog contains 22 tools:
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`
 - policy/image: `request_permissions`, `view_image`
 
-`view_image` can be disabled as an installation capability. All other 21 tools
+`view_image` can be disabled as an installation capability. All other 23 tools
 are fixed.
 
 ## Protocol
@@ -45,7 +46,9 @@ are fixed.
   limits, with a documented emergency safety ceiling for pathological entries.
   `structuredContent` is the complete stable machine result. `_meta` is
   optional UI space only.
-- Root project instructions enter the initialization context automatically.
+- Only configured-workspace-root instructions enter initialization
+  automatically. `list_skills(workdir)` resolves main/nested project context and
+  metadata; `read_skill(workdir, skill)` loads one bounded effective skill.
 
 ## Correctness guarantees
 
@@ -61,6 +64,13 @@ and explicit `next_action` objects for polling or truncated output. Optional
 `get_command` recover handles and retained output after a lost response.
 Command handles are `command_id` values and are distinct from HTTP
 `Mcp-Session-Id`.
+
+Project discovery is bounded and cached for the server lifetime. If the
+workspace root has a recognized project marker it is project `.`; otherwise,
+marked direct children are main projects. Nested project skills apply only when
+the explicit workdir falls inside them. Main-project skills are authoritative on
+name collisions. Skill lookup accepts names rather than source paths and never
+executes referenced scripts.
 
 ## Security boundary
 
