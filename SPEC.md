@@ -49,6 +49,9 @@ are fixed.
 - Only configured-workspace-root instructions enter initialization
   automatically. `list_skills(workdir)` resolves main/nested project context and
   metadata; `read_skill(workdir, skill)` loads one bounded effective skill.
+- Every Git operation can select its repository with explicit `workdir`;
+  optional `path`/`paths` values are repository-relative filters rather than
+  repository selectors.
 
 ## Correctness guarantees
 

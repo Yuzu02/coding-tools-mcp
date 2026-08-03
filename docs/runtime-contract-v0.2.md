@@ -370,33 +370,50 @@ Example: `{"output_ref":"command:abc:stdout","offset":0,"limit":4096}`.
 
 ### git_status
 
-Inputs: `"path"`, `"include_untracked"`, `"max_entries"`.
+Inputs: `"workdir"`, `"path"`, `"include_untracked"`, `"max_entries"`.
 
 Annotations: `{"title":"Git status","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
+`workdir` selects the repository for the call. The legacy `path` argument is
+retained as a repository-directory alias when `workdir` is omitted. When both
+are supplied, `.` is treated as an omitted default and two non-default values
+must resolve to the same directory.
+
 ### git_diff
 
-Inputs: `"path"`, `"paths"`, `"staged"`, `"unstaged"`, `"context_lines"`, `"max_bytes"`.
+Inputs: `"workdir"`, `"path"`, `"paths"`, `"staged"`, `"unstaged"`, `"context_lines"`, `"max_bytes"`.
 
 Annotations: `{"title":"Git diff","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
+`workdir` selects the repository. `path` and `paths` are optional pathspecs
+resolved relative to that directory and may not escape the selected repository.
+
 ### git_log
 
-Inputs: `"path"`, `"ref"`, `"max_count"`, `"skip"`.
+Inputs: `"workdir"`, `"path"`, `"ref"`, `"max_count"`, `"skip"`.
 
 Annotations: `{"title":"Git log","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
+`workdir` selects the repository and `path` is an optional history pathspec
+relative to it. Pagination `next_action` arguments preserve both values.
+
 ### git_show
 
-Inputs: `"rev"`, `"path"`, `"paths"`, `"include_diff"`, `"context_lines"`, `"max_bytes"`.
+Inputs: `"workdir"`, `"rev"`, `"path"`, `"paths"`, `"include_diff"`, `"context_lines"`, `"max_bytes"`.
 
 Annotations: `{"title":"Git show","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
+`workdir` selects the repository. Optional `path` and `paths` filters are
+resolved relative to that directory.
+
 ### git_blame
 
-Inputs: `"path"`, `"rev"`, `"start_line"`, `"end_line"`, `"max_lines"`.
+Inputs: `"workdir"`, `"path"`, `"rev"`, `"start_line"`, `"end_line"`, `"max_lines"`.
 
 Annotations: `{"title":"Git blame","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+`workdir` selects the repository and `path` is resolved relative to it.
+Pagination `next_action` arguments preserve the explicit repository directory.
 
 ### request_permissions
 

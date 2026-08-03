@@ -154,6 +154,11 @@ rollback.
 | Runtime | `server_info` · `check_exec_environment` · `get_default_cwd` · `set_default_cwd` |
 | Project context | `list_skills` · `read_skill` |
 
+All Git tools accept an explicit `workdir`, so a parent workspace can contain
+multiple independent repositories without relying on session-local cwd. For
+diff/log/show/blame, `path` and `paths` remain filters relative to the selected
+repository.
+
 Only `AGENTS.md`/`CLAUDE.md` files at the configured workspace root load into
 the initialize context automatically. For a repository inside a multi-project
 workspace, call `list_skills` with an explicit `workdir`; it returns applicable

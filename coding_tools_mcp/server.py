@@ -786,31 +786,34 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "git_status": ToolSpec(
         title="Git status",
-        description="Return git working tree status for the workspace.",
+        description=(
+            "Return git working tree status for an explicit repository workdir. "
+            "The legacy path argument remains an alias when workdir is omitted."
+        ),
         read_only=True,
         idempotent=True,
     ),
     "git_diff": ToolSpec(
         title="Git diff",
-        description="Return unified git diff for workspace changes.",
+        description="Return unified git diff for a repository selected by explicit workdir.",
         read_only=True,
         idempotent=True,
     ),
     "git_log": ToolSpec(
         title="Git log",
-        description="Return recent git commits with bounded structured metadata.",
+        description="Return recent commits for a repository selected by explicit workdir.",
         read_only=True,
         idempotent=True,
     ),
     "git_show": ToolSpec(
         title="Git show",
-        description="Return bounded git show output for a revision.",
+        description="Return bounded git show output from a repository selected by explicit workdir.",
         read_only=True,
         idempotent=True,
     ),
     "git_blame": ToolSpec(
         title="Git blame",
-        description="Return bounded git blame metadata for a workspace file.",
+        description="Return bounded git blame metadata relative to an explicit repository workdir.",
         read_only=True,
         idempotent=True,
     ),
@@ -3029,13 +3032,99 @@ class Runtime:
         completed = self._run_git_text([require_git(), "-C", str(path), "rev-parse", rev], env=env)
         return completed.stdout.strip() if completed.returncode == 0 else ""
 
-    def _git_path_filters(self, args: dict[str, Any]) -> list[str]:
+    def _resolve_git_workdir(
+        self,
+        args: dict[str, Any],
+        *,
+        path_alias: bool = False,
+    ) -> ResolvedPath:
+        raw_workdir = args.get("workdir")
+        raw_alias = args.get("path") if path_alias else None
+        if raw_workdir is not None and raw_alias is not None:
+            if str(raw_alias) == ".":
+                resolved = self.resolve_existing(str(raw_workdir))
+            elif str(raw_workdir) == ".":
+                resolved = self.resolve_existing(str(raw_alias))
+            else:
+                workdir = self.resolve_existing(str(raw_workdir))
+                alias = self.resolve_existing(str(raw_alias))
+                if workdir.path != alias.path:
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        "workdir and path refer to different repositories.",
+                        category="validation",
+                    )
+                resolved = workdir
+        else:
+            raw = raw_workdir if raw_workdir is not None else raw_alias if raw_alias is not None else "."
+            resolved = self.resolve_existing(str(raw))
+        if not resolved.path.is_dir():
+            raise ToolFailure("NOT_A_DIRECTORY", "Git workdir must be a directory.", category="validation")
+        return resolved
+
+    def _git_repository_root(
+        self,
+        workdir: Path,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> Path | None:
+        completed = self._run_git_text(
+            [require_git(), "-C", str(workdir), "rev-parse", "--show-toplevel"],
+            env=env,
+        )
+        if completed.returncode != 0:
+            return None
+        raw_root = completed.stdout.strip()
+        if not raw_root:
+            return None
+        try:
+            repo_root = Path(raw_root).resolve(strict=True)
+        except OSError as exc:
+            raise ToolFailure(
+                "GIT_ERROR",
+                f"Git repository root could not be resolved: {raw_root}",
+                category="runtime",
+            ) from exc
+        if not is_relative_to(repo_root, self.workspace.root):
+            raise ToolFailure(
+                "PATH_OUTSIDE_WORKSPACE",
+                "Git repository root escapes the configured workspace.",
+                category="security",
+            )
+        return repo_root
+
+    def _raw_git_path_filters(self, args: dict[str, Any]) -> list[str]:
         path_filters: list[str] = []
         if isinstance(args.get("path"), str):
             path_filters.append(str(args["path"]))
         if isinstance(args.get("paths"), list):
             path_filters.extend(str(item) for item in args["paths"])
-        return [self.git_path_filter(path) for path in path_filters]
+        return path_filters
+
+    def _git_path_filters(
+        self,
+        args: dict[str, Any],
+        *,
+        workdir: Path,
+        repo_root: Path,
+    ) -> list[str]:
+        filters: list[str] = []
+        for raw_path in self._raw_git_path_filters(args):
+            resolved = self.workspace.resolve_for_write_at(workdir, raw_path)
+            if not is_relative_to(resolved.path, repo_root):
+                raise ToolFailure(
+                    "PATH_OUTSIDE_WORKSPACE",
+                    "Git path filter escapes the selected repository.",
+                    category="security",
+                )
+            filters.append(Path(os.path.relpath(resolved.path, workdir)).as_posix())
+        return filters
+
+    def _git_fallback_path_filters(self, args: dict[str, Any], *, workdir: Path) -> list[str]:
+        return [
+            self.workspace.resolve_for_write_at(workdir, raw_path).display
+            for raw_path in self._raw_git_path_filters(args)
+        ]
 
     def _base_command_env(self) -> dict[str, str]:
         if self.shell_env_policy.inherit == "none":
@@ -3523,7 +3612,7 @@ class Runtime:
         return command
 
     def git_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.resolve_existing(str(args.get("path", ".")))
+        resolved = self._resolve_git_workdir(args, path_alias=True)
         max_entries = int(args.get("max_entries", 1000))
         include_untracked = bool(args.get("include_untracked", True))
         git = require_git()
@@ -3567,6 +3656,7 @@ class Runtime:
                 break
         return {
             "is_repo": True,
+            "workdir": resolved.display,
             "branch": branch,
             "head": self._git_rev_parse(resolved.path, "HEAD", env=git_env),
             "upstream": upstream,
@@ -3580,18 +3670,45 @@ class Runtime:
     def git_diff(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
+        workdir = self._resolve_git_workdir(args)
         staged = bool(args.get("staged", False))
         unstaged = bool(args.get("unstaged", True))
         context = int(args.get("context_lines", 3))
         max_bytes = int(args.get("max_bytes", 262144))
-        path_filters = self._git_path_filters(args)
-        if not self._is_git_repo(self.workspace.root, env=git_env):
-            return self._fallback_diff(path_filters, max_bytes)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
+        if repo_root is None:
+            return self._fallback_diff(
+                self._git_fallback_path_filters(args, workdir=workdir.path),
+                max_bytes,
+            )
+        path_filters = self._git_path_filters(
+            args,
+            workdir=workdir.path,
+            repo_root=repo_root,
+        )
         chunks: list[bytes] = []
         if unstaged:
-            chunks.append(self._run_git_diff(git, context, path_filters, cached=False, env=git_env))
+            chunks.append(
+                self._run_git_diff(
+                    git,
+                    workdir.path,
+                    context,
+                    path_filters,
+                    cached=False,
+                    env=git_env,
+                )
+            )
         if staged:
-            chunks.append(self._run_git_diff(git, context, path_filters, cached=True, env=git_env))
+            chunks.append(
+                self._run_git_diff(
+                    git,
+                    workdir.path,
+                    context,
+                    path_filters,
+                    cached=True,
+                    env=git_env,
+                )
+            )
         combined = b""
         for chunk in chunks:
             if combined and chunk and not combined.endswith(b"\n"):
@@ -3601,6 +3718,7 @@ class Runtime:
         diff_text = diff_truncation.content
         truncated = diff_truncation.truncated
         return {
+            "workdir": workdir.display,
             "diff": diff_text,
             "files": parse_diff_files(diff_text),
             **truncation_fields(diff_truncation),
@@ -3608,9 +3726,16 @@ class Runtime:
         }
 
     def _run_git_diff(
-        self, git: str, context: int, path_filters: list[str], *, cached: bool, env: dict[str, str] | None = None
+        self,
+        git: str,
+        workdir: Path,
+        context: int,
+        path_filters: list[str],
+        *,
+        cached: bool,
+        env: dict[str, str] | None = None,
     ) -> bytes:
-        cmd = [git, "-C", str(self.workspace.root), "diff", f"--unified={context}"]
+        cmd = [git, "-C", str(workdir), "diff", f"--unified={context}"]
         if cached:
             cmd.append("--cached")
         if path_filters:
@@ -3661,18 +3786,23 @@ class Runtime:
     def git_log(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
-        requested_path = str(args.get("path", "."))
-        resolved = self.resolve_existing(requested_path)
-        if not self._is_git_repo(resolved.path, env=git_env):
+        workdir = self._resolve_git_workdir(args)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
+        if repo_root is None:
             return {"is_repo": False, "commits": [], "truncated": False, "warnings": []}
         ref = validate_git_ref(str(args.get("ref", "HEAD")))
         max_count = int(args.get("max_count", 20))
         skip = int(args.get("skip", 0))
-        path_filter = resolved.display
+        path_filters = self._git_path_filters(
+            args,
+            workdir=workdir.path,
+            repo_root=repo_root,
+        )
+        path_filter = path_filters[0] if path_filters else "."
         cmd = [
             git,
             "-C",
-            str(self.workspace.root),
+            str(workdir.path),
             "log",
             f"--max-count={max_count + 1}",
             f"--skip={skip}",
@@ -3680,8 +3810,9 @@ class Runtime:
             "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s%x1e",
             ref,
         ]
-        if path_filter != ".":
-            cmd.extend(["--", path_filter])
+        if path_filters:
+            cmd.append("--")
+            cmd.extend(path_filters)
         completed = self._run_git_text(cmd, timeout=10, env=git_env)
         if completed.returncode != 0:
             raise ToolFailure("GIT_ERROR", completed.stderr.strip() or "git log failed", category="runtime")
@@ -3703,6 +3834,7 @@ class Runtime:
         truncated = len(commits) > max_count
         result = {
             "is_repo": True,
+            "workdir": workdir.display,
             "ref": ref,
             "path": path_filter,
             "max_count": max_count,
@@ -3712,31 +3844,40 @@ class Runtime:
             "warnings": ["commit limit reached"] if truncated else [],
         }
         if truncated:
+            next_arguments: dict[str, Any] = {
+                "workdir": workdir.display,
+                "ref": ref,
+                "max_count": max_count,
+                "skip": skip + max_count,
+            }
+            if path_filters:
+                next_arguments["path"] = path_filter
             result["next_action"] = {
                 "tool": "git_log",
-                "arguments": {
-                    "path": requested_path,
-                    "ref": ref,
-                    "max_count": max_count,
-                    "skip": skip + max_count,
-                },
+                "arguments": next_arguments,
             }
         return result
 
     def git_show(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
-        if not self._is_git_repo(self.workspace.root, env=git_env):
+        workdir = self._resolve_git_workdir(args)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
+        if repo_root is None:
             return {"is_repo": False, "content": "", "files": [], "truncated": False, "warnings": []}
         rev = validate_git_ref(str(args.get("rev", "HEAD")))
         context = int(args.get("context_lines", 3))
         max_bytes = int(args.get("max_bytes", 262144))
         include_diff = bool(args.get("include_diff", True))
-        normalized_filters = self._git_path_filters(args)
+        normalized_filters = self._git_path_filters(
+            args,
+            workdir=workdir.path,
+            repo_root=repo_root,
+        )
         cmd = [
             git,
             "-C",
-            str(self.workspace.root),
+            str(workdir.path),
             "show",
             "--no-ext-diff",
             "--format=fuller",
@@ -3755,6 +3896,7 @@ class Runtime:
         content = truncation.content
         return {
             "is_repo": True,
+            "workdir": workdir.display,
             "rev": rev,
             "content": content,
             "files": parse_diff_files(content),
@@ -3765,12 +3907,21 @@ class Runtime:
     def git_blame(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
+        workdir = self._resolve_git_workdir(args)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
         requested_path = str(args.get("path", ""))
-        resolved = self.resolve_existing(requested_path)
+        resolved = self.workspace.resolve_existing_at(workdir.path, requested_path)
         if resolved.path.is_dir():
             raise ToolFailure("IS_DIRECTORY", "Path is a directory.", category="validation")
-        if not self._is_git_repo(self.workspace.root, env=git_env):
+        if repo_root is None:
             return {"is_repo": False, "path": resolved.display, "lines": [], "truncated": False, "warnings": []}
+        if not is_relative_to(resolved.path, repo_root):
+            raise ToolFailure(
+                "PATH_OUTSIDE_WORKSPACE",
+                "Blame path escapes the selected repository.",
+                category="security",
+            )
+        blame_path = Path(os.path.relpath(resolved.path, workdir.path)).as_posix()
         ref_arg = args.get("rev")
         ref = validate_git_ref(str(ref_arg)) if isinstance(ref_arg, str) and ref_arg else None
         start_line = int(args.get("start_line", 1))
@@ -3788,7 +3939,7 @@ class Runtime:
         cmd = [
             git,
             "-C",
-            str(self.workspace.root),
+            str(workdir.path),
             "blame",
             "--line-porcelain",
             "-L",
@@ -3796,7 +3947,7 @@ class Runtime:
         ]
         if ref:
             cmd.append(ref)
-        cmd.extend(["--", resolved.display])
+        cmd.extend(["--", blame_path])
         completed = self._run_git_text(cmd, timeout=10, env=git_env)
         if completed.returncode != 0:
             raise ToolFailure("GIT_ERROR", completed.stderr.strip() or "git blame failed", category="runtime")
@@ -3806,6 +3957,7 @@ class Runtime:
             truncated = True
         result = {
             "is_repo": True,
+            "workdir": workdir.display,
             "path": resolved.display,
             "rev": ref,
             "start_line": start_line,
@@ -3817,6 +3969,7 @@ class Runtime:
         }
         if truncated and final_line < requested_final_line:
             next_arguments: dict[str, Any] = {
+                "workdir": workdir.display,
                 "path": requested_path,
                 "start_line": final_line + 1,
                 "end_line": requested_final_line,
@@ -5188,6 +5341,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_status": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": {**string, "default": "."},
                 "include_untracked": {**boolean, "default": True},
                 "max_entries": {**integer, "minimum": 1, "maximum": 10000, "default": 1000},
@@ -5195,6 +5349,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_diff": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": string,
                 "paths": string_array,
                 "staged": {**boolean, "default": False},
@@ -5205,6 +5360,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_log": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": {**string, "default": "."},
                 "ref": {**string, "default": "HEAD"},
                 "max_count": {**integer, "minimum": 1, "maximum": 100, "default": 20},
@@ -5213,6 +5369,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_show": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "rev": {**string, "default": "HEAD"},
                 "path": string,
                 "paths": string_array,
@@ -5223,6 +5380,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_blame": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": {**string, "minLength": 1},
                 "rev": string,
                 "start_line": {**integer, "minimum": 1, "default": 1},

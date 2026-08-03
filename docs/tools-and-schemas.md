@@ -32,11 +32,16 @@ The default catalog contains exactly 24 tools:
 - `write_stdin`: poll or interact with a running command.
 - `kill_command`: terminate one runtime-owned command.
 - `read_output`: page retained stdout or stderr using absolute byte offsets.
-- `git_status`: structured working-tree status.
-- `git_diff`: bounded unified staged/unstaged diff.
-- `git_log`: structured bounded commit history.
-- `git_show`: bounded revision metadata/content/diff.
-- `git_blame`: structured bounded line attribution.
+- `git_status`: structured working-tree status for an explicit repository
+  `workdir`; legacy `path` remains a directory alias.
+- `git_diff`: bounded unified staged/unstaged diff with repository `workdir`
+  separate from optional `path`/`paths` filters.
+- `git_log`: structured bounded commit history for an explicit repository
+  `workdir` and optional relative path filter.
+- `git_show`: bounded revision metadata/content/diff from an explicit repository
+  `workdir`.
+- `git_blame`: structured bounded line attribution for a file relative to an
+  explicit repository `workdir`.
 - `request_permissions`: report elicitation status without silently granting.
 - `view_image`: one MCP image content block plus structured metadata.
 
@@ -132,8 +137,10 @@ Page a truncated stream using the returned reference:
 {"path":"src"}
 ```
 
-It may reset after the client reconnects. `exec_command.workdir` and each
-file/Git tool's `path` argument are the reliable source of truth.
+It may reset after the client reconnects. `exec_command.workdir` and each file
+tool's `path` argument are the reliable source of truth. Git tools use
+`workdir` to select a repository in a multi-project workspace; their `path` and
+`paths` arguments are file filters relative to that repository.
 
 Discover project-scoped skills using an explicit work directory:
 
