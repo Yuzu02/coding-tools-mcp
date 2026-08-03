@@ -36,6 +36,9 @@ are fixed.
 - MCP `2025-11-25` is current; `2025-06-18` is explicitly supported.
 - Streamable HTTP uses `/mcp`; stdio uses newline-delimited JSON-RPC.
 - Every HTTP `Mcp-Session-Id` owns an independent `Runtime`.
+- HTTP session retention is configurable. `stateful` preserves a one-hour idle
+  TTL; `ephemeral` uses a 60-second idle TTL and LRU idle eviction at capacity.
+  Sessions with active requests are never expired or evicted.
 - JSON-RPC batches are rejected, cancellation follows `requestId`, and
   unimplemented logging is not advertised.
 - `content` is agent-readable text normally sized by each tool's per-call

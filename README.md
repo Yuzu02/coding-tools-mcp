@@ -71,6 +71,11 @@ compatibility). A one-line installer, per-client walkthroughs, and
 troubleshooting live in [docs/quickstart.md](docs/quickstart.md) and
 [docs/mcp-client-config.md](docs/mcp-client-config.md).
 
+Clients that initialize a fresh session for each tool call should add
+`--http-session-mode ephemeral`. Idle sessions then expire after 60 seconds and
+the least-recently-used idle session is evicted at capacity; active requests are
+never evicted. Stateful clients retain the one-hour default.
+
 On Windows, string commands run through PowerShell 7 (`pwsh`) with
 `-NoLogo -NoProfile -NonInteractive`. Set
 `CODING_TOOLS_MCP_PWSH_PATH` to an absolute trusted `pwsh.exe` path to pin

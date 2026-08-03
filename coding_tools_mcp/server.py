@@ -79,7 +79,14 @@ from .project_context import ProjectContext, load_project_context
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
-from .transport_http import HTTPSessionManager
+from .transport_http import (
+    EPHEMERAL_HTTP_SESSION_TTL_SECONDS,
+    HTTP_SESSION_MODE_CHOICES,
+    HTTP_SESSION_TTL_SECONDS,
+    MAX_HTTP_SESSIONS,
+    HTTPSessionManager,
+    HTTPSessionOptions,
+)
 from .transport_stdio import serve_stdio
 
 
@@ -457,6 +464,42 @@ def env_int(name: str, fallback: int) -> int:
         return int(raw) if raw else fallback
     except ValueError:
         return fallback
+
+
+def env_float(name: str) -> float | None:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def http_session_options_from_args(args: argparse.Namespace) -> HTTPSessionOptions:
+    mode = str(args.http_session_mode)
+    if mode not in HTTP_SESSION_MODE_CHOICES:
+        raise ValueError(f"http session mode must be one of: {', '.join(HTTP_SESSION_MODE_CHOICES)}")
+    max_sessions = int(args.http_session_max_sessions)
+    if max_sessions < 1:
+        raise ValueError("http session max sessions must be at least 1")
+    configured_ttl = args.http_session_idle_ttl_seconds
+    idle_ttl_seconds = (
+        float(configured_ttl)
+        if configured_ttl is not None
+        else (
+            EPHEMERAL_HTTP_SESSION_TTL_SECONDS
+            if mode == "ephemeral"
+            else HTTP_SESSION_TTL_SECONDS
+        )
+    )
+    if idle_ttl_seconds <= 0:
+        raise ValueError("http session idle TTL must be greater than 0 seconds")
+    return HTTPSessionOptions(
+        max_sessions=max_sessions,
+        idle_ttl_seconds=idle_ttl_seconds,
+        evict_idle_on_capacity=mode == "ephemeral",
+    )
 
 
 def configured_runtime_root() -> Path | None:
@@ -5359,6 +5402,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         method = request.get("method")
         session_id = self.headers.get("Mcp-Session-Id")
         created_session = False
+        managed_session_id: str | None = None
         if method == "initialize":
             if session_id:
                 self.send_rpc_error(
@@ -5366,46 +5410,52 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             try:
-                self._runtime = self.server.sessions.create()  # type: ignore[attr-defined]
+                self._runtime = self.server.sessions.create(active=True)  # type: ignore[attr-defined]
             except RuntimeError as exc:
                 self.send_rpc_error(-32000, str(exc), status=503, request_id=request.get("id"))
                 return
+            managed_session_id = self.runtime.http_session_id
             self._send_session_header = True
             created_session = True
         elif session_id:
-            runtime = self.server.sessions.get(session_id)  # type: ignore[attr-defined]
+            runtime = self.server.sessions.acquire(session_id)  # type: ignore[attr-defined]
             if runtime is None:
                 self.send_rpc_error(
                     -32001, "Unknown MCP session", status=404, request_id=response_id(request)
                 )
                 return
             self._runtime = runtime
+            managed_session_id = session_id
             self._send_session_header = True
-            if protocol_version != runtime.protocol_version:
-                self.send_rpc_error(
-                    -32600,
-                    "MCP-Protocol-Version does not match the initialized session",
-                    request_id=request.get("id"),
-                    data={"expected": runtime.protocol_version, "received": protocol_version},
-                )
-                return
         elif method == "ping":
             self._runtime = self.server.control_runtime  # type: ignore[attr-defined]
         else:
             self.send_rpc_error(-32002, "Server not initialized", request_id=request.get("id"))
             return
-        response = self.handle_rpc(request)
-        if created_session and response is not None and "error" in response:
-            self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
-            self._send_session_header = False
-        if response is None:
-            self.send_response(202)
-            if getattr(self, "_send_session_header", False):
-                self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
-            self.send_cors_headers()
-            self.end_headers()
-            return
-        self.send_json(response)
+        try:
+            if session_id and protocol_version != self.runtime.protocol_version:
+                self.send_rpc_error(
+                    -32600,
+                    "MCP-Protocol-Version does not match the initialized session",
+                    request_id=request.get("id"),
+                    data={"expected": self.runtime.protocol_version, "received": protocol_version},
+                )
+                return
+            response = self.handle_rpc(request)
+            if created_session and response is not None and "error" in response:
+                self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
+                self._send_session_header = False
+            if response is None:
+                self.send_response(202)
+                if getattr(self, "_send_session_header", False):
+                    self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
+                self.send_cors_headers()
+                self.end_headers()
+                return
+            self.send_json(response)
+        finally:
+            if managed_session_id is not None:
+                self.server.sessions.release(managed_session_id)  # type: ignore[attr-defined]
 
     def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
         try:
@@ -5811,10 +5861,17 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
         handler: type[MCPHandler],
         control_runtime: Runtime,
         runtime_factory: Any,
+        session_options: HTTPSessionOptions | None = None,
     ) -> None:
         super().__init__(address, handler)
         self.control_runtime = control_runtime
-        self.sessions = HTTPSessionManager(runtime_factory)
+        options = session_options or HTTPSessionOptions()
+        self.sessions = HTTPSessionManager(
+            runtime_factory,
+            max_sessions=options.max_sessions,
+            idle_ttl_seconds=options.idle_ttl_seconds,
+            evict_idle_on_capacity=options.evict_idle_on_capacity,
+        )
 
     def server_close(self) -> None:
         self.sessions.close()
@@ -5986,7 +6043,19 @@ def run_http(args: argparse.Namespace) -> int:
             command_manager=runtime.command_manager,
         )
 
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)
+    try:
+        session_options = http_session_options_from_args(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        runtime.close()
+        return 2
+    server = RuntimeHTTPServer(
+        (args.host, args.port),
+        MCPHandler,
+        runtime,
+        runtime_factory,
+        session_options=session_options,
+    )
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
         suffix = " + bearer" if runtime.auth_token else ""
@@ -5997,6 +6066,12 @@ def run_http(args: argparse.Namespace) -> int:
         auth_label = "no auth configured"
     base_url = _http_base_for_bind_host(str(args.host), args.port)
     print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
+    print(
+        "HTTP sessions: "
+        f"mode={args.http_session_mode}, max={session_options.max_sessions}, "
+        f"idle_ttl_seconds={session_options.idle_ttl_seconds}",
+        file=sys.stderr,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -6031,6 +6106,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"bind port; defaults to {ENV_PREFIX}_PORT or 8000",
     )
     parser.add_argument("--stdio", action="store_true", help="serve newline-delimited JSON-RPC over stdio")
+    parser.add_argument(
+        "--http-session-mode",
+        choices=HTTP_SESSION_MODE_CHOICES,
+        default=os.environ.get(f"{ENV_PREFIX}_HTTP_SESSION_MODE") or "stateful",
+        help=(
+            "HTTP session retention: stateful keeps idle sessions for one hour; "
+            "ephemeral expires them after 60 seconds and evicts the least-recently-used idle session at capacity"
+        ),
+    )
+    parser.add_argument(
+        "--http-session-idle-ttl-seconds",
+        type=float,
+        default=env_float(f"{ENV_PREFIX}_HTTP_SESSION_IDLE_TTL_SECONDS"),
+        help=(
+            "override the idle session TTL; defaults to 3600 in stateful mode or 60 in ephemeral mode"
+        ),
+    )
+    parser.add_argument(
+        "--http-session-max-sessions",
+        type=int,
+        default=env_int(f"{ENV_PREFIX}_HTTP_SESSION_MAX_SESSIONS", MAX_HTTP_SESSIONS),
+        help=f"maximum retained HTTP sessions; defaults to {MAX_HTTP_SESSIONS}",
+    )
     parser.add_argument(
         "--auth-token",
         default=None,

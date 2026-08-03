@@ -126,6 +126,31 @@ the selected transport runtime; it does not terminate workspace commands. HTTP
 sessions are bounded and expire after inactivity, while commands keep their own
 existing timeout, count, output, and retention limits.
 
+The default `stateful` mode retains idle sessions for one hour and rejects new
+initializations after 128 retained sessions. Use `ephemeral` for tunnel clients
+that routinely abandon each transport session after one tool call:
+
+```bash
+coding-tools-mcp --workspace /path/to/repo --http-session-mode ephemeral
+```
+
+Ephemeral mode expires an idle session after 60 seconds. If the configured
+capacity is reached first, it closes the least-recently-used idle session and
+accepts the new initialization. A session currently processing a request is
+never expired or evicted. Commands remain available through `command_id` and
+`client_request_id` because their manager is workspace-scoped rather than tied
+to the HTTP session.
+
+The policy can be tuned with:
+
+```text
+--http-session-idle-ttl-seconds <seconds>
+--http-session-max-sessions <count>
+CODING_TOOLS_MCP_HTTP_SESSION_MODE
+CODING_TOOLS_MCP_HTTP_SESSION_IDLE_TTL_SECONDS
+CODING_TOOLS_MCP_HTTP_SESSION_MAX_SESSIONS
+```
+
 This implementation returns `405` for `GET /mcp` because it does not provide an
 SSE stream. It rejects JSON-RPC batches and accepts standard
 `notifications/cancelled` messages using `params.requestId`.
