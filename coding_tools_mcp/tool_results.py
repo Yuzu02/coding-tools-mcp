@@ -181,6 +181,8 @@ def _render_exec(payload: dict[str, Any]) -> str:
         header.append(f"signal {payload['signal']}")
     if payload.get("timed_out"):
         header.append("timed out")
+    if payload.get("deduplicated"):
+        header.append("deduplicated retry")
     elapsed_ms = payload.get("elapsed_ms")
     if isinstance(elapsed_ms, (int, float)):
         header.append(f"{int(elapsed_ms)} ms")
@@ -209,6 +211,27 @@ def _render_exec(payload: dict[str, Any]) -> str:
         else:
             sections.append("Output truncated; use read_output with the returned output_ref to read more.")
     return "\n".join(sections)
+
+
+def _render_list_commands(payload: dict[str, Any]) -> str:
+    raw_commands = payload.get("commands")
+    commands: list[Any] = raw_commands if isinstance(raw_commands, list) else []
+    total = payload.get("total", len(commands))
+    lines = [f"Commands: {len(commands)} shown of {total}."]
+    if payload.get("pending"):
+        lines.append("A matching client_request_id is reserved while its command is still starting.")
+    for item in commands:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("command_id", ""))
+        client_request_id = item.get("client_request_id")
+        if isinstance(client_request_id, str) and client_request_id:
+            label += f" [{client_request_id}]"
+        status = str(item.get("status", "unknown"))
+        exit_code = item.get("exit_code")
+        suffix = f", exit {exit_code}" if exit_code is not None else ""
+        lines.append(f"- {label}: {status}{suffix}")
+    return "\n".join(lines)
 
 
 def _render_read_output(payload: dict[str, Any]) -> str:
@@ -397,6 +420,8 @@ _RENDERERS = {
     "search_text": _render_search,
     "apply_patch": _render_patch,
     "exec_command": _render_exec,
+    "list_commands": _render_list_commands,
+    "get_command": _render_exec,
     "write_stdin": _render_exec,
     "kill_command": _render_kill,
     "read_output": _render_read_output,

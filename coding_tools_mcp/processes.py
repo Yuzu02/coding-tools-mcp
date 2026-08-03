@@ -276,6 +276,7 @@ def spawn_process(
 class CommandRun:
     command_id: str
     process: subprocess.Popen[bytes]
+    client_request_id: str | None = None
     timeout_at: float | None = None
     warnings: list[str] = field(default_factory=list)
     stdout: bytearray = field(default_factory=bytearray)
@@ -352,30 +353,29 @@ class CommandRun:
             except OSError:
                 pass
 
-    def snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
-        self.refresh_status()
-        with self.lock:
-            stdout_omitted = max(0, self.stdout_start_offset - self.stdout_cursor)
-            stderr_omitted = max(0, self.stderr_start_offset - self.stderr_cursor)
-            stdout_start = max(0, self.stdout_cursor - self.stdout_start_offset)
-            stderr_start = max(0, self.stderr_cursor - self.stderr_start_offset)
-            stdout_bytes = bytes(self.stdout[stdout_start:])
-            stderr_bytes = bytes(self.stderr[stderr_start:])
-            self.stdout_cursor = self.stdout_total_bytes
-            self.stderr_cursor = self.stderr_total_bytes
+    def current_status(self) -> str:
+        if self.timed_out:
+            return "timeout"
+        if self.terminating and self.process.poll() is None:
+            return "running"
+        if self.signal_name is not None:
+            return "terminated"
+        return "running" if self.process.poll() is None else "exited"
+
+    def _snapshot_payload(
+        self,
+        stdout_bytes: bytes,
+        stderr_bytes: bytes,
+        *,
+        stdout_omitted: int,
+        stderr_omitted: int,
+        max_output_bytes: int,
+    ) -> dict[str, Any]:
         stdout_truncation = truncate_output_bytes_tail(stdout_bytes, max_output_bytes)
         stderr_truncation = truncate_output_bytes_tail(stderr_bytes, max_output_bytes)
-        if self.timed_out:
-            status = "timeout"
-        elif self.terminating and self.process.poll() is None:
-            status = "running"
-        elif self.signal_name is not None:
-            status = "terminated"
-        else:
-            status = "running" if self.process.poll() is None else "exited"
         payload: dict[str, Any] = {
             "command_id": self.command_id,
-            "status": status,
+            "status": self.current_status(),
             "exit_code": self.exit_code,
             "signal": self.signal_name,
             "timed_out": self.timed_out,
@@ -401,6 +401,8 @@ class CommandRun:
             ),
             "ok": True,
         }
+        if self.client_request_id is not None:
+            payload["client_request_id"] = self.client_request_id
         warnings: list[str] = list(self.warnings)
         if stdout_truncation.truncated:
             warnings.append(f"stdout truncated from tail by {stdout_truncation.truncated_by}")
@@ -413,6 +415,42 @@ class CommandRun:
         if warnings:
             payload["warnings"] = warnings
         return payload
+
+    def snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
+        self.refresh_status()
+        with self.lock:
+            stdout_omitted = max(0, self.stdout_start_offset - self.stdout_cursor)
+            stderr_omitted = max(0, self.stderr_start_offset - self.stderr_cursor)
+            stdout_start = max(0, self.stdout_cursor - self.stdout_start_offset)
+            stderr_start = max(0, self.stderr_cursor - self.stderr_start_offset)
+            stdout_bytes = bytes(self.stdout[stdout_start:])
+            stderr_bytes = bytes(self.stderr[stderr_start:])
+            self.stdout_cursor = self.stdout_total_bytes
+            self.stderr_cursor = self.stderr_total_bytes
+        return self._snapshot_payload(
+            stdout_bytes,
+            stderr_bytes,
+            stdout_omitted=stdout_omitted,
+            stderr_omitted=stderr_omitted,
+            max_output_bytes=max_output_bytes,
+        )
+
+    def snapshot_retained(self, max_output_bytes: int) -> dict[str, Any]:
+        """Return retained output without advancing the polling cursors."""
+
+        self.refresh_status()
+        with self.lock:
+            stdout_bytes = bytes(self.stdout)
+            stderr_bytes = bytes(self.stderr)
+            stdout_omitted = self.stdout_start_offset
+            stderr_omitted = self.stderr_start_offset
+        return self._snapshot_payload(
+            stdout_bytes,
+            stderr_bytes,
+            stdout_omitted=stdout_omitted,
+            stderr_omitted=stderr_omitted,
+            max_output_bytes=max_output_bytes,
+        )
 
     def refresh_status(self) -> None:
         if self.timeout_at is not None and not self.timed_out and self.process.poll() is None and time.time() >= self.timeout_at:

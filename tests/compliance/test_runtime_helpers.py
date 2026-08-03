@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import os
 import shlex
 import signal
@@ -1187,6 +1188,181 @@ Maven home: /usr/share/maven
                         pass
                 runtime.close()
 
+    def test_exec_command_client_request_id_deduplicates_equivalent_retries(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            command_ids: set[str] = set()
+            try:
+                first = runtime.exec_command(
+                    {
+                        "cmd": "sleep 5",
+                        "timeout_ms": 10_000,
+                        "yield_time_ms": 0,
+                        "client_request_id": "retry-equivalent-1",
+                    }
+                )
+                command_ids.add(str(first["command_id"]))
+                second = runtime.exec_command(
+                    {
+                        "cmd": "sleep 5",
+                        "timeout_ms": 10_000,
+                        "yield_time_ms": 0,
+                        "verbosity": "summary",
+                        "client_request_id": "retry-equivalent-1",
+                    }
+                )
+                command_ids.add(str(second["command_id"]))
+
+                self.assertEqual(second.get("command_id"), first.get("command_id"))
+                self.assertIs(second.get("deduplicated"), True)
+                self.assertEqual(second.get("client_request_id"), "retry-equivalent-1")
+                self.assertEqual(len(runtime.commands), 1)
+            finally:
+                for command_id in command_ids:
+                    try:
+                        runtime.kill_command({"command_id": command_id, "signal": "KILL"})
+                    except ToolFailure:
+                        pass
+                runtime.close()
+
+    def test_exec_command_client_request_id_is_atomic_across_concurrent_callers(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            barrier = threading.Barrier(3)
+            results: list[dict[str, object]] = []
+            failures: list[BaseException] = []
+            result_lock = threading.Lock()
+
+            def call() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    result = runtime.exec_command(
+                        {
+                            "cmd": "sleep 5",
+                            "timeout_ms": 10_000,
+                            "yield_time_ms": 0,
+                            "client_request_id": "retry-concurrent-1",
+                        }
+                    )
+                    with result_lock:
+                        results.append(result)
+                except BaseException as exc:
+                    with result_lock:
+                        failures.append(exc)
+
+            threads = [threading.Thread(target=call) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=5)
+            for thread in threads:
+                thread.join(timeout=10)
+
+            try:
+                self.assertEqual(failures, [])
+                self.assertEqual(len(results), 2)
+                command_ids = {str(result["command_id"]) for result in results}
+                self.assertEqual(len(command_ids), 1)
+                self.assertEqual(sum(result.get("deduplicated") is True for result in results), 1)
+                self.assertEqual(len(runtime.commands), 1)
+            finally:
+                for command_id in {str(result["command_id"]) for result in results}:
+                    try:
+                        runtime.kill_command({"command_id": command_id, "signal": "KILL"})
+                    except ToolFailure:
+                        pass
+                runtime.close()
+
+    def test_exec_command_client_request_id_rejects_conflicting_reuse(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            command_ids: set[str] = set()
+            conflict: ToolFailure | None = None
+            try:
+                first = runtime.exec_command(
+                    {
+                        "cmd": "sleep 5",
+                        "timeout_ms": 10_000,
+                        "yield_time_ms": 0,
+                        "client_request_id": "retry-conflict-1",
+                    }
+                )
+                command_ids.add(str(first["command_id"]))
+                try:
+                    duplicate = runtime.exec_command(
+                        {
+                            "cmd": "sleep 4",
+                            "timeout_ms": 10_000,
+                            "yield_time_ms": 0,
+                            "client_request_id": "retry-conflict-1",
+                        }
+                    )
+                    command_ids.add(str(duplicate["command_id"]))
+                except ToolFailure as exc:
+                    conflict = exc
+
+                self.assertIsNotNone(conflict)
+                assert conflict is not None
+                self.assertEqual(conflict.code, "IDEMPOTENCY_CONFLICT")
+                self.assertIs(conflict.retryable, False)
+                self.assertEqual(len(runtime.commands), 1)
+            finally:
+                for command_id in command_ids:
+                    try:
+                        runtime.kill_command({"command_id": command_id, "signal": "KILL"})
+                    except ToolFailure:
+                        pass
+                runtime.close()
+
+    def test_command_discovery_recovers_output_without_consuming_it_or_exposing_inputs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            try:
+                command = "Write-Output alpha" if os.name == "nt" else "printf 'alpha\\n'"
+                executed = runtime.exec_command(
+                    {
+                        "cmd": command,
+                        "env": {"RECOVERY_TEST_VALUE": "must-not-be-listed"},
+                        "timeout_ms": 5_000,
+                        "yield_time_ms": 5_000,
+                        "client_request_id": "recover-output-1",
+                    }
+                )
+                self.assertEqual(executed.get("status"), "exited", executed)
+
+                first = runtime.get_command(
+                    {
+                        "client_request_id": "recover-output-1",
+                        "verbosity": "preview",
+                        "preview_bytes": 64,
+                    }
+                )
+                second = runtime.get_command(
+                    {
+                        "command_id": executed["command_id"],
+                        "verbosity": "preview",
+                        "preview_bytes": 64,
+                    }
+                )
+                self.assertEqual(first.get("command_id"), executed.get("command_id"))
+                self.assertEqual(second.get("command_id"), executed.get("command_id"))
+                self.assertIn("alpha", str(first.get("preview", "")))
+                self.assertIn("alpha", str(second.get("preview", "")))
+
+                listing = runtime.list_commands(
+                    {"client_request_id": "recover-output-1", "limit": 10}
+                )
+                self.assertEqual(listing.get("count"), 1, listing)
+                item = listing["commands"][0]
+                self.assertEqual(item.get("command_id"), executed.get("command_id"))
+                self.assertEqual(item.get("client_request_id"), "recover-output-1")
+                serialized = json.dumps(listing, sort_keys=True)
+                self.assertNotIn(command, serialized)
+                self.assertNotIn("must-not-be-listed", serialized)
+                self.assertNotIn("env", item)
+                self.assertNotIn("cmd", item)
+            finally:
+                runtime.close()
+
     def test_initialize_injects_root_instructions_and_indexes_nested_instructions(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -1351,7 +1527,8 @@ Maven home: /usr/share/maven
                 stderr_ref = output_refs["stderr"]
 
                 first: dict[str, object] = {}
-                for _ in range(10):
+                output_deadline = time.time() + 2
+                while time.time() < output_deadline:
                     first = runtime.read_output({"output_ref": stderr_ref, "offset": 0, "limit": 5})
                     if first.get("content"):
                         break

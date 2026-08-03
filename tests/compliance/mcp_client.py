@@ -33,6 +33,8 @@ REQUIRED_TOOLS = (
     "search_text",
     "apply_patch",
     "exec_command",
+    "list_commands",
+    "get_command",
     "write_stdin",
     "kill_command",
     "read_output",

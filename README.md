@@ -121,8 +121,9 @@ coding-tools-mcp-desktop
 Per-workspace profiles, server and tunnel start/stop, credential setup with
 clipboard helpers, live health checks. English and 简体中文.
 
-**6. Keep an interactive command alive.** `exec_command` starts a REPL or
+**6. Keep and recover an interactive command.** `exec_command` starts a REPL or
 debugger under a real POSIX PTY; `write_stdin` feeds it across turns;
+`list_commands` and `get_command` recover a handle after a lost response;
 `read_output` pages long output; `kill_command` cleans up. Long-running
 processes are first-class, with deadline watchdogs and bounded buffers.
 Windows uses PowerShell 7 for non-TTY commands; ConPTY remains a separate
@@ -143,7 +144,7 @@ rollback.
 | Group | Tools |
 | --- | --- |
 | Files & search | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
-| Execution | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
+| Execution | `exec_command` · `list_commands` · `get_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
 | Runtime | `server_info` · `check_exec_environment` · `get_default_cwd` · `set_default_cwd` |
 

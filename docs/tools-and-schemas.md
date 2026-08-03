@@ -6,7 +6,7 @@ properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The default catalog contains exactly 20 tools:
+The default catalog contains exactly 22 tools:
 
 - `server_info`: server, workspace, automatic project context, policy, runtime,
   auth, protocol, and fixed-catalog metadata.
@@ -20,7 +20,11 @@ The default catalog contains exactly 20 tools:
   controls.
 - `search_text`: literal or regex search; ripgrep stops after the result cap.
 - `apply_patch`: stage and atomically commit add/update/delete/move envelopes.
-- `exec_command`: run a bounded command and wait up to 10 seconds by default.
+- `exec_command`: run a bounded command and optionally deduplicate retries with
+  `client_request_id`.
+- `list_commands`: list bounded active and retained command metadata.
+- `get_command`: recover one command by `command_id` or `client_request_id`
+  without consuming its output cursor.
 - `write_stdin`: poll or interact with a running command.
 - `kill_command`: terminate one runtime-owned command.
 - `read_output`: page retained stdout or stderr using absolute byte offsets.
@@ -33,7 +37,7 @@ The default catalog contains exactly 20 tools:
 - `view_image`: one MCP image content block plus structured metadata.
 
 `view_image` may be disabled when an installation cannot accept binary image
-content. That capability gate is not a tool profile. The other 19 tools are
+content. That capability gate is not a tool profile. The other 21 tools are
 always advertised, and `listChanged` is `false`.
 
 ## Result envelope
@@ -86,13 +90,24 @@ Mode bits, BOM, and newline style are preserved; moves inherit source mode.
 Use explicit paths for multi-call workflows:
 
 ```json
-{"cmd":"pytest -q","workdir":".","yield_time_ms":30000}
+{"cmd":"pytest -q","workdir":".","yield_time_ms":30000,"client_request_id":"tests-20260803-01"}
 ```
 
 If the result is still running, copy its `command_id` exactly:
 
 ```json
 {"command_id":"abc","chars":"","yield_time_ms":10000}
+```
+
+If a transport failure hides the original `exec_command` response, retry with
+the same `client_request_id` or recover it explicitly:
+
+```json
+{"client_request_id":"tests-20260803-01"}
+```
+
+```json
+{"status":"all","limit":50}
 ```
 
 Terminate that command when needed:
@@ -121,7 +136,10 @@ file/Git tool's `path` argument are the reliable source of truth.
 `exec_command` and `write_stdin` default `yield_time_ms` to `10000`. Short
 commands ordinarily return `status: "exited"` in one call. A still-running
 command returns a `command_id` and a machine-readable `next_action` for
-`write_stdin` with empty `chars`.
+`write_stdin` with empty `chars`. Reusing a `client_request_id` with equivalent
+execution inputs returns the existing command; conflicting reuse returns
+`IDEMPOTENCY_CONFLICT`. Discovery results never expose command text, stdin, or
+environment values.
 
 Only truncated terminal output returns a `read_output` next action by default.
 `output_ref` values are `command:<id>:stdout` or `command:<id>:stderr`; offsets

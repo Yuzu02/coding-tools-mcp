@@ -62,6 +62,8 @@ class MCPContractTests(ComplianceTestCase):
     def test_command_handles_have_no_legacy_session_aliases(self) -> None:
         tools = {str(tool.get("name")): tool for tool in self.client.list_tools()}
         self.assertIn("kill_command", tools)
+        self.assertIn("list_commands", tools)
+        self.assertIn("get_command", tools)
         self.assertNotIn("kill_session", tools)
         for name in ("write_stdin", "kill_command"):
             schema = tools[name]["inputSchema"]
@@ -69,6 +71,13 @@ class MCPContractTests(ComplianceTestCase):
             self.assertIn("command_id", properties)
             self.assertNotIn("session_id", properties)
             self.assertIn("command_id", schema.get("required", []))
+
+        exec_schema = tools["exec_command"]["inputSchema"]
+        self.assertIn("client_request_id", exec_schema.get("properties", {}))
+        self.assertNotIn("client_request_id", exec_schema.get("required", []))
+        get_schema = tools["get_command"]["inputSchema"]
+        self.assertIn("command_id", get_schema.get("properties", {}))
+        self.assertIn("client_request_id", get_schema.get("properties", {}))
 
         try:
             legacy = self.client.call_tool("write_stdin", {"session_id": "legacy", "chars": ""})
@@ -83,6 +92,8 @@ class MCPContractTests(ComplianceTestCase):
             "set_default_cwd": ("session", "workdir", '"path":"src"'),
             "apply_patch": ("*** Begin Patch", "*** Update File"),
             "exec_command": ("workdir", "command_id", '"yield_time_ms":30000'),
+            "list_commands": ("workspace", "client_request_id"),
+            "get_command": ("command_id", "client_request_id"),
             "write_stdin": ("command_id", '"chars":""'),
             "kill_command": ("command_id", '"signal":"KILL"'),
             "read_output": ("command:abc:stdout", '"offset":0'),
@@ -115,6 +126,39 @@ class MCPContractTests(ComplianceTestCase):
 
         original_cwd = self.assert_tool_success(self.client.call_tool("get_default_cwd", {}))
         self.assertEqual(original_cwd.get("default_cwd"), "src")
+
+    def test_fresh_http_sessions_deduplicate_and_recover_command_by_client_request_id(self) -> None:
+        request_id = "http-recovery-1"
+        arguments = {
+            "cmd": "sleep 5",
+            "timeout_ms": 10_000,
+            "yield_time_ms": 0,
+            "client_request_id": request_id,
+        }
+        first = self.assert_tool_success(self.client.call_tool("exec_command", arguments))
+        command_id = first.get("command_id")
+        self.assertIsInstance(command_id, str)
+        try:
+            with MCPClient(self.workspace.root, url=self.client.url) as sibling:
+                duplicate = self.assert_tool_success(sibling.call_tool("exec_command", arguments))
+                self.assertEqual(duplicate.get("command_id"), command_id)
+                self.assertIs(duplicate.get("deduplicated"), True)
+
+                recovered = self.assert_tool_success(
+                    sibling.call_tool("get_command", {"client_request_id": request_id})
+                )
+                self.assertEqual(recovered.get("command_id"), command_id)
+
+                listed = self.assert_tool_success(
+                    sibling.call_tool(
+                        "list_commands",
+                        {"client_request_id": request_id, "limit": 10},
+                    )
+                )
+                self.assertEqual(listed.get("count"), 1, listed)
+                self.assertEqual(listed.get("commands", [{}])[0].get("command_id"), command_id)
+        finally:
+            self.client.call_tool("kill_command", {"command_id": command_id, "signal": "KILL"})
 
     def test_http_session_delete_does_not_terminate_workspace_command(self) -> None:
         with MCPClient(self.workspace.root, url=self.client.url) as owner:

@@ -112,7 +112,7 @@ Tool failures keep the same envelope with `isError: true`, a readable error in
 Known tool error codes include:
 
 ```json
-["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "SHELL_NOT_FOUND", "SHELL_VERSION_UNSUPPORTED", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
+["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "COMMAND_STARTING", "COMMAND_START_FAILED", "IDEMPOTENCY_CONFLICT", "SHELL_NOT_FOUND", "SHELL_VERSION_UNSUPPORTED", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
 ```
 
 Error categories are `validation`, `security`, `permission`, `runtime`,
@@ -124,9 +124,10 @@ unexpected server failure `-32603`.
 
 ## Command lifecycle
 
-`exec_command`, `write_stdin`, `read_output`, and `kill_command` are always in
-the catalog. `exec_command` and `write_stdin` default to a 10-second yield. A
-short command normally finishes in one call. A running command returns:
+`exec_command`, `list_commands`, `get_command`, `write_stdin`, `read_output`,
+and `kill_command` are always in the catalog. `exec_command` and `write_stdin`
+default to a 10-second yield. A short command normally finishes in one call. A
+running command returns:
 
 ```json
 {
@@ -144,6 +145,15 @@ output is truncated or a caller explicitly requested compact retained output.
 Its offsets are absolute and independent for stdout and stderr. A single
 truncated stream is selected by `next_action`; when both streams are truncated,
 `next_actions` contains one executable `read_output` call for each stream.
+
+`exec_command.client_request_id` is an optional stable idempotency key. A retry
+with the same key and equivalent execution inputs returns the existing
+`command_id` with `deduplicated: true`; a different execution fingerprint
+returns `IDEMPOTENCY_CONFLICT`. Concurrent callers reserve the key atomically,
+so at most one subprocess starts. `list_commands` and `get_command` expose only
+bounded lifecycle/output metadata; command text, stdin, and environment values
+are never returned. `get_command` snapshots retained output without advancing
+the polling cursor used by `write_stdin`.
 
 Active processes, completed-output commands, per-command bytes, and total
 runtime bytes are bounded. Completed commands have a TTL. POSIX `tty=true` uses
@@ -167,7 +177,7 @@ survive tunnel churn. Forwarded headers are ignored unless
 
 ## Stable tool inventory
 
-The default catalog has 20 tools, including `view_image`. Setting
+The default catalog has 22 tools, including `view_image`. Setting
 `CODING_TOOLS_MCP_ENABLE_VIEW_IMAGE=0` is the sole installation capability gate
 and removes only that optional binary-content tool. It is not a tool profile.
 
@@ -267,7 +277,7 @@ Supports `*** Add File`, `*** Update File`, `*** Delete File`, and
 
 ### exec_command
 
-Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`.
+Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`, `"client_request_id"`.
 
 Annotations: `{"title":"Execute command","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}`.
 
@@ -275,7 +285,26 @@ Statuses are `exited`, `running`, `timeout`, `terminated`, or `failed`.
 Launch/policy failures use the error envelope with `status: "failed"`; signal
 exits use `terminated`. Ordinary non-zero exit codes still use `exited`.
 
-Example: `{"cmd":"pytest -q","workdir":".","yield_time_ms":30000}`.
+Example: `{"cmd":"pytest -q","workdir":".","yield_time_ms":30000,"client_request_id":"tests-20260803-01"}`.
+
+### list_commands
+
+Inputs: `"limit"`, `"status"`, `"client_request_id"`.
+
+Annotations: `{"title":"List commands","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Returns bounded active and retained command metadata. It does not expose command
+text, stdin, or environment values.
+
+### get_command
+
+Inputs: `"command_id"`, `"client_request_id"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
+
+Annotations: `{"title":"Get command","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Exactly one of `command_id` or `client_request_id` is required. The result
+recovers status and retained output without advancing the command's polling
+cursor.
 
 ### write_stdin
 

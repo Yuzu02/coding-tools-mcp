@@ -208,6 +208,9 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+CLIENT_REQUEST_ID_MAX_LENGTH = 128
+CLIENT_REQUEST_START_WAIT_SECONDS = 5.0
+CLIENT_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -662,12 +665,32 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Execute command",
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
-            "A still-running command returns command_id. Example: "
-            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}."
+            "A still-running command returns command_id. Supply one stable non-secret client_request_id to "
+            "deduplicate an uncertain retry. Example: "
+            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000,"
+            "\"client_request_id\":\"test-run-1\"}."
         ),
         destructive=True,
         open_world=True,
         error_status="failed",
+    ),
+    "list_commands": ToolSpec(
+        title="List commands",
+        description=(
+            "List bounded metadata for workspace-owned commands across MCP sessions. Filter by "
+            "client_request_id to discover an uncertain execution without exposing command text or environment values."
+        ),
+        read_only=True,
+        idempotent=True,
+    ),
+    "get_command": ToolSpec(
+        title="Get command",
+        description=(
+            "Recover one workspace-owned command by command_id or client_request_id without consuming its output cursor. "
+            "Use returned output_refs with read_output for stable paging."
+        ),
+        read_only=True,
+        idempotent=True,
     ),
     "write_stdin": ToolSpec(
         title="Write stdin",
@@ -1265,6 +1288,13 @@ class Workspace:
         return {path for path in completed.stdout.split("\0") if path}
 
 
+@dataclass
+class ClientRequestBinding:
+    fingerprint: str
+    command_id: str | None = None
+    ready: threading.Event = field(default_factory=threading.Event)
+
+
 class WorkspaceCommandManager:
     """Own commands for one workspace independently of MCP transport sessions."""
 
@@ -1277,6 +1307,8 @@ class WorkspaceCommandManager:
         )
         self.commands: dict[str, CommandRun] = {}
         self.output_commands: dict[str, CommandRun] = {}
+        self.client_requests: dict[str, ClientRequestBinding] = {}
+        self.command_client_requests: dict[str, str] = {}
         self.lock = threading.Lock()
         self.starting_commands = 0
         self.closed = False
@@ -1287,8 +1319,13 @@ class WorkspaceCommandManager:
                 return
             self.closed = True
             commands = list(self.commands.values())
+            bindings = list(self.client_requests.values())
             self.commands.clear()
             self.output_commands.clear()
+            self.client_requests.clear()
+            self.command_client_requests.clear()
+        for binding in bindings:
+            binding.ready.set()
         for command in commands:
             command.refresh_status()
             if command.process.poll() is None:
@@ -1297,6 +1334,63 @@ class WorkspaceCommandManager:
         shutil.rmtree(self.runtime_dir, ignore_errors=True)
         if self.fallback_runtime_dir is not None:
             shutil.rmtree(self.fallback_runtime_dir, ignore_errors=True)
+
+    def reserve_client_request(
+        self,
+        client_request_id: str,
+        fingerprint: str,
+    ) -> tuple[bool, ClientRequestBinding]:
+        with self.lock:
+            if self.closed:
+                raise ToolFailure(
+                    "COMMAND_CLOSED",
+                    "Workspace command manager is closed.",
+                    category="runtime",
+                )
+            existing = self.client_requests.get(client_request_id)
+            if existing is not None:
+                if existing.fingerprint != fingerprint:
+                    raise ToolFailure(
+                        "IDEMPOTENCY_CONFLICT",
+                        "client_request_id is already bound to a different command request.",
+                        category="validation",
+                        details={"client_request_id": client_request_id},
+                    )
+                return False, existing
+            binding = ClientRequestBinding(fingerprint=fingerprint)
+            self.client_requests[client_request_id] = binding
+            return True, binding
+
+    def publish_client_request(
+        self,
+        client_request_id: str,
+        binding: ClientRequestBinding,
+        command_id: str,
+    ) -> None:
+        with self.lock:
+            current = self.client_requests.get(client_request_id)
+            if current is binding:
+                binding.command_id = command_id
+                self.command_client_requests[command_id] = client_request_id
+                binding.ready.set()
+
+    def release_client_request(
+        self,
+        client_request_id: str,
+        binding: ClientRequestBinding,
+    ) -> None:
+        with self.lock:
+            if self.client_requests.get(client_request_id) is binding:
+                self.client_requests.pop(client_request_id, None)
+            binding.ready.set()
+
+    def remove_command_binding_locked(self, command_id: str) -> None:
+        client_request_id = self.command_client_requests.pop(command_id, None)
+        if client_request_id is None:
+            return
+        binding = self.client_requests.get(client_request_id)
+        if binding is not None and binding.command_id == command_id:
+            self.client_requests.pop(client_request_id, None)
 
 
 class Runtime:
@@ -2335,6 +2429,74 @@ class Runtime:
                 None if change.baseline.data is None else change.baseline.data.decode("utf-8", errors="replace")
             )
 
+    def _validated_client_request_id(self, raw: Any) -> str | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, str) or not CLIENT_REQUEST_ID_RE.fullmatch(raw):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "client_request_id must be 1-128 characters using letters, digits, '.', '_', ':', or '-'.",
+                category="validation",
+            )
+        return raw
+
+    def _command_request_fingerprint(
+        self,
+        *,
+        cmd: str,
+        workdir: ResolvedPath,
+        timeout_ms: int,
+        tty: bool,
+        stdin_text: str,
+        explicit_env: Any,
+    ) -> str:
+        env_items = (
+            sorted((str(key), str(value)) for key, value in explicit_env.items())
+            if isinstance(explicit_env, dict)
+            else []
+        )
+        canonical = json.dumps(
+            {
+                "cmd": cmd,
+                "workdir": workdir.display,
+                "timeout_ms": timeout_ms,
+                "tty": tty,
+                "stdin": stdin_text,
+                "env": env_items,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _recover_deduplicated_command(
+        self,
+        binding: ClientRequestBinding,
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not binding.ready.wait(CLIENT_REQUEST_START_WAIT_SECONDS):
+            raise ToolFailure(
+                "COMMAND_STARTING",
+                "The idempotent command is still starting; retry with the same client_request_id.",
+                category="runtime",
+                retryable=True,
+            )
+        command_id = binding.command_id
+        if command_id is None:
+            raise ToolFailure(
+                "COMMAND_START_FAILED",
+                "The original idempotent command did not finish starting; retry with the same client_request_id.",
+                category="runtime",
+                retryable=True,
+            )
+        command = self._get_command(command_id)
+        payload = command.snapshot_retained(int(args.get("max_output_bytes", 65536)))
+        payload["elapsed_ms"] = int((time.time() - command.started_at) * 1000)
+        payload["deduplicated"] = True
+        self._add_exec_diagnostics(payload)
+        return self._format_command_output(command, payload, args)
+
     def exec_command(self, args: dict[str, Any]) -> dict[str, Any]:
         self._prune_commands()
         cmd = str(args.get("cmd", ""))
@@ -2352,7 +2514,26 @@ class Runtime:
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
-        env = self._command_env(args.get("env", {}))
+        explicit_env = args.get("env", {})
+        env = self._command_env(explicit_env)
+        client_request_id = self._validated_client_request_id(args.get("client_request_id"))
+        client_binding: ClientRequestBinding | None = None
+        owns_client_binding = False
+        if client_request_id is not None:
+            fingerprint = self._command_request_fingerprint(
+                cmd=cmd,
+                workdir=workdir,
+                timeout_ms=timeout_ms,
+                tty=tty,
+                stdin_text=stdin_text,
+                explicit_env=explicit_env,
+            )
+            owns_client_binding, client_binding = self.command_manager.reserve_client_request(
+                client_request_id,
+                fingerprint,
+            )
+            if not owns_client_binding:
+                return self._recover_deduplicated_command(client_binding, args)
         start = time.time()
         deadline = start + (timeout_ms / 1000.0)
         landlock_fd: int | None = None
@@ -2374,26 +2555,36 @@ class Runtime:
                 if exc.code != "SANDBOX_UNAVAILABLE":
                     raise
                 landlock_warning = landlock_unavailable_warning(exc)
+        slot_failure: ToolFailure | None = None
         with self.commands_lock:
             if self._closed or self.command_manager.closed:
-                if landlock_fd is not None:
-                    os.close(landlock_fd)
-                raise ToolFailure("COMMAND_CLOSED", "Workspace command manager is closed.", category="runtime")
-            if len(self.commands) + self.starting_commands >= MAX_ACTIVE_COMMANDS:
-                if landlock_fd is not None:
-                    os.close(landlock_fd)
-                raise ToolFailure(
+                slot_failure = ToolFailure(
+                    "COMMAND_CLOSED",
+                    "Workspace command manager is closed.",
+                    category="runtime",
+                )
+            elif len(self.commands) + self.starting_commands >= MAX_ACTIVE_COMMANDS:
+                slot_failure = ToolFailure(
                     "COMMAND_LIMIT_REACHED",
                     "Too many commands are already running or starting.",
                     category="runtime",
                     retryable=True,
                     details={"max_active_commands": MAX_ACTIVE_COMMANDS},
                 )
-            self.starting_commands += 1
+            else:
+                self.starting_commands += 1
+        if slot_failure is not None:
+            if landlock_fd is not None:
+                os.close(landlock_fd)
+                landlock_fd = None
+            if client_request_id is not None and client_binding is not None:
+                self.command_manager.release_client_request(client_request_id, client_binding)
+            raise slot_failure
         process: subprocess.Popen[bytes] | None = None
         command: CommandRun | None = None
         registered = False
         slot_released = False
+        binding_published = False
         try:
             process, pty_master_fd = spawn_process(
                 popen_cmd,
@@ -2408,6 +2599,7 @@ class Runtime:
                 timeout_at=deadline,
                 warnings=[landlock_warning] if landlock_warning else None,
                 pty_master_fd=pty_master_fd,
+                client_request_id=client_request_id,
             )
             with self.commands_lock:
                 self.starting_commands -= 1
@@ -2417,12 +2609,25 @@ class Runtime:
                     registered = True
             if not registered:
                 raise ToolFailure("COMMAND_CLOSED", "Runtime closed while the command was starting.", category="runtime")
+            if client_request_id is not None and client_binding is not None:
+                self.command_manager.publish_client_request(
+                    client_request_id,
+                    client_binding,
+                    command.command_id,
+                )
+                binding_published = True
         except Exception:
             with self.commands_lock:
                 if not registered and not slot_released:
                     self.starting_commands -= 1
             if process is not None and process.poll() is None:
                 terminate_process_group(process, signal.SIGTERM)
+            if (
+                client_request_id is not None
+                and client_binding is not None
+                and not binding_published
+            ):
+                self.command_manager.release_client_request(client_request_id, client_binding)
             raise
         finally:
             if landlock_fd is not None:
@@ -2720,10 +2925,12 @@ class Runtime:
         timeout_at: float | None = None,
         warnings: list[str] | None = None,
         pty_master_fd: int | None = None,
+        client_request_id: str | None = None,
     ) -> CommandRun:
         return CommandRun(
             command_id=secrets.token_urlsafe(18),
             process=process,
+            client_request_id=client_request_id,
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
@@ -2748,6 +2955,7 @@ class Runtime:
             or retained > MAX_RUNTIME_OUTPUT_BYTES
         ):
             oldest = self.output_commands.pop(next(iter(self.output_commands)))
+            self.command_manager.remove_command_binding_locked(oldest.command_id)
             retained -= oldest.retained_bytes
 
     def _complete_command(self, command: CommandRun) -> None:
@@ -2774,6 +2982,7 @@ class Runtime:
             ]
             for command_id in expired:
                 self.output_commands.pop(command_id, None)
+                self.command_manager.remove_command_binding_locked(command_id)
             self._evict_retained_locked()
 
     def _get_output_command(self, command_id: str) -> CommandRun:
@@ -2783,6 +2992,127 @@ class Runtime:
         if command is None:
             raise ToolFailure("COMMAND_NOT_FOUND", "Output command not found.", category="runtime")
         return command
+
+    def _command_metadata(self, command: CommandRun) -> dict[str, Any]:
+        command.refresh_status()
+        if command.process.poll() is not None:
+            self._complete_command(command)
+        stdout, stdout_start, stdout_total, stdout_dropped = command.retained_stream_bytes("stdout")
+        stderr, stderr_start, stderr_total, stderr_dropped = command.retained_stream_bytes("stderr")
+        finished_at = command.completed_at or time.time()
+        metadata: dict[str, Any] = {
+            "command_id": command.command_id,
+            "status": command.current_status(),
+            "exit_code": command.exit_code,
+            "signal": command.signal_name,
+            "timed_out": command.timed_out,
+            "started_at": datetime.fromtimestamp(command.started_at, tz=timezone.utc).isoformat(),
+            "completed_at": (
+                None
+                if command.completed_at is None
+                else datetime.fromtimestamp(command.completed_at, tz=timezone.utc).isoformat()
+            ),
+            "elapsed_ms": int((finished_at - command.started_at) * 1000),
+            "stdout_total_bytes": stdout_total,
+            "stderr_total_bytes": stderr_total,
+            "stdout_retained_bytes": len(stdout),
+            "stderr_retained_bytes": len(stderr),
+            "stdout_retained_start_offset": stdout_start,
+            "stderr_retained_start_offset": stderr_start,
+            "stdout_dropped_bytes": stdout_dropped,
+            "stderr_dropped_bytes": stderr_dropped,
+            "output_refs": {
+                "stdout": f"command:{command.command_id}:stdout",
+                "stderr": f"command:{command.command_id}:stderr",
+            },
+        }
+        if command.client_request_id is not None:
+            metadata["client_request_id"] = command.client_request_id
+        return metadata
+
+    def list_commands(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._prune_commands()
+        status_filter = str(args.get("status", "all"))
+        if status_filter not in {"all", "running", "completed"}:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "status must be one of: all, running, completed.",
+                category="validation",
+            )
+        limit = max(1, min(int(args.get("limit", 20)), 100))
+        client_request_id = self._validated_client_request_id(args.get("client_request_id"))
+        pending = False
+        with self.commands_lock:
+            if client_request_id is not None:
+                binding = self.command_manager.client_requests.get(client_request_id)
+                pending = binding is not None and binding.command_id is None
+                command_ids = [] if binding is None or binding.command_id is None else [binding.command_id]
+                commands = [
+                    command
+                    for command_id in command_ids
+                    if (command := self.commands.get(command_id) or self.output_commands.get(command_id))
+                    is not None
+                ]
+            else:
+                by_id = {**self.output_commands, **self.commands}
+                commands = list(by_id.values())
+        metadata = [self._command_metadata(command) for command in commands]
+        if status_filter == "running":
+            metadata = [item for item in metadata if item["status"] == "running"]
+        elif status_filter == "completed":
+            metadata = [item for item in metadata if item["status"] != "running"]
+        metadata.sort(key=lambda item: str(item["started_at"]), reverse=True)
+        total = len(metadata)
+        return {
+            "commands": metadata[:limit],
+            "count": min(total, limit),
+            "total": total,
+            "truncated": total > limit,
+            "pending": pending,
+            "ok": True,
+            "warnings": [],
+        }
+
+    def get_command(self, args: dict[str, Any]) -> dict[str, Any]:
+        command_id_arg = args.get("command_id")
+        client_request_arg = args.get("client_request_id")
+        if (command_id_arg is None) == (client_request_arg is None):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "Provide exactly one of command_id or client_request_id.",
+                category="validation",
+            )
+        recovered_by = "command_id"
+        if client_request_arg is not None:
+            client_request_id = self._validated_client_request_id(client_request_arg)
+            assert client_request_id is not None
+            with self.commands_lock:
+                binding = self.command_manager.client_requests.get(client_request_id)
+            if binding is None:
+                raise ToolFailure(
+                    "COMMAND_NOT_FOUND",
+                    "No command is retained for client_request_id.",
+                    category="not_found",
+                )
+            if not binding.ready.is_set() or binding.command_id is None:
+                raise ToolFailure(
+                    "COMMAND_STARTING",
+                    "The command is still starting; retry get_command with the same client_request_id.",
+                    category="runtime",
+                    retryable=True,
+                )
+            command_id = binding.command_id
+            recovered_by = "client_request_id"
+        else:
+            command_id = str(command_id_arg or "")
+            if not command_id:
+                raise ToolFailure("INVALID_ARGUMENT", "command_id is required.", category="validation")
+        command = self._get_command(command_id)
+        payload = command.snapshot_retained(int(args.get("max_output_bytes", 65536)))
+        payload["elapsed_ms"] = int((time.time() - command.started_at) * 1000)
+        payload["recovered_by"] = recovered_by
+        self._add_exec_diagnostics(payload)
+        return self._format_command_output(command, payload, args)
 
     def _format_command_output(self, command: CommandRun, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
         terminal = payload.get("status") != "running"
@@ -3041,6 +3371,7 @@ class Runtime:
     def cancel_command(self, command_id: str) -> None:
         with self.commands_lock:
             command = self.commands.pop(command_id, None)
+            self.command_manager.remove_command_binding_locked(command_id)
         if command is None:
             return
         command.refresh_status()
@@ -4633,8 +4964,54 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "stdin": {**string, "default": ""},
                 "tty": {**boolean, "default": False},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
+                "client_request_id": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": CLIENT_REQUEST_ID_MAX_LENGTH,
+                    "pattern": CLIENT_REQUEST_ID_RE.pattern,
+                },
             },
             ["cmd"],
+        ),
+        "list_commands": object_schema(
+            {
+                "status": {
+                    **string,
+                    "enum": ["all", "running", "completed"],
+                    "default": "all",
+                },
+                "client_request_id": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": CLIENT_REQUEST_ID_MAX_LENGTH,
+                    "pattern": CLIENT_REQUEST_ID_RE.pattern,
+                },
+                "limit": {**integer, "minimum": 1, "maximum": 100, "default": 20},
+            }
+        ),
+        "get_command": object_schema(
+            {
+                "command_id": {**string, "minLength": 1},
+                "client_request_id": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": CLIENT_REQUEST_ID_MAX_LENGTH,
+                    "pattern": CLIENT_REQUEST_ID_RE.pattern,
+                },
+                "max_output_bytes": {
+                    **integer,
+                    "minimum": 1,
+                    "maximum": 1048576,
+                    "default": 65536,
+                },
+                "verbosity": {**string, "enum": ["summary", "preview", "full"]},
+                "preview_bytes": {
+                    **integer,
+                    "minimum": 1,
+                    "maximum": 1048576,
+                    "default": 4096,
+                },
+            }
         ),
         "write_stdin": object_schema(
             {

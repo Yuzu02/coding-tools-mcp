@@ -17,18 +17,19 @@ no dynamic `tools/list_changed`, and no required `open_workspace` call.
 `apply_patch` is the only direct file-write tool. `safe`, `trusted`, and
 `dangerous` are command permission policies and never alter `tools/list`.
 
-The default catalog contains 20 tools:
+The default catalog contains 22 tools:
 
 - runtime/context: `server_info`, `check_exec_environment`, `get_default_cwd`,
   `set_default_cwd`
 - workspace inspection: `read_file`, `list_dir`, `list_files`, `search_text`
 - mutation: `apply_patch`
-- processes: `exec_command`, `write_stdin`, `read_output`, `kill_command`
+- processes: `exec_command`, `list_commands`, `get_command`, `write_stdin`,
+  `read_output`, `kill_command`
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`
 - policy/image: `request_permissions`, `view_image`
 
-`view_image` can be disabled as an installation capability. All other tools are
-fixed.
+`view_image` can be disabled as an installation capability. All other 21 tools
+are fixed.
 
 ## Protocol
 
@@ -52,8 +53,11 @@ reported explicitly rather than hidden.
 
 Commands use a 10-second default yield, real POSIX PTYs, bounded active and
 retained-command stores, per-command and runtime output budgets, TTL cleanup,
-and explicit `next_action` objects for polling or truncated output. Command
-handles are `command_id` values and are distinct from HTTP `Mcp-Session-Id`.
+and explicit `next_action` objects for polling or truncated output. Optional
+`client_request_id` values make retries idempotent, while `list_commands` and
+`get_command` recover handles and retained output after a lost response.
+Command handles are `command_id` values and are distinct from HTTP
+`Mcp-Session-Id`.
 
 ## Security boundary
 
