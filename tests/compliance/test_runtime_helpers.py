@@ -350,8 +350,12 @@ class RuntimeHelperTests(unittest.TestCase):
             runtime = Runtime(Path(tmp))
             command = runtime._make_command(StillRunningProcess())  # type: ignore[arg-type]
             runtime.commands[command.command_id] = command
+            kill_args = {"command_id": command.command_id, "wait_ms": 0, "kill_wait_ms": 0}
+            # Guard against schema drift: these args must pass the same
+            # validation the MCP tools/call path applies.
+            server_module.validate_arguments("kill_command", kill_args)
             with patch.object(server_module, "terminate_process_group", return_value=None):
-                result = runtime.kill_command({"command_id": command.command_id, "wait_ms": 0, "kill_wait_ms": 0})
+                result = runtime.kill_command(kill_args)
 
         self.assertFalse(result.get("killed"), result)
         self.assertEqual(result.get("status"), "terminating", result)
@@ -1342,6 +1346,10 @@ Maven home: /usr/share/maven
                 self.assertEqual(page.get("content"), "cdef")
                 self.assertEqual(page.get("omitted_bytes"), 2)
                 self.assertEqual(page.get("retained_start_offset"), 2)
+
+                with self.assertRaises(ToolFailure) as rejected:
+                    runtime.read_output({"output_ref": "command:manual-output:full"})
+                self.assertEqual(rejected.exception.code, "INVALID_ARGUMENT")
 
                 command.stdout_cursor = 0
                 snapshot = command.snapshot_since_cursor(10)

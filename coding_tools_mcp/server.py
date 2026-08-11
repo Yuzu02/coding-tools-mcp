@@ -2855,7 +2855,7 @@ class Runtime:
 
     def read_output(self, args: dict[str, Any]) -> dict[str, Any]:
         output_ref = str(args.get("output_ref", ""))
-        match = re.fullmatch(r"command:([^:]+):(full|stdout|stderr)", output_ref)
+        match = re.fullmatch(r"command:([^:]+):(stdout|stderr)", output_ref)
         if not match:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -2864,13 +2864,12 @@ class Runtime:
             )
         command = self._get_output_command(match.group(1))
         command.refresh_status()
-        ref_stream = match.group(2)
+        stream = match.group(2)
         requested_stream = str(args.get("stream", "") or "")
         if requested_stream and requested_stream not in {"stdout", "stderr"}:
             raise ToolFailure("INVALID_ARGUMENT", "stream must be stdout or stderr.", category="validation")
-        if ref_stream in {"stdout", "stderr"} and requested_stream and requested_stream != ref_stream:
+        if requested_stream and requested_stream != stream:
             raise ToolFailure("INVALID_ARGUMENT", "stream does not match output_ref.", category="validation")
-        stream = ref_stream if ref_stream in {"stdout", "stderr"} else requested_stream or "stdout"
         data, retained_start_offset, total_stream_bytes, dropped_bytes = command.retained_stream_bytes(stream)
         requested_offset = max(0, int(args.get("offset", 0)))
         offset = max(requested_offset, retained_start_offset)
@@ -2884,8 +2883,6 @@ class Runtime:
             warnings.append(f"{stream} offset skipped dropped bytes")
         if dropped_bytes:
             warnings.append(f"older {stream} output was dropped from the rolling command buffer")
-        if ref_stream == "full":
-            warnings.append("legacy full output_ref defaults to stdout; use output_refs for stable stream paging")
         result = {
             "output_ref": output_ref,
             "stream_output_ref": f"command:{command.command_id}:{stream}",
@@ -4602,6 +4599,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "command_id": {**string, "minLength": 1},
                 "signal": {**string, "enum": ["TERM", "KILL", "INT"], "default": "TERM"},
                 "wait_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 5000},
+                "kill_wait_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 2000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},

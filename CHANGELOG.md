@@ -21,6 +21,12 @@
   reconnect. Tool descriptions now direct remote clients to pass explicit
   `path`/`workdir` arguments and include concrete examples for patching and
   command continuation.
+- `kill_command` now declares `kill_wait_ms` (hard-kill escalation wait,
+  default 2000 ms) in its input schema; previously the runtime honored it but
+  schema validation rejected any call that passed it.
+- `read_output` no longer accepts the undocumented `command:<id>:full`
+  reference form, which silently read stdout only. Use the per-stream
+  `command:<id>:stdout` / `command:<id>:stderr` references.
 
 ## 0.2.2 - 2026-07-28
 
