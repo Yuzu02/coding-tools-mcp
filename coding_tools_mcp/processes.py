@@ -13,6 +13,11 @@ from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_tail
 
 
 COMMAND_BUFFER_BYTES = 524_288
+# Fraction of the per-stream budget frozen as the head segment. The head keeps
+# the earliest output (command echo, first error) that a tail-only rolling
+# buffer would lose first, mirroring the head+tail retention used by other
+# agent runtimes.
+COMMAND_HEAD_BUFFER_DIVISOR = 8
 HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
@@ -123,6 +128,8 @@ class CommandRun:
     warnings: list[str] = field(default_factory=list)
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
+    stdout_head: bytearray = field(default_factory=bytearray)
+    stderr_head: bytearray = field(default_factory=bytearray)
     stdout_start_offset: int = 0
     stderr_start_offset: int = 0
     stdout_cursor: int = 0
@@ -142,34 +149,62 @@ class CommandRun:
     timed_out: bool = False
     terminating: bool = False
     pty_master_fd: int | None = None
+    on_evict: Any = None
     _stdin_closed: bool = False
+
+    @property
+    def head_buffer_limit(self) -> int:
+        return self.buffer_limit // COMMAND_HEAD_BUFFER_DIVISOR
 
     @property
     def retained_bytes(self) -> int:
         with self.lock:
-            return len(self.stdout) + len(self.stderr)
+            stdout_head_unique = min(len(self.stdout_head), self.stdout_start_offset)
+            stderr_head_unique = min(len(self.stderr_head), self.stderr_start_offset)
+            return len(self.stdout) + len(self.stderr) + stdout_head_unique + stderr_head_unique
 
     def append_stdout(self, chunk: bytes) -> None:
         with self.lock:
+            head_capacity = self.head_buffer_limit - len(self.stdout_head)
+            if head_capacity > 0:
+                self.stdout_head.extend(chunk[:head_capacity])
             self.stdout.extend(chunk)
             self.stdout_total_bytes += len(chunk)
-            self.stdout_dropped_bytes += _trim_buffer(
+            previous_start = self.stdout_start_offset
+            dropped = _trim_buffer(
                 self.stdout,
                 total_bytes=self.stdout_total_bytes,
                 start_offset_attr="stdout_start_offset",
                 command=self,
             )
+            self.stdout_dropped_bytes += dropped
+            if dropped:
+                self._report_eviction("stdout", previous_start, self.stdout_start_offset, len(self.stdout_head))
 
     def append_stderr(self, chunk: bytes) -> None:
         with self.lock:
+            head_capacity = self.head_buffer_limit - len(self.stderr_head)
+            if head_capacity > 0:
+                self.stderr_head.extend(chunk[:head_capacity])
             self.stderr.extend(chunk)
             self.stderr_total_bytes += len(chunk)
-            self.stderr_dropped_bytes += _trim_buffer(
+            previous_start = self.stderr_start_offset
+            dropped = _trim_buffer(
                 self.stderr,
                 total_bytes=self.stderr_total_bytes,
                 start_offset_attr="stderr_start_offset",
                 command=self,
             )
+            self.stderr_dropped_bytes += dropped
+            if dropped:
+                self._report_eviction("stderr", previous_start, self.stderr_start_offset, len(self.stderr_head))
+
+    def _report_eviction(self, stream: str, previous_start: int, new_start: int, head_len: int) -> None:
+        if self.on_evict is None:
+            return
+        lost_bytes = max(0, new_start - max(previous_start, head_len))
+        if lost_bytes:
+            self.on_evict(stream, lost_bytes)
 
     def write_input(self, data: bytes) -> None:
         if self._stdin_closed:
@@ -296,12 +331,32 @@ class CommandRun:
             sections.extend([b"--- stderr ---\n", stderr])
         return b"".join(sections)
 
-    def retained_stream_bytes(self, stream: str) -> tuple[bytes, int, int, int]:
+    def retained_stream_segments(self, stream: str) -> tuple[bytes, bytes, int, int, int]:
+        """Return (head, tail, tail_start_offset, total_bytes, tail_dropped_bytes).
+
+        The retained set for a stream is the frozen head segment covering
+        absolute offsets [0, len(head)) plus the rolling tail window covering
+        [tail_start_offset, total_bytes). While the tail has not dropped
+        anything the head is a duplicate prefix of the tail; once the tail
+        rolls past the head, offsets between the two segments are evicted.
+        """
         with self.lock:
             if stream == "stdout":
-                return bytes(self.stdout), self.stdout_start_offset, self.stdout_total_bytes, self.stdout_dropped_bytes
+                return (
+                    bytes(self.stdout_head),
+                    bytes(self.stdout),
+                    self.stdout_start_offset,
+                    self.stdout_total_bytes,
+                    self.stdout_dropped_bytes,
+                )
             if stream == "stderr":
-                return bytes(self.stderr), self.stderr_start_offset, self.stderr_total_bytes, self.stderr_dropped_bytes
+                return (
+                    bytes(self.stderr_head),
+                    bytes(self.stderr),
+                    self.stderr_start_offset,
+                    self.stderr_total_bytes,
+                    self.stderr_dropped_bytes,
+                )
         raise ValueError(f"Unknown output stream: {stream}")
 
 
@@ -386,7 +441,8 @@ def _trim_buffer(
     start_offset_attr: str,
     command: CommandRun,
 ) -> int:
-    overflow = len(buffer) - command.buffer_limit
+    tail_limit = command.buffer_limit - command.head_buffer_limit
+    overflow = len(buffer) - tail_limit
     if overflow <= 0:
         return 0
     del buffer[:overflow]

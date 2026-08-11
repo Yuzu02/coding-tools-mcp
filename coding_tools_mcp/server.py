@@ -60,6 +60,7 @@ from .patching import (
 from .processes import (
     HARD_KILL_SIGNAL,
     COMMAND_BUFFER_BYTES,
+    COMMAND_HEAD_BUFFER_DIVISOR,
     CommandRun,
     spawn_process,
     start_reader_threads,
@@ -618,7 +619,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
             "A still-running command returns command_id. Example: "
-            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}."
+            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
+            "Retained output is bounded per stream; for very large output redirect to a file "
+            "(cmd > out.log 2>&1) and page it with read_file or search_text."
         ),
         destructive=True,
         open_world=True,
@@ -643,6 +646,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Read output",
         description=(
             "Read retained command output using an output_ref returned by exec_command/write_stdin. "
+            "Each stream retains the earliest output (head) plus the most recent output (rolling tail); "
+            "bytes between them may be evicted and are reported via evicted_gap_bytes. "
             "Example: {\"output_ref\":\"command:abc:stdout\",\"offset\":0,\"limit\":4096}."
         ),
         read_only=True,
@@ -1235,6 +1240,31 @@ class WorkspaceCommandManager:
         self.lock = threading.Lock()
         self.starting_commands = 0
         self.closed = False
+        # Retention observability: how often output is evicted past the head
+        # segment and how often clients actually ask for evicted bytes. High
+        # hit rates are the signal to consider spilling output to disk.
+        self._retention_stats_lock = threading.Lock()
+        self._retention_stats = {
+            "evict_events": 0,
+            "evicted_bytes_total": 0,
+            "read_output_omitted_hits": 0,
+            "poll_omitted_hits": 0,
+        }
+
+    def record_output_eviction(self, stream: str, lost_bytes: int) -> None:
+        with self._retention_stats_lock:
+            self._retention_stats["evict_events"] += 1
+            self._retention_stats["evicted_bytes_total"] += lost_bytes
+
+    def record_omitted_read(self, kind: str) -> None:
+        key = f"{kind}_omitted_hits"
+        with self._retention_stats_lock:
+            if key in self._retention_stats:
+                self._retention_stats[key] += 1
+
+    def retention_stats_snapshot(self) -> dict[str, int]:
+        with self._retention_stats_lock:
+            return dict(self._retention_stats)
 
     def close(self) -> None:
         with self.lock:
@@ -1521,6 +1551,11 @@ class Runtime:
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
+            "output_retention": {
+                "buffer_bytes_per_stream": COMMAND_BUFFER_BYTES,
+                "head_bytes_per_stream": COMMAND_BUFFER_BYTES // COMMAND_HEAD_BUFFER_DIVISOR,
+                **self.command_manager.retention_stats_snapshot(),
+            },
             "endpoint_path": MCP_ENDPOINT_PATH,
             "project_context": {
                 "root_instruction_files": [item.path for item in self.project_context.root_files],
@@ -2680,6 +2715,7 @@ class Runtime:
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
+            on_evict=self.command_manager.record_output_eviction,
         )
 
     def _remember_output_command(self, command: CommandRun) -> None:
@@ -2755,12 +2791,17 @@ class Runtime:
             "stderr": f"command:{command.command_id}:stderr",
         }
         truncated_streams: list[str] = []
+        cursor_skipped_drop = False
         for stream in ("stdout", "stderr"):
             omitted = payload.get(f"{stream}_omitted_bytes")
+            if isinstance(omitted, int) and omitted > 0:
+                cursor_skipped_drop = True
             if payload.get(f"{stream}_truncated") or (
                 isinstance(omitted, int) and omitted > 0
             ):
                 truncated_streams.append(stream)
+        if cursor_skipped_drop:
+            self.command_manager.record_omitted_read("poll")
         output_stream = (
             truncated_streams[0]
             if truncated_streams
@@ -2830,7 +2871,7 @@ class Runtime:
                 preview_streams = [
                     stream
                     for stream in ("stdout", "stderr")
-                    if command.retained_stream_bytes(stream)[2] > 0
+                    if command.retained_stream_segments(stream)[3] > 0
                 ]
                 compact["truncated_output_streams"] = preview_streams
                 preview_actions = [read_output_action(output_refs[stream]) for stream in preview_streams]
@@ -2870,19 +2911,37 @@ class Runtime:
             raise ToolFailure("INVALID_ARGUMENT", "stream must be stdout or stderr.", category="validation")
         if requested_stream and requested_stream != stream:
             raise ToolFailure("INVALID_ARGUMENT", "stream does not match output_ref.", category="validation")
-        data, retained_start_offset, total_stream_bytes, dropped_bytes = command.retained_stream_bytes(stream)
+        head, tail, tail_start_offset, total_stream_bytes, dropped_bytes = command.retained_stream_segments(stream)
         requested_offset = max(0, int(args.get("offset", 0)))
-        offset = max(requested_offset, retained_start_offset)
         limit = max(1, min(int(args.get("limit", EXEC_PREVIEW_BYTES)), COMMAND_BUFFER_BYTES))
-        buffer_offset = max(0, offset - retained_start_offset)
-        chunk = data[buffer_offset : buffer_offset + limit]
+        head_len = len(head)
+        evicted_gap_bytes = max(0, tail_start_offset - head_len)
+        # The retained set is the frozen head [0, head_len) plus the rolling
+        # tail [tail_start_offset, total). Serve from whichever segment holds
+        # the requested offset; offsets inside the evicted gap clamp forward
+        # to the tail. Chunks never span the gap so offsets stay stable.
+        if requested_offset >= tail_start_offset:
+            offset = requested_offset
+            buffer_offset = offset - tail_start_offset
+            chunk = tail[buffer_offset : buffer_offset + limit]
+        elif requested_offset < head_len:
+            offset = requested_offset
+            chunk = head[offset : min(head_len, offset + limit)]
+        else:
+            offset = tail_start_offset
+            chunk = tail[:limit]
         next_offset = offset + len(chunk) if offset + len(chunk) < total_stream_bytes else None
-        omitted_bytes = max(0, retained_start_offset - requested_offset)
+        omitted_bytes = offset - requested_offset
         warnings: list[str] = []
         if omitted_bytes:
             warnings.append(f"{stream} offset skipped dropped bytes")
-        if dropped_bytes:
-            warnings.append(f"older {stream} output was dropped from the rolling command buffer")
+        if evicted_gap_bytes:
+            warnings.append(
+                f"{stream} output between the retained head and the rolling tail was evicted; "
+                "redirect large output to a file (cmd > out.log 2>&1) to keep everything"
+            )
+        if omitted_bytes:
+            self.command_manager.record_omitted_read("read_output")
         result = {
             "output_ref": output_ref,
             "stream_output_ref": f"command:{command.command_id}:{stream}",
@@ -2892,8 +2951,10 @@ class Runtime:
             "limit": limit,
             "content": chunk.decode("utf-8", errors="replace"),
             "next_offset": next_offset,
-            "total_retained_bytes": len(data),
-            "retained_start_offset": retained_start_offset,
+            "total_retained_bytes": len(tail) + min(head_len, tail_start_offset),
+            "head_retained_bytes": head_len,
+            "evicted_gap_bytes": evicted_gap_bytes,
+            "retained_start_offset": tail_start_offset,
             "total_stream_bytes": total_stream_bytes,
             "stdout_dropped_bytes": command.stdout_dropped_bytes,
             "stderr_dropped_bytes": command.stderr_dropped_bytes,

@@ -1357,6 +1357,74 @@ Maven home: /usr/share/maven
                 self.assertEqual(snapshot.get("stdout_omitted_bytes"), 2)
                 self.assertIs(snapshot.get("truncated"), True)
 
+    def test_read_output_serves_retained_head_before_evicted_gap(self) -> None:
+        data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
+        self.assertEqual(len(data), 64)
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                # buffer_limit 32 keeps a 4-byte frozen head and a 28-byte tail.
+                command = server_module.CommandRun(command_id="head-tail", process=process, buffer_limit=32)
+                command.append_stdout(data)
+                runtime._remember_output_command(command)
+
+                first = runtime.read_output({"output_ref": "command:head-tail:stdout", "offset": 0, "limit": 10})
+                self.assertEqual(first.get("content"), "abcd")
+                self.assertEqual(first.get("offset"), 0)
+                self.assertEqual(first.get("next_offset"), 4)
+                self.assertEqual(first.get("head_retained_bytes"), 4)
+                self.assertEqual(first.get("evicted_gap_bytes"), 32)
+                self.assertEqual(first.get("omitted_bytes"), 0)
+                self.assertEqual(first.get("retained_start_offset"), 36)
+                self.assertEqual(first.get("total_retained_bytes"), 32)
+
+                second = runtime.read_output({"output_ref": "command:head-tail:stdout", "offset": 4, "limit": 10})
+                self.assertEqual(second.get("offset"), 36)
+                self.assertEqual(second.get("omitted_bytes"), 32)
+                self.assertEqual(second.get("content"), data[36:46].decode())
+                self.assertEqual(second.get("next_offset"), 46)
+                self.assertTrue(any("skipped dropped" in warning for warning in second.get("warnings", [])))
+
+                third = runtime.read_output({"output_ref": "command:head-tail:stdout", "offset": 60, "limit": 10})
+                self.assertEqual(third.get("content"), data[60:].decode())
+                self.assertIsNone(third.get("next_offset"))
+
+    def test_output_retention_counters_and_server_info_track_evicted_output(self) -> None:
+        data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                command = server_module.CommandRun(
+                    command_id="evicted",
+                    process=process,
+                    buffer_limit=32,
+                    on_evict=runtime.command_manager.record_output_eviction,
+                )
+                command.append_stdout(data)
+                runtime._remember_output_command(command)
+
+                stats = runtime.command_manager.retention_stats_snapshot()
+                self.assertEqual(stats["evict_events"], 1)
+                self.assertEqual(stats["evicted_bytes_total"], 32)
+                self.assertEqual(stats["read_output_omitted_hits"], 0)
+
+                runtime.read_output({"output_ref": "command:evicted:stdout", "offset": 8, "limit": 10})
+                stats = runtime.command_manager.retention_stats_snapshot()
+                self.assertEqual(stats["read_output_omitted_hits"], 1)
+
+                retention = runtime.server_info_payload()["output_retention"]
+                self.assertEqual(retention["evict_events"], 1)
+                self.assertEqual(retention["evicted_bytes_total"], 32)
+                self.assertEqual(retention["read_output_omitted_hits"], 1)
+                self.assertEqual(
+                    retention["buffer_bytes_per_stream"],
+                    server_module.COMMAND_BUFFER_BYTES,
+                )
+                self.assertEqual(
+                    retention["head_bytes_per_stream"],
+                    server_module.COMMAND_BUFFER_BYTES // 8,
+                )
+
     def test_default_cwd_and_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:
             self.skipTest("git is not available")

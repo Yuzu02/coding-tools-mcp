@@ -27,6 +27,17 @@
 - `read_output` no longer accepts the undocumented `command:<id>:full`
   reference form, which silently read stdout only. Use the per-stream
   `command:<id>:stdout` / `command:<id>:stderr` references.
+- Retained command output now keeps the earliest bytes per stream (a frozen
+  head segment, one eighth of the per-stream budget) in addition to the
+  rolling tail, so the command echo and first errors survive large outputs.
+  `read_output` reports `head_retained_bytes` and `evicted_gap_bytes`.
+- `server_info` exposes an `output_retention` block with eviction counters
+  (`evict_events`, `evicted_bytes_total`) and omitted-read counters
+  (`read_output_omitted_hits`, `poll_omitted_hits`) so operators can measure
+  how often clients hit evicted output.
+- `exec_command` and `read_output` tool descriptions now direct clients to
+  redirect very large output to a file and page it with `read_file` /
+  `search_text`.
 
 ## 0.2.2 - 2026-07-28
 
