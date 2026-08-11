@@ -22,7 +22,7 @@ from coding_tools_mcp.server import (
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
     LANDLOCK_ACCESS_FS_TRUNCATE,
     LANDLOCK_ACCESS_FS_WRITE_FILE,
-    MAX_ACTIVE_EXEC_SESSIONS,
+    MAX_ACTIVE_COMMANDS,
     Runtime,
     ShellEnvPolicy,
     ToolFailure,
@@ -50,7 +50,7 @@ def fake_landlock_exec() -> Iterator[dict[str, object]]:
     read_fd, write_fd = os.pipe()
     original_open = server_module.open_landlock_ruleset
     original_popen = server_module.subprocess.Popen
-    original_watchdog = server_module.start_session_watchdog
+    original_watchdog = server_module.start_command_watchdog
     captured: dict[str, object] = {"read_fd": read_fd}
 
     class FakeProcess:
@@ -73,13 +73,13 @@ def fake_landlock_exec() -> Iterator[dict[str, object]]:
 
     server_module.open_landlock_ruleset = fake_open
     server_module.subprocess.Popen = fake_popen  # type: ignore[method-assign]
-    server_module.start_session_watchdog = lambda _session: None
+    server_module.start_command_watchdog = lambda _session: None
     try:
         yield captured
     finally:
         server_module.open_landlock_ruleset = original_open
         server_module.subprocess.Popen = original_popen  # type: ignore[method-assign]
-        server_module.start_session_watchdog = original_watchdog
+        server_module.start_command_watchdog = original_watchdog
         os.close(write_fd)
 
 
@@ -338,7 +338,7 @@ class RuntimeHelperTests(unittest.TestCase):
 
         self.assertEqual(runtime.workspace.root, Path(tmp).resolve())
 
-    def test_kill_session_keeps_unresponsive_session(self) -> None:
+    def test_kill_command_keeps_unresponsive_command(self) -> None:
         class StillRunningProcess:
             def poll(self) -> None:
                 return None
@@ -348,16 +348,20 @@ class RuntimeHelperTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp))
-            session = runtime._make_session(StillRunningProcess())  # type: ignore[arg-type]
-            runtime.sessions[session.session_id] = session
+            command = runtime._make_command(StillRunningProcess())  # type: ignore[arg-type]
+            runtime.commands[command.command_id] = command
+            kill_args = {"command_id": command.command_id, "wait_ms": 0, "kill_wait_ms": 0}
+            # Guard against schema drift: these args must pass the same
+            # validation the MCP tools/call path applies.
+            server_module.validate_arguments("kill_command", kill_args)
             with patch.object(server_module, "terminate_process_group", return_value=None):
-                result = runtime.kill_session({"session_id": session.session_id, "wait_ms": 0, "kill_wait_ms": 0})
+                result = runtime.kill_command(kill_args)
 
         self.assertFalse(result.get("killed"), result)
         self.assertEqual(result.get("status"), "terminating", result)
         self.assertFalse(result.get("evicted"), result)
-        self.assertIn(session.session_id, runtime.sessions)
-        self.assertTrue(any("session retained" in warning for warning in result.get("warnings", [])), result)
+        self.assertIn(command.command_id, runtime.commands)
+        self.assertTrue(any("command retained" in warning for warning in result.get("warnings", [])), result)
 
     def test_command_policy_gates_inline_interpreter_code(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -930,7 +934,7 @@ Maven home: /usr/share/maven
                 {"cmd": command, "timeout_ms": 10000, "max_output_bytes": 512},
             )
             model_text = self.agent_text(result)
-            self.assertIn('read_output(output_ref="session:', model_text)
+            self.assertIn('read_output(output_ref="command:', model_text)
             self.assertIn(":stdout", model_text)
 
     @unittest.skipIf(os.name == "nt", "POSIX shell redirection syntax")
@@ -955,7 +959,7 @@ Maven home: /usr/share/maven
             model_text = self.agent_text(result)
             self.assertIn("stderr output truncated", model_text)
             self.assertIn(":stderr", model_text)
-            self.assertNotIn('output_ref="session:' + str(payload["session_id"]) + ':stdout"', model_text)
+            self.assertNotIn('output_ref="command:' + str(payload["command_id"]) + ':stdout"', model_text)
 
     @unittest.skipIf(os.name == "nt", "POSIX shell redirection syntax")
     def test_exec_truncation_names_both_stream_continuations(self) -> None:
@@ -995,7 +999,7 @@ Maven home: /usr/share/maven
             )
             model_text = self.agent_text(result)
             self.assertIn("Status: running", model_text)
-            self.assertIn('write_stdin(session_id="', model_text)
+            self.assertIn('write_stdin(command_id="', model_text)
 
     def test_read_file_truncation_is_visible_with_continuation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1141,23 +1145,23 @@ Maven home: /usr/share/maven
     def test_active_process_limit_counts_running_commands(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="trusted")
-            session_ids: list[str] = []
+            command_ids: list[str] = []
             try:
-                for _ in range(MAX_ACTIVE_EXEC_SESSIONS):
+                for _ in range(MAX_ACTIVE_COMMANDS):
                     result = runtime.exec_command(
                         {"cmd": "sleep 5", "timeout_ms": 10_000, "yield_time_ms": 0}
                     )
-                    session_ids.append(str(result["session_id"]))
+                    command_ids.append(str(result["command_id"]))
                 with self.assertRaises(ToolFailure) as raised:
                     runtime.exec_command(
                         {"cmd": "sleep 5", "timeout_ms": 10_000, "yield_time_ms": 0}
                     )
-                self.assertEqual(raised.exception.code, "SESSION_LIMIT_REACHED")
+                self.assertEqual(raised.exception.code, "COMMAND_LIMIT_REACHED")
             finally:
-                for session_id in session_ids:
+                for command_id in command_ids:
                     try:
-                        runtime.kill_session(
-                            {"session_id": session_id, "signal": "KILL", "wait_ms": 1000}
+                        runtime.kill_command(
+                            {"command_id": command_id, "signal": "KILL", "wait_ms": 1000}
                         )
                     except ToolFailure:
                         pass
@@ -1224,33 +1228,33 @@ Maven home: /usr/share/maven
             deadline = time.time() + 5
             while result.get("status") == "running" and time.time() < deadline:
                 result = runtime.write_stdin(
-                    {"session_id": result["session_id"], "chars": "", "yield_time_ms": 500}
+                    {"command_id": result["command_id"], "chars": "", "yield_time_ms": 500}
                 )
                 stdout += str(result.get("stdout", ""))
             self.assertEqual(result.get("status"), "exited", result)
             self.assertIn("True True True", stdout)
 
-    def test_completed_sessions_are_evicted_from_active_storage(self) -> None:
+    def test_completed_commands_are_evicted_from_active_storage(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="trusted")
-            session_ids: list[str] = []
+            command_ids: list[str] = []
             for _ in range(20):
                 result = runtime.exec_command(
                     {"cmd": "sleep 0.02", "timeout_ms": 2000, "yield_time_ms": 0, "max_output_bytes": 64}
                 )
-                session_ids.append(str(result["session_id"]))
+                command_ids.append(str(result["command_id"]))
             # Poll instead of a fixed sleep: the short-lived processes finish
             # on their own schedule, and eviction only requires that a prune
             # after exit moves them out of active storage.
             eviction_deadline = time.time() + 5
             while time.time() < eviction_deadline:
-                runtime._prune_sessions()
-                if not runtime.sessions:
+                runtime._prune_commands()
+                if not runtime.commands:
                     break
                 time.sleep(0.05)
-            self.assertEqual(runtime.sessions, {})
-            self.assertLessEqual(len(runtime.output_sessions), 20)
-            self.assertTrue(set(runtime.output_sessions).issubset(set(session_ids)))
+            self.assertEqual(runtime.commands, {})
+            self.assertLessEqual(len(runtime.output_commands), 20)
+            self.assertTrue(set(runtime.output_commands).issubset(set(command_ids)))
             deadline = time.time() + 1
             while time.time() < deadline and any(
                 thread.name.startswith("coding-tools-watchdog-")
@@ -1272,7 +1276,7 @@ Maven home: /usr/share/maven
             )
             self.assertEqual(running.get("status"), "running")
             self.assertEqual(running.get("next_action", {}).get("tool"), "write_stdin")
-            runtime.kill_session({"session_id": running["session_id"], "signal": "KILL"})
+            runtime.kill_command({"command_id": running["command_id"], "signal": "KILL"})
 
             truncated = runtime.exec_command(
                 {
@@ -1324,7 +1328,7 @@ Maven home: /usr/share/maven
             self.assertEqual(second.get("offset"), first.get("next_offset"))
             self.assertEqual(second.get("content"), "err2\n")
             self.assertNotIn("out2", second.get("content", ""))
-            runtime.kill_session({"session_id": result["session_id"], "wait_ms": 1000})
+            runtime.kill_command({"command_id": result["command_id"], "wait_ms": 1000})
 
     def test_read_output_uses_absolute_stream_offsets_after_buffer_drop(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1332,22 +1336,94 @@ Maven home: /usr/share/maven
             # The context manager closes the stdout/stderr pipes and waits, so
             # the test does not leak pipe file objects (ResourceWarning).
             with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
-                session = server_module.ExecSession(session_id="manual-output", process=process, buffer_limit=4)
-                session.append_stdout(b"abcdef")
-                runtime._remember_output_session(session)
+                command = server_module.CommandRun(command_id="manual-output", process=process, buffer_limit=4)
+                command.append_stdout(b"abcdef")
+                runtime._remember_output_command(command)
 
-                page = runtime.read_output({"output_ref": "session:manual-output:stdout", "offset": 0, "limit": 10})
+                page = runtime.read_output({"output_ref": "command:manual-output:stdout", "offset": 0, "limit": 10})
                 self.assertEqual(page.get("offset"), 2)
                 self.assertEqual(page.get("requested_offset"), 0)
                 self.assertEqual(page.get("content"), "cdef")
                 self.assertEqual(page.get("omitted_bytes"), 2)
                 self.assertEqual(page.get("retained_start_offset"), 2)
 
-                session.stdout_cursor = 0
-                snapshot = session.snapshot_since_cursor(10)
+                with self.assertRaises(ToolFailure) as rejected:
+                    runtime.read_output({"output_ref": "command:manual-output:full"})
+                self.assertEqual(rejected.exception.code, "INVALID_ARGUMENT")
+
+                command.stdout_cursor = 0
+                snapshot = command.snapshot_since_cursor(10)
                 self.assertEqual(snapshot.get("stdout"), "cdef")
                 self.assertEqual(snapshot.get("stdout_omitted_bytes"), 2)
                 self.assertIs(snapshot.get("truncated"), True)
+
+    def test_read_output_serves_retained_head_before_evicted_gap(self) -> None:
+        data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
+        self.assertEqual(len(data), 64)
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                # buffer_limit 32 keeps a 4-byte frozen head and a 28-byte tail.
+                command = server_module.CommandRun(command_id="head-tail", process=process, buffer_limit=32)
+                command.append_stdout(data)
+                runtime._remember_output_command(command)
+
+                first = runtime.read_output({"output_ref": "command:head-tail:stdout", "offset": 0, "limit": 10})
+                self.assertEqual(first.get("content"), "abcd")
+                self.assertEqual(first.get("offset"), 0)
+                self.assertEqual(first.get("next_offset"), 4)
+                self.assertEqual(first.get("head_retained_bytes"), 4)
+                self.assertEqual(first.get("evicted_gap_bytes"), 32)
+                self.assertEqual(first.get("omitted_bytes"), 0)
+                self.assertEqual(first.get("retained_start_offset"), 36)
+                self.assertEqual(first.get("total_retained_bytes"), 32)
+
+                second = runtime.read_output({"output_ref": "command:head-tail:stdout", "offset": 4, "limit": 10})
+                self.assertEqual(second.get("offset"), 36)
+                self.assertEqual(second.get("omitted_bytes"), 32)
+                self.assertEqual(second.get("content"), data[36:46].decode())
+                self.assertEqual(second.get("next_offset"), 46)
+                self.assertTrue(any("skipped dropped" in warning for warning in second.get("warnings", [])))
+
+                third = runtime.read_output({"output_ref": "command:head-tail:stdout", "offset": 60, "limit": 10})
+                self.assertEqual(third.get("content"), data[60:].decode())
+                self.assertIsNone(third.get("next_offset"))
+
+    def test_output_retention_counters_and_server_info_track_evicted_output(self) -> None:
+        data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                command = server_module.CommandRun(
+                    command_id="evicted",
+                    process=process,
+                    buffer_limit=32,
+                    on_evict=runtime.command_manager.record_output_eviction,
+                )
+                command.append_stdout(data)
+                runtime._remember_output_command(command)
+
+                stats = runtime.command_manager.retention_stats_snapshot()
+                self.assertEqual(stats["evict_events"], 1)
+                self.assertEqual(stats["evicted_bytes_total"], 32)
+                self.assertEqual(stats["read_output_omitted_hits"], 0)
+
+                runtime.read_output({"output_ref": "command:evicted:stdout", "offset": 8, "limit": 10})
+                stats = runtime.command_manager.retention_stats_snapshot()
+                self.assertEqual(stats["read_output_omitted_hits"], 1)
+
+                retention = runtime.server_info_payload()["output_retention"]
+                self.assertEqual(retention["evict_events"], 1)
+                self.assertEqual(retention["evicted_bytes_total"], 32)
+                self.assertEqual(retention["read_output_omitted_hits"], 1)
+                self.assertEqual(
+                    retention["buffer_bytes_per_stream"],
+                    server_module.COMMAND_BUFFER_BYTES,
+                )
+                self.assertEqual(
+                    retention["head_bytes_per_stream"],
+                    server_module.COMMAND_BUFFER_BYTES // 8,
+                )
 
     def test_default_cwd_and_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:
@@ -1497,7 +1573,7 @@ class FakeReadonlyAnnotationTests(unittest.TestCase):
     defensible while the lie stays confined to tools/list, so these tests pin
     both halves: what it changes, and what it must never change."""
 
-    MUTATING_TOOLS = ("apply_patch", "exec_command", "write_stdin", "kill_session")
+    MUTATING_TOOLS = ("apply_patch", "exec_command", "write_stdin", "kill_command")
 
     def test_default_runtime_reports_truthful_annotations(self) -> None:
         with TemporaryDirectory() as tmp:

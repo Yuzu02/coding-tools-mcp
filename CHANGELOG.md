@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Breaking:** command handles are now named `command_id`; `kill_session` is
+  now `kill_command`; retained output references use
+  `command:<command_id>:stdout|stderr`. The former command `session_id`,
+  `kill_session`, and `session:` output references are not accepted.
+- Commands and retained output are now owned by the workspace server rather
+  than by an individual `Mcp-Session-Id`. Multiple authenticated clients for
+  the same workspace can continue, read, or terminate a command after
+  reconnecting or creating a new MCP transport session using the `command_id`
+  returned by `exec_command`.
+- Closing or expiring an HTTP transport session no longer terminates workspace
+  commands. Commands are still bounded by the existing active-count, retained
+  output, byte, timeout, and TTL limits and are terminated when the workspace
+  server shuts down.
+- `default_cwd` remains scoped to one MCP transport session and may reset after
+  reconnect. Tool descriptions now direct remote clients to pass explicit
+  `path`/`workdir` arguments and include concrete examples for patching and
+  command continuation.
+- `kill_command` now declares `kill_wait_ms` (hard-kill escalation wait,
+  default 2000 ms) in its input schema; previously the runtime honored it but
+  schema validation rejected any call that passed it.
+- `read_output` no longer accepts the undocumented `command:<id>:full`
+  reference form, which silently read stdout only. Use the per-stream
+  `command:<id>:stdout` / `command:<id>:stderr` references.
+- Retained command output now keeps the earliest bytes per stream (a frozen
+  head segment, one eighth of the per-stream budget) in addition to the
+  rolling tail, so the command echo and first errors survive large outputs.
+  `read_output` reports `head_retained_bytes` and `evicted_gap_bytes`.
+- `server_info` exposes an `output_retention` block with eviction counters
+  (`evict_events`, `evicted_bytes_total`) and omitted-read counters
+  (`read_output_omitted_hits`, `poll_omitted_hits`) so operators can measure
+  how often clients hit evicted output.
+- `exec_command` and `read_output` tool descriptions now direct clients to
+  redirect very large output to a file and page it with `read_file` /
+  `search_text`.
+
 ## 0.2.2 - 2026-07-28
 
 ### Fixed

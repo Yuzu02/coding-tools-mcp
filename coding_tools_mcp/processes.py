@@ -12,7 +12,12 @@ from .errors import ToolFailure
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_tail
 
 
-SESSION_BUFFER_BYTES = 524_288
+COMMAND_BUFFER_BYTES = 524_288
+# Fraction of the per-stream budget frozen as the head segment. The head keeps
+# the earliest output (command echo, first error) that a tail-only rolling
+# buffer would lose first, mirroring the head+tail retention used by other
+# agent runtimes.
+COMMAND_HEAD_BUFFER_DIVISOR = 8
 HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
@@ -116,13 +121,15 @@ def spawn_process(
 
 
 @dataclass
-class ExecSession:
-    session_id: str
+class CommandRun:
+    command_id: str
     process: subprocess.Popen[bytes]
     timeout_at: float | None = None
     warnings: list[str] = field(default_factory=list)
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
+    stdout_head: bytearray = field(default_factory=bytearray)
+    stderr_head: bytearray = field(default_factory=bytearray)
     stdout_start_offset: int = 0
     stderr_start_offset: int = 0
     stdout_cursor: int = 0
@@ -131,7 +138,7 @@ class ExecSession:
     stderr_total_bytes: int = 0
     stdout_dropped_bytes: int = 0
     stderr_dropped_bytes: int = 0
-    buffer_limit: int = SESSION_BUFFER_BYTES
+    buffer_limit: int = COMMAND_BUFFER_BYTES
     lock: threading.Lock = field(default_factory=threading.Lock)
     reader_threads: list[threading.Thread] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
@@ -142,48 +149,76 @@ class ExecSession:
     timed_out: bool = False
     terminating: bool = False
     pty_master_fd: int | None = None
+    on_evict: Any = None
     _stdin_closed: bool = False
+
+    @property
+    def head_buffer_limit(self) -> int:
+        return self.buffer_limit // COMMAND_HEAD_BUFFER_DIVISOR
 
     @property
     def retained_bytes(self) -> int:
         with self.lock:
-            return len(self.stdout) + len(self.stderr)
+            stdout_head_unique = min(len(self.stdout_head), self.stdout_start_offset)
+            stderr_head_unique = min(len(self.stderr_head), self.stderr_start_offset)
+            return len(self.stdout) + len(self.stderr) + stdout_head_unique + stderr_head_unique
 
     def append_stdout(self, chunk: bytes) -> None:
         with self.lock:
+            head_capacity = self.head_buffer_limit - len(self.stdout_head)
+            if head_capacity > 0:
+                self.stdout_head.extend(chunk[:head_capacity])
             self.stdout.extend(chunk)
             self.stdout_total_bytes += len(chunk)
-            self.stdout_dropped_bytes += _trim_buffer(
+            previous_start = self.stdout_start_offset
+            dropped = _trim_buffer(
                 self.stdout,
                 total_bytes=self.stdout_total_bytes,
                 start_offset_attr="stdout_start_offset",
-                session=self,
+                command=self,
             )
+            self.stdout_dropped_bytes += dropped
+            if dropped:
+                self._report_eviction("stdout", previous_start, self.stdout_start_offset, len(self.stdout_head))
 
     def append_stderr(self, chunk: bytes) -> None:
         with self.lock:
+            head_capacity = self.head_buffer_limit - len(self.stderr_head)
+            if head_capacity > 0:
+                self.stderr_head.extend(chunk[:head_capacity])
             self.stderr.extend(chunk)
             self.stderr_total_bytes += len(chunk)
-            self.stderr_dropped_bytes += _trim_buffer(
+            previous_start = self.stderr_start_offset
+            dropped = _trim_buffer(
                 self.stderr,
                 total_bytes=self.stderr_total_bytes,
                 start_offset_attr="stderr_start_offset",
-                session=self,
+                command=self,
             )
+            self.stderr_dropped_bytes += dropped
+            if dropped:
+                self._report_eviction("stderr", previous_start, self.stderr_start_offset, len(self.stderr_head))
+
+    def _report_eviction(self, stream: str, previous_start: int, new_start: int, head_len: int) -> None:
+        if self.on_evict is None:
+            return
+        lost_bytes = max(0, new_start - max(previous_start, head_len))
+        if lost_bytes:
+            self.on_evict(stream, lost_bytes)
 
     def write_input(self, data: bytes) -> None:
         if self._stdin_closed:
-            raise ToolFailure("SESSION_CLOSED", "Session stdin is closed.", category="runtime")
+            raise ToolFailure("COMMAND_CLOSED", "Command stdin is closed.", category="runtime")
         try:
             if self.pty_master_fd is not None:
                 os.write(self.pty_master_fd, data)
                 return
             if self.process.stdin is None or self.process.stdin.closed:
-                raise ToolFailure("SESSION_CLOSED", "Session stdin is closed.", category="runtime")
+                raise ToolFailure("COMMAND_CLOSED", "Command stdin is closed.", category="runtime")
             self.process.stdin.write(data)
             self.process.stdin.flush()
         except (BrokenPipeError, OSError, ValueError) as exc:
-            raise ToolFailure("SESSION_CLOSED", "Session stdin is closed.", category="runtime") from exc
+            raise ToolFailure("COMMAND_CLOSED", "Command stdin is closed.", category="runtime") from exc
 
     def close_stdin(self) -> None:
         if self.pty_master_fd is not None or self._stdin_closed:
@@ -217,7 +252,7 @@ class ExecSession:
         else:
             status = "running" if self.process.poll() is None else "exited"
         payload: dict[str, Any] = {
-            "session_id": self.session_id,
+            "command_id": self.command_id,
             "status": status,
             "exit_code": self.exit_code,
             "signal": self.signal_name,
@@ -296,16 +331,36 @@ class ExecSession:
             sections.extend([b"--- stderr ---\n", stderr])
         return b"".join(sections)
 
-    def retained_stream_bytes(self, stream: str) -> tuple[bytes, int, int, int]:
+    def retained_stream_segments(self, stream: str) -> tuple[bytes, bytes, int, int, int]:
+        """Return (head, tail, tail_start_offset, total_bytes, tail_dropped_bytes).
+
+        The retained set for a stream is the frozen head segment covering
+        absolute offsets [0, len(head)) plus the rolling tail window covering
+        [tail_start_offset, total_bytes). While the tail has not dropped
+        anything the head is a duplicate prefix of the tail; once the tail
+        rolls past the head, offsets between the two segments are evicted.
+        """
         with self.lock:
             if stream == "stdout":
-                return bytes(self.stdout), self.stdout_start_offset, self.stdout_total_bytes, self.stdout_dropped_bytes
+                return (
+                    bytes(self.stdout_head),
+                    bytes(self.stdout),
+                    self.stdout_start_offset,
+                    self.stdout_total_bytes,
+                    self.stdout_dropped_bytes,
+                )
             if stream == "stderr":
-                return bytes(self.stderr), self.stderr_start_offset, self.stderr_total_bytes, self.stderr_dropped_bytes
+                return (
+                    bytes(self.stderr_head),
+                    bytes(self.stderr),
+                    self.stderr_start_offset,
+                    self.stderr_total_bytes,
+                    self.stderr_dropped_bytes,
+                )
         raise ValueError(f"Unknown output stream: {stream}")
 
 
-def start_reader_threads(session: ExecSession) -> None:
+def start_reader_threads(command: CommandRun) -> None:
     def reader(stream: BinaryIO, append: Any) -> None:
         try:
             while True:
@@ -327,7 +382,7 @@ def start_reader_threads(session: ExecSession) -> None:
                 chunk = os.read(fd, 4096)
                 if not chunk:
                     break
-                session.append_stdout(chunk)
+                command.append_stdout(chunk)
         except OSError:
             return
         finally:
@@ -335,46 +390,46 @@ def start_reader_threads(session: ExecSession) -> None:
                 os.close(fd)
             except OSError:
                 pass
-            if session.pty_master_fd == fd:
-                session.pty_master_fd = None
+            if command.pty_master_fd == fd:
+                command.pty_master_fd = None
 
-    if session.pty_master_fd is not None:
-        thread = threading.Thread(target=pty_reader, args=(session.pty_master_fd,), daemon=True)
-        session.reader_threads.append(thread)
+    if command.pty_master_fd is not None:
+        thread = threading.Thread(target=pty_reader, args=(command.pty_master_fd,), daemon=True)
+        command.reader_threads.append(thread)
         thread.start()
         return
-    if session.process.stdout is not None:
-        thread = threading.Thread(target=reader, args=(session.process.stdout, session.append_stdout), daemon=True)
-        session.reader_threads.append(thread)
+    if command.process.stdout is not None:
+        thread = threading.Thread(target=reader, args=(command.process.stdout, command.append_stdout), daemon=True)
+        command.reader_threads.append(thread)
         thread.start()
-    if session.process.stderr is not None:
-        thread = threading.Thread(target=reader, args=(session.process.stderr, session.append_stderr), daemon=True)
-        session.reader_threads.append(thread)
+    if command.process.stderr is not None:
+        thread = threading.Thread(target=reader, args=(command.process.stderr, command.append_stderr), daemon=True)
+        command.reader_threads.append(thread)
         thread.start()
 
 
-def start_session_watchdog(session: ExecSession) -> None:
-    if session.timeout_at is None:
+def start_command_watchdog(command: CommandRun) -> None:
+    if command.timeout_at is None:
         return
 
     def watchdog() -> None:
-        delay = max(0.0, session.timeout_at - time.time()) if session.timeout_at is not None else 0.0
+        delay = max(0.0, command.timeout_at - time.time()) if command.timeout_at is not None else 0.0
         try:
-            session.process.wait(timeout=delay)
+            command.process.wait(timeout=delay)
         except subprocess.TimeoutExpired:
             pass
         else:
-            session.refresh_status()
+            command.refresh_status()
             return
-        if session.process.poll() is not None or session.timed_out:
+        if command.process.poll() is not None or command.timed_out:
             return
-        session.timed_out = True
-        terminate_process_group(session.process, signal.SIGTERM)
-        session.refresh_status()
+        command.timed_out = True
+        terminate_process_group(command.process, signal.SIGTERM)
+        command.refresh_status()
 
     threading.Thread(
         target=watchdog,
-        name=f"coding-tools-watchdog-{session.session_id}",
+        name=f"coding-tools-watchdog-{command.command_id}",
         daemon=True,
     ).start()
 
@@ -384,13 +439,14 @@ def _trim_buffer(
     *,
     total_bytes: int,
     start_offset_attr: str,
-    session: ExecSession,
+    command: CommandRun,
 ) -> int:
-    overflow = len(buffer) - session.buffer_limit
+    tail_limit = command.buffer_limit - command.head_buffer_limit
+    overflow = len(buffer) - tail_limit
     if overflow <= 0:
         return 0
     del buffer[:overflow]
-    setattr(session, start_offset_attr, total_bytes - len(buffer))
+    setattr(command, start_offset_attr, total_bytes - len(buffer))
     return overflow
 
 
