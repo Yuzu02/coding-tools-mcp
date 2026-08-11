@@ -60,6 +60,7 @@ from .patching import (
 from .processes import (
     HARD_KILL_SIGNAL,
     COMMAND_BUFFER_BYTES,
+    COMMAND_HEAD_BUFFER_DIVISOR,
     CommandRun,
     spawn_process,
     start_reader_threads,
@@ -178,9 +179,34 @@ NETWORK_RE = re.compile(
     r"(https?://|urllib\.request|urllib3|requests\.|http\.client|\bHTTPConnection\b|\bHTTPSConnection\b|socket\.|aiohttp|httpx|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\bftp\b)",
     re.I,
 )
+POWERSHELL_NETWORK_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|"
+    r"Test-NetConnection|Test-Connection|Resolve-DnsName|iwr|irm|tnc|ping(?:\.exe)?|"
+    r"nslookup(?:\.exe)?|tracert(?:\.exe)?)\b|\b(?:System\.)?Net\.",
+    re.I,
+)
 SHELL_EXPANSION_RE = re.compile(r"(`|\$\(|\$\{)")
 DESTRUCTIVE_RE = re.compile(
     r"(^|\s)(sudo|su|chmod\s+-R|chown\s+-R|mkfs|mount|umount|find\b[^;&|]*\s-delete\b|git\b[^;&|]*\breset\s+--hard\b|git\b[^;&|]*\bclean\s+-[^\s]*[fx][^\s]*|rm\s+-[^\s]*r[^\s]*f|rm\s+-[^\s]*f[^\s]*r)\b",
+    re.I,
+)
+POWERSHELL_DESTRUCTIVE_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:Remove-Item|rm|ri|del|erase|rmdir|rd)\b"
+    r"(?=[^;&|{}\r\n]*\s-(?:r|re|rec|recu|recur|recurs|recurse)\b)",
+    re.I,
+)
+# PowerShell resolves commands at runtime, so scanning for cmdlet names cannot
+# see through a variable, a splatted parameter set, a redefined alias, or a
+# .NET member call. Any of those constructs makes the destructive and network
+# scans above unsound, so they require the same explicit permission that POSIX
+# command substitution already requires instead of being scanned for keywords.
+POWERSHELL_DYNAMIC_RE = re.compile(
+    r"(?P<expansion>\$)"
+    r"|(?P<splatting>(?:^|[\s;&|(){},=])@)"
+    r"|(?P<static_member>::)"
+    r"|(?P<call_operator>(?:^|[;|(){}\r\n]|&&|\|\|)\s*(?:&(?!&)|\.)\s)"
+    r"|(?P<dynamic_eval>\b(?:Invoke-Expression|iex|Invoke-Command|icm|New-Object|"
+    r"Add-Type|Set-Alias|New-Alias|sal|nal)\b)",
     re.I,
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
@@ -618,7 +644,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
             "A still-running command returns command_id. Example: "
-            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}."
+            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
+            "Retained output is bounded per stream; for very large output redirect to a file "
+            "(cmd > out.log 2>&1) and page it with read_file or search_text."
         ),
         destructive=True,
         open_world=True,
@@ -643,6 +671,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Read output",
         description=(
             "Read retained command output using an output_ref returned by exec_command/write_stdin. "
+            "Each stream retains the earliest output (head) plus the most recent output (rolling tail); "
+            "bytes between them may be evicted and are reported via evicted_gap_bytes. "
             "Example: {\"output_ref\":\"command:abc:stdout\",\"offset\":0,\"limit\":4096}."
         ),
         read_only=True,
@@ -1235,6 +1265,31 @@ class WorkspaceCommandManager:
         self.lock = threading.Lock()
         self.starting_commands = 0
         self.closed = False
+        # Retention observability: how often output is evicted past the head
+        # segment and how often clients actually ask for evicted bytes. High
+        # hit rates are the signal to consider spilling output to disk.
+        self._retention_stats_lock = threading.Lock()
+        self._retention_stats = {
+            "evict_events": 0,
+            "evicted_bytes_total": 0,
+            "read_output_omitted_hits": 0,
+            "poll_omitted_hits": 0,
+        }
+
+    def record_output_eviction(self, stream: str, lost_bytes: int) -> None:
+        with self._retention_stats_lock:
+            self._retention_stats["evict_events"] += 1
+            self._retention_stats["evicted_bytes_total"] += lost_bytes
+
+    def record_omitted_read(self, kind: str) -> None:
+        key = f"{kind}_omitted_hits"
+        with self._retention_stats_lock:
+            if key in self._retention_stats:
+                self._retention_stats[key] += 1
+
+    def retention_stats_snapshot(self) -> dict[str, int]:
+        with self._retention_stats_lock:
+            return dict(self._retention_stats)
 
     def close(self) -> None:
         with self.lock:
@@ -1521,6 +1576,11 @@ class Runtime:
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
+            "output_retention": {
+                "buffer_bytes_per_stream": COMMAND_BUFFER_BYTES,
+                "head_bytes_per_stream": COMMAND_BUFFER_BYTES // COMMAND_HEAD_BUFFER_DIVISOR,
+                **self.command_manager.retention_stats_snapshot(),
+            },
             "endpoint_path": MCP_ENDPOINT_PATH,
             "project_context": {
                 "root_instruction_files": [item.path for item in self.project_context.root_files],
@@ -2470,20 +2530,39 @@ class Runtime:
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if DESTRUCTIVE_RE.search(cmd):
+        if DESTRUCTIVE_RE.search(cmd) or POWERSHELL_DESTRUCTIVE_RE.search(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Destructive commands are blocked without explicit permission.",
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if not self.allow_network and NETWORK_RE.search(cmd) and not is_literal_network_reference_command(cmd):
+        network_command = NETWORK_RE.search(cmd) or POWERSHELL_NETWORK_RE.search(cmd)
+        if not self.allow_network and network_command and not is_literal_network_reference_command(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Network access is denied by default.",
                 category="permission",
                 details={"permission": "network", "command": compact},
             )
+        # Runs last so a command the scans above already recognized keeps its
+        # precise permission label; this is the catch-all for the PowerShell
+        # syntax that makes those scans unsound in the first place.
+        if not self.capabilities.shell_expansion and powershell_executes_string_commands():
+            construct = powershell_dynamic_construct(cmd)
+            if construct is not None:
+                raise ToolFailure(
+                    "PERMISSION_REQUIRED",
+                    "PowerShell dynamic syntax requires explicit permission because the command "
+                    "a variable, splat, alias, or .NET member resolves to cannot be verified "
+                    "statically.",
+                    category="permission",
+                    details={
+                        "permission": "shell_expansion",
+                        "construct": construct,
+                        "command": compact,
+                    },
+                )
 
     def _add_exec_diagnostics(self, payload: dict[str, Any]) -> None:
         diagnostics = exec_output_diagnostics(payload)
@@ -2680,6 +2759,7 @@ class Runtime:
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
+            on_evict=self.command_manager.record_output_eviction,
         )
 
     def _remember_output_command(self, command: CommandRun) -> None:
@@ -2755,12 +2835,17 @@ class Runtime:
             "stderr": f"command:{command.command_id}:stderr",
         }
         truncated_streams: list[str] = []
+        cursor_skipped_drop = False
         for stream in ("stdout", "stderr"):
             omitted = payload.get(f"{stream}_omitted_bytes")
+            if isinstance(omitted, int) and omitted > 0:
+                cursor_skipped_drop = True
             if payload.get(f"{stream}_truncated") or (
                 isinstance(omitted, int) and omitted > 0
             ):
                 truncated_streams.append(stream)
+        if cursor_skipped_drop:
+            self.command_manager.record_omitted_read("poll")
         output_stream = (
             truncated_streams[0]
             if truncated_streams
@@ -2830,7 +2915,7 @@ class Runtime:
                 preview_streams = [
                     stream
                     for stream in ("stdout", "stderr")
-                    if command.retained_stream_bytes(stream)[2] > 0
+                    if command.retained_stream_segments(stream)[3] > 0
                 ]
                 compact["truncated_output_streams"] = preview_streams
                 preview_actions = [read_output_action(output_refs[stream]) for stream in preview_streams]
@@ -2855,7 +2940,7 @@ class Runtime:
 
     def read_output(self, args: dict[str, Any]) -> dict[str, Any]:
         output_ref = str(args.get("output_ref", ""))
-        match = re.fullmatch(r"command:([^:]+):(full|stdout|stderr)", output_ref)
+        match = re.fullmatch(r"command:([^:]+):(stdout|stderr)", output_ref)
         if not match:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -2864,28 +2949,43 @@ class Runtime:
             )
         command = self._get_output_command(match.group(1))
         command.refresh_status()
-        ref_stream = match.group(2)
+        stream = match.group(2)
         requested_stream = str(args.get("stream", "") or "")
         if requested_stream and requested_stream not in {"stdout", "stderr"}:
             raise ToolFailure("INVALID_ARGUMENT", "stream must be stdout or stderr.", category="validation")
-        if ref_stream in {"stdout", "stderr"} and requested_stream and requested_stream != ref_stream:
+        if requested_stream and requested_stream != stream:
             raise ToolFailure("INVALID_ARGUMENT", "stream does not match output_ref.", category="validation")
-        stream = ref_stream if ref_stream in {"stdout", "stderr"} else requested_stream or "stdout"
-        data, retained_start_offset, total_stream_bytes, dropped_bytes = command.retained_stream_bytes(stream)
+        head, tail, tail_start_offset, total_stream_bytes, dropped_bytes = command.retained_stream_segments(stream)
         requested_offset = max(0, int(args.get("offset", 0)))
-        offset = max(requested_offset, retained_start_offset)
         limit = max(1, min(int(args.get("limit", EXEC_PREVIEW_BYTES)), COMMAND_BUFFER_BYTES))
-        buffer_offset = max(0, offset - retained_start_offset)
-        chunk = data[buffer_offset : buffer_offset + limit]
+        head_len = len(head)
+        evicted_gap_bytes = max(0, tail_start_offset - head_len)
+        # The retained set is the frozen head [0, head_len) plus the rolling
+        # tail [tail_start_offset, total). Serve from whichever segment holds
+        # the requested offset; offsets inside the evicted gap clamp forward
+        # to the tail. Chunks never span the gap so offsets stay stable.
+        if requested_offset >= tail_start_offset:
+            offset = requested_offset
+            buffer_offset = offset - tail_start_offset
+            chunk = tail[buffer_offset : buffer_offset + limit]
+        elif requested_offset < head_len:
+            offset = requested_offset
+            chunk = head[offset : min(head_len, offset + limit)]
+        else:
+            offset = tail_start_offset
+            chunk = tail[:limit]
         next_offset = offset + len(chunk) if offset + len(chunk) < total_stream_bytes else None
-        omitted_bytes = max(0, retained_start_offset - requested_offset)
+        omitted_bytes = offset - requested_offset
         warnings: list[str] = []
         if omitted_bytes:
             warnings.append(f"{stream} offset skipped dropped bytes")
-        if dropped_bytes:
-            warnings.append(f"older {stream} output was dropped from the rolling command buffer")
-        if ref_stream == "full":
-            warnings.append("legacy full output_ref defaults to stdout; use output_refs for stable stream paging")
+        if evicted_gap_bytes:
+            warnings.append(
+                f"{stream} output between the retained head and the rolling tail was evicted; "
+                "redirect large output to a file (cmd > out.log 2>&1) to keep everything"
+            )
+        if omitted_bytes:
+            self.command_manager.record_omitted_read("read_output")
         result = {
             "output_ref": output_ref,
             "stream_output_ref": f"command:{command.command_id}:{stream}",
@@ -2895,8 +2995,10 @@ class Runtime:
             "limit": limit,
             "content": chunk.decode("utf-8", errors="replace"),
             "next_offset": next_offset,
-            "total_retained_bytes": len(data),
-            "retained_start_offset": retained_start_offset,
+            "total_retained_bytes": len(tail) + min(head_len, tail_start_offset),
+            "head_retained_bytes": head_len,
+            "evicted_gap_bytes": evicted_gap_bytes,
+            "retained_start_offset": tail_start_offset,
             "total_stream_bytes": total_stream_bytes,
             "stdout_dropped_bytes": command.stdout_dropped_bytes,
             "stderr_dropped_bytes": command.stderr_dropped_bytes,
@@ -3694,6 +3796,20 @@ def inline_script_segment(command: str | None, args: list[str]) -> dict[str, str
                 return {"command": name, "option": option}
     if name in {"ruby", "perl"} and "-e" in args:
         return {"command": name, "option": "-e"}
+    if name in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+        for arg in args:
+            if not arg.startswith("-"):
+                continue
+            option = arg.lstrip("-").lower()
+            # PowerShell accepts any unambiguous prefix, so -e, -enc, and
+            # -EncodedCommand all smuggle a base64 script past text scanning.
+            if option and ("command".startswith(option) or "encodedcommand".startswith(option)):
+                return {"command": name, "option": arg}
+        return None
+    if name in {"cmd", "cmd.exe"}:
+        for arg in args:
+            if arg.lstrip("-/").lower() in {"c", "k"}:
+                return {"command": name, "option": arg}
     return None
 
 
@@ -3846,6 +3962,24 @@ def is_inspectable_path_argument(token: str) -> bool:
     if "/" in normalized:
         return True
     return "." in PurePosixPath(normalized).name
+
+
+def powershell_executes_string_commands() -> bool:
+    """True when this host runs string commands through PowerShell 7.
+
+    Mirrors the spawn decision in processes.spawn_process, which wraps Windows
+    string commands in pwsh. Command policy has to agree with that decision:
+    PowerShell syntax is only worth gating where PowerShell is the interpreter.
+    """
+
+    return os.name == "nt"
+
+
+def powershell_dynamic_construct(command: str) -> str | None:
+    match = POWERSHELL_DYNAMIC_RE.search(command)
+    if match is None:
+        return None
+    return match.lastgroup
 
 
 def is_literal_network_reference_command(command: str) -> bool:
@@ -4602,6 +4736,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "command_id": {**string, "minLength": 1},
                 "signal": {**string, "enum": ["TERM", "KILL", "INT"], "default": "TERM"},
                 "wait_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 5000},
+                "kill_wait_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 2000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
