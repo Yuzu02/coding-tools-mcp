@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import shlex
 import signal
 import shutil
 import subprocess
@@ -38,6 +39,21 @@ from coding_tools_mcp.tool_results import (
     make_tool_result,
 )
 from tests.compliance.fixtures import git_fixture_preflight_error, init_git
+
+
+def shell_join(arguments: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(arguments)
+    return shlex.join(arguments)
+
+
+def write_lf(path: Path, content: str) -> None:
+    path.write_bytes(content.encode("utf-8"))
+
+
+def env_value(env: dict[str, str], name: str) -> str | None:
+    upper = name.upper()
+    return next((value for key, value in env.items() if key.upper() == upper), None)
 
 
 @contextmanager
@@ -636,7 +652,7 @@ class RuntimeHelperTests(unittest.TestCase):
             with patch.dict(server_module.os.environ, host_env, clear=True):
                 env = runtime._command_env({})
 
-            self.assertEqual(env.get("PATH"), "/usr/bin")
+            self.assertEqual(env_value(env, "PATH"), "/usr/bin")
             self.assertEqual(env.get("KEEP_THIS"), "yes")
             self.assertEqual(env.get("SET_BY_POLICY"), "configured")
             self.assertNotIn("KEEP_DROP", env)
@@ -668,9 +684,11 @@ class RuntimeHelperTests(unittest.TestCase):
 
             server_module.open_landlock_ruleset = unavailable
             try:
-                result = runtime.exec_command({"cmd": "printf ok", "timeout_ms": 5000, "yield_time_ms": 1000})
+                command = "[Console]::Out.Write('ok')" if os.name == "nt" else "printf ok"
+                result = runtime.exec_command({"cmd": command, "timeout_ms": 5000, "yield_time_ms": 5000})
             finally:
                 server_module.open_landlock_ruleset = original
+                runtime.close()
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["stdout"], "ok")
@@ -758,12 +776,13 @@ class RuntimeHelperTests(unittest.TestCase):
                 clear=True,
             ):
                 roots = set(guard_allow_roots())
-        self.assertIn("/etc/resolv.conf", roots)
-        self.assertIn("/etc/hosts", roots)
-        self.assertIn("/usr", roots)
-        self.assertIn("/usr/local/sdkman/candidates", roots)
-        self.assertIn("/etc/gitconfig", roots)
-        self.assertIn("/etc/gitconfig.d", roots)
+        if os.name != "nt":
+            self.assertIn("/etc/resolv.conf", roots)
+            self.assertIn("/etc/hosts", roots)
+            self.assertIn("/usr", roots)
+            self.assertIn("/usr/local/sdkman/candidates", roots)
+            self.assertIn("/etc/gitconfig", roots)
+            self.assertIn("/etc/gitconfig.d", roots)
         self.assertIn(str(java_home.resolve()), roots)
         self.assertIn(str(explicit_root.resolve()), roots)
         self.assertNotIn(str(private_path_dir.resolve()), roots)
@@ -993,13 +1012,18 @@ Maven home: /usr/share/maven
 
     def test_exec_running_model_text_names_the_poll_call(self) -> None:
         with TemporaryDirectory() as tmp:
-            result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
-                "exec_command",
-                {"cmd": "sleep 1", "timeout_ms": 10000, "yield_time_ms": 0},
-            )
-            model_text = self.agent_text(result)
-            self.assertIn("Status: running", model_text)
-            self.assertIn('write_stdin(command_id="', model_text)
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            try:
+                command = "Start-Sleep -Seconds 2" if os.name == "nt" else "sleep 2"
+                result = runtime.call_tool(
+                    "exec_command",
+                    {"cmd": command, "timeout_ms": 10000, "yield_time_ms": 0},
+                )
+                model_text = self.agent_text(result)
+                self.assertIn("Status: running", model_text)
+                self.assertIn('write_stdin(command_id="', model_text)
+            finally:
+                runtime.close()
 
     def test_read_file_truncation_is_visible_with_continuation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1185,28 +1209,36 @@ Maven home: /usr/share/maven
     def test_exec_command_compact_preview_and_read_output(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="trusted")
-            result = runtime.exec_command(
-                {
-                    "cmd": "printf 'alpha\nbeta\n'",
-                    "timeout_ms": 5000,
-                    "yield_time_ms": 30000,
-                    "verbosity": "preview",
-                    "preview_bytes": 64,
-                }
-            )
-            self.assertEqual(result.get("status"), "exited", result)
-            self.assertEqual(result.get("exit_code"), 0, result)
-            self.assertIn("summary", result)
-            self.assertIn("preview", result)
-            self.assertIn("output_ref", result)
-            self.assertIn("output_refs", result)
-            self.assertEqual(result.get("output_stream"), "stdout")
-            self.assertNotIn("stdout", result)
-            page = runtime.read_output({"output_ref": result["output_ref"], "offset": 0, "limit": 128})
-            self.assertIn("alpha", page.get("content", ""))
-            self.assertIn("beta", page.get("content", ""))
-            self.assertEqual(page.get("stream"), "stdout")
-            self.assertIsNone(page.get("next_offset"))
+            try:
+                command = (
+                    "Write-Output alpha; Write-Output beta"
+                    if os.name == "nt"
+                    else "printf 'alpha\nbeta\n'"
+                )
+                result = runtime.exec_command(
+                    {
+                        "cmd": command,
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 30000,
+                        "verbosity": "preview",
+                        "preview_bytes": 64,
+                    }
+                )
+                self.assertEqual(result.get("status"), "exited", result)
+                self.assertEqual(result.get("exit_code"), 0, result)
+                self.assertIn("summary", result)
+                self.assertIn("preview", result)
+                self.assertIn("output_ref", result)
+                self.assertIn("output_refs", result)
+                self.assertEqual(result.get("output_stream"), "stdout")
+                self.assertNotIn("stdout", result)
+                page = runtime.read_output({"output_ref": result["output_ref"], "offset": 0, "limit": 128})
+                self.assertIn("alpha", page.get("content", ""))
+                self.assertIn("beta", page.get("content", ""))
+                self.assertEqual(page.get("stream"), "stdout")
+                self.assertIsNone(page.get("next_offset"))
+            finally:
+                runtime.close()
 
     @unittest.skipIf(os.name == "nt", "this build explicitly reports ConPTY as unsupported")
     def test_exec_command_tty_uses_a_real_pseudo_terminal(self) -> None:
@@ -1292,43 +1324,53 @@ Maven home: /usr/share/maven
 
     def test_read_output_pages_streams_independently(self) -> None:
         with TemporaryDirectory() as tmp:
-            runtime = Runtime(Path(tmp), permission_mode="trusted")
-            script = (
-                "import sys,time;"
-                "sys.stderr.write('err1\\nerr2\\n'); sys.stderr.flush();"
-                "sys.stdout.write('out1\\n'); sys.stdout.flush();"
-                "time.sleep(0.4);"
-                "sys.stdout.write('out2\\n'); sys.stdout.flush();"
-                "time.sleep(1)"
+            workspace = Path(tmp)
+            script_path = workspace / "stream_output.py"
+            write_lf(
+                script_path,
+                "import sys, time\n"
+                "sys.stderr.buffer.write(b'err1\\nerr2\\n')\n"
+                "sys.stderr.buffer.flush()\n"
+                "sys.stdout.buffer.write(b'out1\\n')\n"
+                "sys.stdout.buffer.flush()\n"
+                "time.sleep(0.4)\n"
+                "sys.stdout.buffer.write(b'out2\\n')\n"
+                "sys.stdout.buffer.flush()\n"
+                "time.sleep(1)\n",
             )
-            result = runtime.exec_command(
-                {
-                    "cmd": f"{sys.executable} -c {script!r}",
-                    "timeout_ms": 5000,
-                    "yield_time_ms": 100,
-                    "verbosity": "preview",
-                    "preview_bytes": 64,
-                }
-            )
-            self.assertEqual(result.get("status"), "running", result)
-            output_refs = result.get("output_refs")
-            self.assertIsInstance(output_refs, dict)
-            stderr_ref = output_refs["stderr"]
+            runtime = Runtime(workspace, permission_mode="trusted")
+            try:
+                result = runtime.exec_command(
+                    {
+                        "cmd": shell_join([sys.executable, script_path.name]),
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 100,
+                        "verbosity": "preview",
+                        "preview_bytes": 64,
+                    }
+                )
+                self.assertEqual(result.get("status"), "running", result)
+                output_refs = result.get("output_refs")
+                self.assertIsInstance(output_refs, dict)
+                stderr_ref = output_refs["stderr"]
 
-            first: dict[str, object] = {}
-            for _ in range(10):
-                first = runtime.read_output({"output_ref": stderr_ref, "offset": 0, "limit": 5})
-                if first.get("content"):
-                    break
-                time.sleep(0.05)
-            self.assertEqual(first.get("content"), "err1\n")
-            self.assertEqual(first.get("next_offset"), 5)
-            time.sleep(0.6)
-            second = runtime.read_output({"output_ref": stderr_ref, "offset": first["next_offset"], "limit": 64})
-            self.assertEqual(second.get("offset"), first.get("next_offset"))
-            self.assertEqual(second.get("content"), "err2\n")
-            self.assertNotIn("out2", second.get("content", ""))
-            runtime.kill_command({"command_id": result["command_id"], "wait_ms": 1000})
+                first: dict[str, object] = {}
+                for _ in range(10):
+                    first = runtime.read_output({"output_ref": stderr_ref, "offset": 0, "limit": 5})
+                    if first.get("content"):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(first.get("content"), "err1\n")
+                self.assertEqual(first.get("next_offset"), 5)
+                time.sleep(0.6)
+                second = runtime.read_output(
+                    {"output_ref": stderr_ref, "offset": first["next_offset"], "limit": 64}
+                )
+                self.assertEqual(second.get("offset"), first.get("next_offset"))
+                self.assertEqual(second.get("content"), "err2\n")
+                self.assertNotIn("out2", second.get("content", ""))
+            finally:
+                runtime.close()
 
     def test_read_output_uses_absolute_stream_offsets_after_buffer_drop(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1431,7 +1473,7 @@ Maven home: /usr/share/maven
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "src").mkdir()
-            (workspace / "src" / "hello.txt").write_text("hello\n", encoding="utf-8")
+            write_lf(workspace / "src" / "hello.txt", "hello\n")
             for cmd in (
                 ["git", "init", "-q"],
                 ["git", "config", "user.email", "test@example.invalid"],
@@ -1468,7 +1510,7 @@ Maven home: /usr/share/maven
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "nested").mkdir()
-            (workspace / "sample.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
+            write_lf(workspace / "sample.txt", "one\ntwo\nthree\n")
             runtime = Runtime(workspace, permission_mode="trusted")
 
             cwd_result = runtime.exec_command(
@@ -1484,16 +1526,19 @@ Maven home: /usr/share/maven
             self.assertEqual(read.get("content"), "two\n")
             self.assertEqual(read.get("end_line"), 2)
 
-            tag = "model" + "Version"
-            xml_heredoc = (
-                "cat > pom.xml <<'EOF'\n"
-                "<project>\n"
-                f"  <{tag}>4.0.0</{tag}>\n"
-                "</project>\n"
-                "EOF"
-            )
-            runtime.exec_command({"cmd": xml_heredoc, "timeout_ms": 5000, "max_output_bytes": 4096})
-            self.assertIn(tag, (workspace / "pom.xml").read_text(encoding="utf-8"))
+            if os.name != "nt":
+                tag = "model" + "Version"
+                xml_heredoc = (
+                    "cat > pom.xml <<'EOF'\n"
+                    "<project>\n"
+                    f"  <{tag}>4.0.0</{tag}>\n"
+                    "</project>\n"
+                    "EOF"
+                )
+                runtime.exec_command(
+                    {"cmd": xml_heredoc, "timeout_ms": 5000, "max_output_bytes": 4096}
+                )
+                self.assertIn(tag, (workspace / "pom.xml").read_text(encoding="utf-8"))
 
     def test_heredoc_payload_stripping_keeps_live_shell_code_scanned(self) -> None:
         with TemporaryDirectory() as tmp:

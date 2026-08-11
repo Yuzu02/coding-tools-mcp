@@ -248,7 +248,10 @@ def spawn_process(
     try:
         import pty
 
-        master_fd, slave_fd = pty.openpty()
+        openpty = getattr(pty, "openpty", None)
+        if openpty is None:
+            raise ImportError("pty.openpty is unavailable")
+        master_fd, slave_fd = openpty()
     except (ImportError, OSError) as exc:
         raise ToolFailure(
             "TTY_UNSUPPORTED",
