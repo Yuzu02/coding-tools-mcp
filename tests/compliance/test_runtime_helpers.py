@@ -489,6 +489,35 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertTrue(runtime.cache_dir.is_dir())
             self.assertFalse((workspace / ".coding-tools").exists())
 
+    def test_runtime_dirs_resolve_once_and_never_move_afterwards(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            runtime = Runtime(workspace)
+            unwritable = root / "unwritable"
+            unwritable.write_text("not a directory", encoding="utf-8")
+            fallback = root / "fallback" / "instance"
+            runtime._set_runtime_dir(unwritable / "instance")
+            runtime.fallback_runtime_dir = fallback
+
+            runtime._ensure_runtime_dirs()
+
+            self.assertEqual(runtime.runtime_dir, fallback)
+            self.assertEqual(runtime.command_home_dir(), fallback / "home")
+            self.assertEqual(runtime.command_tmp_dir(), fallback / "tmp")
+            self.assertTrue(runtime.cache_dir.is_dir())
+
+            shutil.rmtree(fallback.parent)
+            (root / "fallback").write_text("not a directory", encoding="utf-8")
+            runtime.fallback_runtime_dir = root / "second-fallback" / "instance"
+            with self.assertRaises(ToolFailure) as cm:
+                runtime._command_env({})
+
+            self.assertEqual(cm.exception.code, "RUNTIME_DIR_UNWRITABLE")
+            self.assertEqual(runtime.runtime_dir, fallback)
+            self.assertFalse((root / "second-fallback").exists())
+
     def test_runtime_and_server_info_do_not_create_exec_dirs(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)

@@ -4,7 +4,7 @@ import json
 import sys
 from typing import Any, Protocol, TextIO
 
-from .protocol import dispatch_rpc, invalid_request_response, jsonrpc_error
+from .protocol import RequestContext, dispatch_rpc, invalid_request_response, jsonrpc_error
 
 
 class StdioRuntime(Protocol):
@@ -20,10 +20,8 @@ class StdioRuntime(Protocol):
         name: str,
         arguments: dict[str, Any],
         *,
-        request_id: str | int | None = None,
+        context: RequestContext | None = None,
     ) -> dict[str, Any]: ...
-
-    def cancel_request(self, request_id: str | int) -> None: ...
 
     def close(self) -> None: ...
 

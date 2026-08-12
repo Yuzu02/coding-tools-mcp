@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from .errors import JsonRpcError
@@ -7,6 +9,7 @@ from .errors import JsonRpcError
 
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION, "2025-06-18")
+LEGACY_ERA = "legacy"
 KNOWN_METHODS = frozenset(
     {
         "initialize",
@@ -17,6 +20,23 @@ KNOWN_METHODS = frozenset(
         "tools/call",
     }
 )
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    """Per-request facts that transports hand to the runtime.
+
+    One runtime serves concurrent clients, so a request carries its own
+    context instead of parking it on runtime state. ``frozen`` freezes only
+    the top level: ``client_info`` and ``client_capabilities`` must hold
+    immutable values, so they stay ``None`` until the negotiated identity is
+    validated and copied into them.
+    """
+
+    era: str = LEGACY_ERA
+    protocol_version: str = PROTOCOL_VERSION
+    client_info: Mapping[str, Any] | None = None
+    client_capabilities: Mapping[str, Any] | None = None
 
 
 def jsonrpc_error(
@@ -99,6 +119,7 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
     """
 
     request_id = request.get("id")
+    context = RequestContext(era=LEGACY_ERA, protocol_version=runtime.protocol_version)
     try:
         validate_rpc_envelope(request)
         method = request["method"]
@@ -131,9 +152,10 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
         elif method == "notifications/initialized":
             return None
         elif method == "notifications/cancelled":
-            cancelled_request_id = params.get("requestId")
-            if isinstance(cancelled_request_id, (str, int)) and not isinstance(cancelled_request_id, bool):
-                runtime.cancel_request(cancelled_request_id)
+            # Accepted and acknowledged by staying silent. A command outlives
+            # the request that started it and is shared with every other
+            # client of this workspace, so cancelling a request must not kill
+            # it; clients terminate a command with kill_command.
             return None
         elif method == "ping":
             result = {}
@@ -145,7 +167,7 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
             arguments = params.get("arguments") or {}
             if not isinstance(arguments, dict):
                 raise JsonRpcError(-32602, "tools/call arguments must be an object")
-            result = runtime.call_tool(params["name"], arguments, request_id=request_id)
+            result = runtime.call_tool(params["name"], arguments, context=context)
         else:  # only reachable if KNOWN_METHODS gains a method without a branch here
             raise JsonRpcError(-32601, f"Unknown method: {method}")
         if request_id is None:

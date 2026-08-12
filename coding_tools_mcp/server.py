@@ -70,6 +70,7 @@ from .processes import (
 from .protocol import (
     PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
+    RequestContext,
     dispatch_rpc,
     jsonrpc_error,
     protocol_version_is_supported,
@@ -1315,6 +1316,8 @@ class Runtime:
         self.server_instance_id = self.command_manager.server_instance_id
         self._set_runtime_dir(self.command_manager.runtime_dir)
         self.fallback_runtime_dir = self.command_manager.fallback_runtime_dir
+        self._runtime_dir_lock = threading.Lock()
+        self._runtime_dir_resolved = False
         self._closed = False
         self.http_session_id = secrets.token_urlsafe(24)
         self.protocol_version = PROTOCOL_VERSION
@@ -1327,9 +1330,6 @@ class Runtime:
         self.project_context: ProjectContext = (
             project_context if project_context is not None else load_project_context(self.workspace.root)
         )
-        self.request_commands: dict[str | int, str] = {}
-        self.request_commands_lock = threading.Lock()
-        self.request_context = threading.local()
         self.initialized = False
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
@@ -1368,36 +1368,57 @@ class Runtime:
     def starting_commands(self, value: int) -> None:
         self.command_manager.starting_commands = value
 
+    def _create_runtime_dirs(self, runtime_dir: Path) -> str | None:
+        """Create one runtime tree, reporting failure instead of raising."""
+
+        try:
+            for path in (
+                runtime_dir.parent,
+                runtime_dir,
+                runtime_dir / "home",
+                runtime_dir / "tmp",
+                runtime_dir / "cache",
+            ):
+                path.mkdir(parents=True, mode=0o700, exist_ok=True)
+                if os.name != "nt":
+                    try:
+                        path.chmod(0o700)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            return f"{runtime_dir}: {exc}"
+        return None
+
     def _ensure_runtime_dirs(self) -> None:
-        candidates = [self.runtime_dir]
-        if self.fallback_runtime_dir is not None and self.fallback_runtime_dir not in candidates:
-            candidates.append(self.fallback_runtime_dir)
-        errors: list[str] = []
-        for runtime_dir in candidates:
-            self._set_runtime_dir(runtime_dir)
-            try:
-                for path in (
-                    self.runtime_dir.parent,
-                    self.runtime_dir,
-                    self.home_dir,
-                    self.tmp_dir,
-                    self.cache_dir,
-                ):
-                    path.mkdir(parents=True, mode=0o700, exist_ok=True)
-                    if os.name != "nt":
-                        try:
-                            path.chmod(0o700)
-                        except OSError:
-                            pass
-                return
-            except OSError as exc:
-                errors.append(f"{runtime_dir}: {exc}")
-        raise ToolFailure(
-            "RUNTIME_DIR_UNWRITABLE",
-            "Runtime directory could not be created outside the workspace.",
-            category="runtime",
-            details={"attempted": errors},
-        )
+        """Create the runtime directories, choosing which tree to use only once.
+
+        The first call picks the primary directory or, if that one cannot be
+        created, the fallback. Every later call re-creates that same tree and
+        fails instead of switching: concurrent clients share one runtime, and
+        a command reading HOME or TMPDIR must never see them move to another
+        directory mid-flight.
+        """
+
+        with self._runtime_dir_lock:
+            resolved = self._runtime_dir_resolved
+            candidates = [self.runtime_dir]
+            if not resolved and self.fallback_runtime_dir is not None and self.fallback_runtime_dir not in candidates:
+                candidates.append(self.fallback_runtime_dir)
+            errors: list[str] = []
+            for runtime_dir in candidates:
+                error = self._create_runtime_dirs(runtime_dir)
+                if error is None:
+                    if not resolved:
+                        self._set_runtime_dir(runtime_dir)
+                        self._runtime_dir_resolved = True
+                    return
+                errors.append(error)
+            raise ToolFailure(
+                "RUNTIME_DIR_UNWRITABLE",
+                "Runtime directory could not be created outside the workspace.",
+                category="runtime",
+                details={"attempted": errors},
+            )
 
     def command_home_dir(self) -> Path:
         return self.home_dir
@@ -1539,7 +1560,7 @@ class Runtime:
         name: str,
         arguments: dict[str, Any] | None,
         *,
-        request_id: str | int | None = None,
+        context: RequestContext | None = None,
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
@@ -1549,16 +1570,9 @@ class Runtime:
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
         try:
-            self.request_context.request_id = request_id
-            try:
-                payload = handler(args)
-            finally:
-                if request_id is not None:
-                    with self.request_commands_lock:
-                        self.request_commands.pop(request_id, None)
-                self.request_context.request_id = None
+            payload = handler(args)
             payload.setdefault("ok", True)
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
         except ToolFailure as exc:
@@ -1587,7 +1601,7 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
             payload = {
@@ -1602,7 +1616,7 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1628,7 +1642,17 @@ class Runtime:
             "warnings": warnings,
         }
 
-    def emit_tool_trace(self, name: str, args: dict[str, Any], payload: dict[str, Any], started_at: float) -> None:
+    def emit_tool_trace(
+        self,
+        name: str,
+        args: dict[str, Any],
+        payload: dict[str, Any],
+        started_at: float,
+        *,
+        context: RequestContext | None = None,
+    ) -> None:
+        # `context` carries the per-request facts telemetry will label traces
+        # with once observability is wired to it; nothing reads it yet.
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
@@ -2373,10 +2397,6 @@ class Runtime:
                 except OSError:
                     pass
         assert command is not None
-        request_id = getattr(self.request_context, "request_id", None)
-        if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
-            with self.request_commands_lock:
-                self.request_commands[request_id] = command.command_id
         start_reader_threads(command)
         start_command_watchdog(command)
         try:
@@ -3001,21 +3021,6 @@ class Runtime:
                 self.commands.pop(command_id, None)
         return payload
 
-    def cancel_command(self, command_id: str) -> None:
-        with self.commands_lock:
-            command = self.commands.pop(command_id, None)
-        if command is None:
-            return
-        command.refresh_status()
-        if command.process.poll() is None:
-            terminate_process_group(command.process, signal.SIGTERM)
-
-    def cancel_request(self, request_id: str | int) -> None:
-        with self.request_commands_lock:
-            command_id = self.request_commands.get(request_id)
-        if command_id is not None:
-            self.cancel_command(command_id)
-
     def _get_command(self, command_id: str) -> CommandRun:
         self._prune_commands()
         with self.commands_lock:
@@ -3127,7 +3132,9 @@ class Runtime:
         selected = set(path_filters)
         chunks: list[str] = []
         files: list[dict[str, Any]] = []
-        for rel, before in sorted(self.patch_baselines.items()):
+        with self.patch_lock:
+            baselines = sorted(self.patch_baselines.items())
+        for rel, before in baselines:
             if selected and rel not in selected:
                 continue
             current_path = self.workspace.resolve_for_write(rel).path

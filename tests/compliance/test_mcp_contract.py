@@ -130,6 +130,27 @@ class MCPContractTests(ComplianceTestCase):
         )
         self.assertIn(killed.get("status"), {"killed", "exited"})
 
+    def test_cancel_notification_leaves_the_running_command_alone(self) -> None:
+        started = self.assert_tool_success(
+            self.client.call_tool(
+                "exec_command",
+                {"cmd": "sleep 5", "timeout_ms": 10000, "yield_time_ms": 0},
+            )
+        )
+        command_id = started.get("command_id")
+        self.assertIsInstance(command_id, str)
+
+        self.client.notify("notifications/cancelled", {"requestId": self.client.request_id})
+
+        polled = self.assert_tool_success(
+            self.client.call_tool("write_stdin", {"command_id": command_id, "chars": "", "yield_time_ms": 0})
+        )
+        self.assertEqual(polled.get("status"), "running")
+        killed = self.assert_tool_success(
+            self.client.call_tool("kill_command", {"command_id": command_id, "signal": "KILL"})
+        )
+        self.assertIn(killed.get("status"), {"killed", "exited"})
+
     def test_tools_list_excludes_forbidden_product_layer_tools(self) -> None:
         names = {str(tool.get("name", "")) for tool in self.client.list_tools()}
         exact_forbidden = sorted(names & FORBIDDEN_TOOL_NAMES)

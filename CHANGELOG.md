@@ -17,6 +17,14 @@
   commands. Commands are still bounded by the existing active-count, retained
   output, byte, timeout, and TTL limits and are terminated when the workspace
   server shuts down.
+- **Breaking:** `notifications/cancelled` no longer terminates the command the
+  cancelled request started. The notification is still accepted and, as
+  before, answered with no response. A command outlives the request that
+  started it and is shared by every client of the workspace, and the mapping
+  was keyed by the client's own JSON-RPC id, so two clients that both used
+  `id: 1` could cancel each other's commands. Terminate a command with
+  `kill_command`; the reduced cancellation responsiveness is tracked in issue
+  #48.
 - **Breaking:** `get_default_cwd` and `set_default_cwd` are removed and the
   default catalog is now 18 tools. A relative `path` always resolves against
   the workspace root, so there is no session-scoped working directory to set,
@@ -50,6 +58,12 @@
   not initialized`, which tells a client to handshake and retry a method that
   will never exist. Implemented methods are unchanged: calling one before
   `initialize` still returns `-32002`.
+- Runtime state a shared server exposes to concurrent requests is hardened:
+  the runtime directory (and the `HOME`, `TMPDIR`, and cache directories under
+  it) is resolved to the primary or fallback location exactly once, so a later
+  failure reports `RUNTIME_DIR_UNWRITABLE` instead of moving a running
+  command's directories, and the non-git diff fallback snapshots its patch
+  baselines under the patch lock.
 
 ### Fixed
 
