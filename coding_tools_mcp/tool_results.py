@@ -81,10 +81,6 @@ def _render_exec_environment(payload: dict[str, Any]) -> str:
     return f"Execution environment checked. Landlock: {state}.{suffix}"
 
 
-def _render_cwd(payload: dict[str, Any]) -> str:
-    return f"Default working directory: {payload.get('default_cwd', '.')}"
-
-
 def _render_read_file(payload: dict[str, Any]) -> str:
     content = payload.get("content")
     if not isinstance(content, str):
@@ -388,8 +384,6 @@ def _render_image(payload: dict[str, Any]) -> str:
 _RENDERERS = {
     "server_info": _render_server_info,
     "check_exec_environment": _render_exec_environment,
-    "get_default_cwd": _render_cwd,
-    "set_default_cwd": _render_cwd,
     "read_file": _render_read_file,
     "list_dir": _render_list,
     "list_files": _render_list,

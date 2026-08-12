@@ -25,8 +25,6 @@ ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_TOOLS = (
     "server_info",
     "check_exec_environment",
-    "get_default_cwd",
-    "set_default_cwd",
     "read_file",
     "list_dir",
     "list_files",

@@ -1016,7 +1016,7 @@ Maven home: /usr/share/maven
             self.assertIn("line-2000", model_text)
             self.assertNotIn("line-2001\n", model_text)
 
-    def test_read_file_continuation_preserves_default_cwd_relative_path(self) -> None:
+    def test_read_file_continuation_preserves_workspace_relative_path(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             nested = workspace / "nested"
@@ -1026,16 +1026,15 @@ Maven home: /usr/share/maven
                 encoding="utf-8",
             )
             runtime = Runtime(workspace)
-            runtime.set_default_cwd({"path": "nested"})
             first = runtime.call_tool(
                 "read_file",
-                {"path": "long.txt", "max_bytes": 16},
+                {"path": "nested/long.txt", "max_bytes": 16},
             )
             first_payload = first["structuredContent"]
             action = first_payload.get("next_action")
             self.assertIsInstance(action, dict)
             self.assertEqual(action.get("tool"), "read_file")
-            self.assertEqual(action.get("arguments", {}).get("path"), "long.txt")
+            self.assertEqual(action.get("arguments", {}).get("path"), "nested/long.txt")
             second = runtime.call_tool(action["tool"], action["arguments"])
             self.assertIs(second.get("isError"), False)
             self.assertEqual(
@@ -1425,7 +1424,7 @@ Maven home: /usr/share/maven
                     server_module.COMMAND_BUFFER_BYTES // 8,
                 )
 
-    def test_default_cwd_and_git_convenience_tools(self) -> None:
+    def test_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:
             self.skipTest("git is not available")
         with TemporaryDirectory() as tmp:
@@ -1444,9 +1443,7 @@ Maven home: /usr/share/maven
                     self.skipTest(f"git fixture setup failed: {completed.stderr.strip()}")
 
             runtime = Runtime(workspace)
-            cwd = runtime.set_default_cwd({"path": "src"})
-            self.assertEqual(cwd.get("default_cwd"), "src")
-            read = runtime.read_file({"path": "hello.txt"})
+            read = runtime.read_file({"path": "src/hello.txt"})
             self.assertEqual(read.get("content"), "hello\n")
 
             log = runtime.git_log({"max_count": 5})
@@ -1457,12 +1454,12 @@ Maven home: /usr/share/maven
             self.assertTrue(show.get("is_repo"))
             self.assertIn("initial commit", show.get("content", ""))
 
-            blame = runtime.git_blame({"path": "hello.txt", "max_lines": 5})
+            blame = runtime.git_blame({"path": "src/hello.txt", "max_lines": 5})
             self.assertTrue(blame.get("is_repo"))
             self.assertEqual(blame.get("lines", [])[0].get("content"), "hello")
 
             with self.assertRaises(ToolFailure):
-                runtime.set_default_cwd({"path": "../outside"})
+                runtime.git_blame({"path": "../outside", "max_lines": 5})
 
     def test_boundary_regressions_for_aliases_and_command_scanning(self) -> None:
         with TemporaryDirectory() as tmp:

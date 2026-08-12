@@ -17,10 +17,17 @@
   commands. Commands are still bounded by the existing active-count, retained
   output, byte, timeout, and TTL limits and are terminated when the workspace
   server shuts down.
-- `default_cwd` remains scoped to one MCP transport session and may reset after
-  reconnect. Tool descriptions now direct remote clients to pass explicit
-  `path`/`workdir` arguments and include concrete examples for patching and
-  command continuation.
+- **Breaking:** `get_default_cwd` and `set_default_cwd` are removed and the
+  default catalog is now 18 tools. A relative `path` always resolves against
+  the workspace root, so there is no session-scoped working directory to set,
+  read, or lose on reconnect. Pass a workspace-relative `path`, or
+  `exec_command`'s `workdir`, to target a subdirectory. The `read_file`
+  `next_action` continuation now repeats the workspace-relative path it was
+  given rather than one relative to a session cwd, and `server_info` no longer
+  reports `default_cwd`.
+- Tool descriptions now direct remote clients to pass explicit `path`/`workdir`
+  arguments and include concrete examples for patching and command
+  continuation.
 - `kill_command` now declares `kill_wait_ms` (hard-kill escalation wait,
   default 2000 ms) in its input schema; previously the runtime honored it but
   schema validation rejected any call that passed it.

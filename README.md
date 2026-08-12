@@ -16,7 +16,7 @@ Coding Tools MCP is a **model-neutral coding runtime** served over the
 search, structured multi-file patches, command execution, interactive
 sessions, and git — one server that any MCP client can drive. Claude Desktop,
 Claude Code, Cursor, Cline, or an agent you build yourself all get the same
-20 battle-tested tools, confined to one workspace, gated by permission modes.
+18 battle-tested tools, confined to one workspace, gated by permission modes.
 
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -137,7 +137,7 @@ rollback.
 | Files & search | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
 | Execution | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
-| Runtime | `server_info` · `check_exec_environment` · `get_default_cwd` · `set_default_cwd` |
+| Runtime | `server_info` · `check_exec_environment` |
 
 Root `AGENTS.md`/`CLAUDE.md` files load into the initialize context
 automatically. Tool `content` is concise agent-facing text;

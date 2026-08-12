@@ -565,23 +565,6 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         read_only=True,
         idempotent=True,
     ),
-    "get_default_cwd": ToolSpec(
-        title="Get default cwd",
-        description=(
-            "Return the current MCP transport session's default cwd. This value is session-local and may "
-            "reset after a reconnect."
-        ),
-        read_only=True,
-        idempotent=True,
-    ),
-    "set_default_cwd": ToolSpec(
-        title="Set default cwd",
-        description=(
-            "Set the default cwd only for the current MCP transport session. Prefer explicit path/workdir "
-            "arguments when calls must survive reconnects. Example: {\"path\":\"src\"}."
-        ),
-        idempotent=True,
-    ),
     "read_file": ToolSpec(
         title="Read file",
         description="Read a UTF-8 text file slice inside the configured workspace.",
@@ -1109,12 +1092,8 @@ class Workspace:
         return pure
 
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        return self.resolve_existing_at(self.root, raw_path)
-
-    def resolve_existing_at(self, base: Path, raw_path: str = ".") -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path or ".")
-        base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self.root.joinpath(*pure.parts)
         try:
             resolved = candidate.resolve(strict=True)
         except FileNotFoundError as exc:
@@ -1125,14 +1104,10 @@ class Workspace:
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        return self.resolve_for_write_at(self.root, raw_path)
-
-    def resolve_for_write_at(self, base: Path, raw_path: str) -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path)
         if pure.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
-        base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self.root.joinpath(*pure.parts)
         if candidate.exists() or candidate.is_symlink():
             resolved = candidate.resolve(strict=True)
             if not is_relative_to(resolved, self.root):
@@ -1154,17 +1129,6 @@ class Workspace:
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
         return ResolvedPath(normalize_rel_display(target, self.root), target, False)
-
-    def _validate_base(self, base: Path) -> Path:
-        try:
-            resolved = base.resolve(strict=True)
-        except FileNotFoundError as exc:
-            raise ToolFailure("NOT_FOUND", "Default cwd path no longer exists.", category="not_found") from exc
-        if not resolved.is_dir():
-            raise ToolFailure("NOT_A_DIRECTORY", "Default cwd is not a directory.", category="validation")
-        if not is_relative_to(resolved, self.root):
-            raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Default cwd escapes the configured workspace.", category="security")
-        return resolved
 
     def reject_write_symlink(self, raw_path: str) -> None:
         pure = self._reject_unsafe_text(raw_path)
@@ -1351,7 +1315,6 @@ class Runtime:
         self.server_instance_id = self.command_manager.server_instance_id
         self._set_runtime_dir(self.command_manager.runtime_dir)
         self.fallback_runtime_dir = self.command_manager.fallback_runtime_dir
-        self.default_cwd = self.workspace.root
         self._closed = False
         self.http_session_id = secrets.token_urlsafe(24)
         self.protocol_version = PROTOCOL_VERSION
@@ -1508,18 +1471,15 @@ class Runtime:
     def oauth_enabled(self) -> bool:
         return self.oauth_config is not None
 
-    def default_cwd_display(self) -> str:
-        return normalize_rel_display(self.default_cwd, self.workspace.root)
-
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        return self.workspace.resolve_existing_at(self.default_cwd, raw_path)
+        return self.workspace.resolve_existing(raw_path)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        return self.workspace.resolve_for_write_at(self.default_cwd, raw_path)
+        return self.workspace.resolve_for_write(raw_path)
 
     def git_path_filter(self, raw_path: str) -> str:
         if raw_path == ".":
-            return self.default_cwd_display()
+            return "."
         return self.resolve_for_write(raw_path).display
 
     def _exec_environment_summary(self) -> dict[str, Any]:
@@ -1546,7 +1506,6 @@ class Runtime:
             "version": __version__,
             "protocol_version": self.protocol_version,
             **self._exec_environment_summary(),
-            "default_cwd": self.default_cwd_display(),
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
             "annotation_override": "fake_readonly" if self.fake_readonly_annotations else None,
@@ -1667,22 +1626,6 @@ class Runtime:
             "landlock_abi": landlock.get("abi_version"),
             "global_tmp_write": self.global_tmp_write_policy(),
             "warnings": warnings,
-        }
-
-    def get_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "workspace": str(self.workspace.root),
-            "default_cwd": self.default_cwd_display(),
-        }
-
-    def set_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.workspace.resolve_existing(str(args.get("path", ".")))
-        if not resolved.path.is_dir():
-            raise ToolFailure("NOT_A_DIRECTORY", "Default cwd must be a directory.", category="validation")
-        self.default_cwd = resolved.path
-        return {
-            "workspace": str(self.workspace.root),
-            "default_cwd": resolved.display,
         }
 
     def emit_tool_trace(self, name: str, args: dict[str, Any], payload: dict[str, Any], started_at: float) -> None:
@@ -4581,12 +4524,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
     return {
         "server_info": object_schema(),
         "check_exec_environment": object_schema(),
-        "get_default_cwd": object_schema(),
-        "set_default_cwd": object_schema(
-            {
-                "path": {**string, "default": "."},
-            }
-        ),
         "read_file": object_schema(
             {
                 "path": {**string, "minLength": 1},

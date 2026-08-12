@@ -15,7 +15,7 @@ Coding Tools MCP 是一个**模型中立的编程运行时**，通过
 [Model Context Protocol](https://modelcontextprotocol.io) 对外提供服务：
 文件读取与搜索、结构化多文件补丁、命令执行、交互式命令、git 操作——
 一个服务器，任何 MCP 客户端都能驱动。Claude Desktop、Claude Code、Cursor、
-Cline，或你自己写的 agent，拿到的都是同一套久经考验的 20 个工具：
+Cline，或你自己写的 agent，拿到的都是同一套久经考验的 18 个工具：
 限定在单一工作区内，由权限模式层层把关。
 
 [![观看演示](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
@@ -126,7 +126,7 @@ coding-tools-mcp-desktop
 | 文件与搜索 | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
 | 执行 | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
-| 运行时 | `server_info` · `check_exec_environment` · `get_default_cwd` · `set_default_cwd` |
+| 运行时 | `server_info` · `check_exec_environment` |
 
 仓库根部的 `AGENTS.md`/`CLAUDE.md` 会自动载入 initialize 上下文。工具的
 `content` 是给 agent 看的精炼文本，`structuredContent` 则是完整稳定的机器

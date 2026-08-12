@@ -80,7 +80,6 @@ class MCPContractTests(ComplianceTestCase):
     def test_high_confusion_tools_include_model_ready_examples(self) -> None:
         tools = {str(tool.get("name")): tool for tool in self.client.list_tools()}
         expected_fragments = {
-            "set_default_cwd": ("session", "workdir", '"path":"src"'),
             "apply_patch": ("*** Begin Patch", "*** Update File"),
             "exec_command": ("workdir", "command_id", '"yield_time_ms":30000'),
             "write_stdin": ("command_id", '"chars":""'),
@@ -93,13 +92,8 @@ class MCPContractTests(ComplianceTestCase):
                 with self.subTest(tool=name, fragment=fragment):
                     self.assertIn(fragment, description)
 
-    def test_http_sessions_isolate_cwd_but_share_workspace_commands(self) -> None:
-        self.client.call_tool("set_default_cwd", {"path": "src"})
+    def test_http_sessions_share_workspace_commands(self) -> None:
         with MCPClient(self.workspace.root, url=self.client.url) as sibling:
-            sibling_cwd = self.assert_tool_success(sibling.call_tool("get_default_cwd", {}))
-            self.assertEqual(sibling_cwd.get("default_cwd"), ".")
-            sibling.call_tool("set_default_cwd", {"path": "test"})
-
             started = self.client.call_tool(
                 "exec_command",
                 {"cmd": "sleep 1", "timeout_ms": 5000, "yield_time_ms": 0},
@@ -111,10 +105,10 @@ class MCPContractTests(ComplianceTestCase):
                 sibling.call_tool("write_stdin", {"command_id": command_id, "chars": "", "yield_time_ms": 0})
             )
             self.assertEqual(polled.get("command_id"), command_id)
-            sibling.call_tool("kill_command", {"command_id": command_id, "signal": "KILL"})
-
-        original_cwd = self.assert_tool_success(self.client.call_tool("get_default_cwd", {}))
-        self.assertEqual(original_cwd.get("default_cwd"), "src")
+            killed = self.assert_tool_success(
+                sibling.call_tool("kill_command", {"command_id": command_id, "signal": "KILL"})
+            )
+            self.assertIn(killed.get("status"), {"killed", "exited"})
 
     def test_http_session_delete_does_not_terminate_workspace_command(self) -> None:
         with MCPClient(self.workspace.root, url=self.client.url) as owner:
@@ -164,8 +158,6 @@ class MCPContractTests(ComplianceTestCase):
         expected = {
             "server_info": (True, False, True, False),
             "check_exec_environment": (True, False, True, False),
-            "get_default_cwd": (True, False, True, False),
-            "set_default_cwd": (False, False, True, False),
             "read_file": (True, False, True, False),
             "list_dir": (True, False, True, False),
             "list_files": (True, False, True, False),
