@@ -64,6 +64,28 @@
   failure reports `RUNTIME_DIR_UNWRITABLE` instead of moving a running
   command's directories, and the non-git diff fallback snapshots its patch
   baselines under the patch lock.
+- **Behavior change:** `initialize` no longer fails with `-32602` when a client
+  asks for a `protocolVersion` this server does not speak. As the handshake
+  spec requires, the server now answers with an `InitializeResult` naming the
+  newest version it does speak (`2025-11-25`); a client that asks for a
+  supported version still gets that version back. Asking to handshake with
+  `2026-07-28` downgrades the same way, because that protocol states its
+  version per request instead of negotiating one.
+
+### Added
+
+- Support for MCP `2026-07-28`, which serves a request without a handshake.
+  Such a request states its own protocol version in `params._meta`
+  (`io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities` are required,
+  `io.modelcontextprotocol/clientInfo` is optional) and may call `ping`,
+  `tools/list`, and `tools/call` immediately. A `_meta` version this server
+  does not speak is answered with `-32022` and the versions it does
+  (`data.supported`); a missing or mistyped required `_meta` field is answered
+  with `-32602`. Available over STDIO in this change; HTTP support follows.
+  Requests without that `_meta` key — including legacy requests that carry
+  `_meta.progressToken`, and every `initialize` — keep the handshake behavior
+  they had.
 
 ### Fixed
 

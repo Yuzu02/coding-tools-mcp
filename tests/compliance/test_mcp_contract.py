@@ -31,6 +31,42 @@ from tests.compliance.mcp_client import (
 from tests.compliance.test_support import ComplianceTestCase
 
 
+MODERN_PROTOCOL_VERSION = "2026-07-28"
+META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+
+
+def modern_meta(
+    overrides: dict[str, Any] | None = None,
+    *,
+    drop: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Build the per-request ``_meta`` a 2026-07-28 client sends."""
+
+    meta: dict[str, Any] = {
+        META_PROTOCOL_VERSION: MODERN_PROTOCOL_VERSION,
+        META_CLIENT_CAPABILITIES: {},
+        META_CLIENT_INFO: {"name": "modern-contract-client", "version": "1.0"},
+    }
+    meta.update(overrides or {})
+    for key in drop:
+        meta.pop(key, None)
+    return meta
+
+
+def modern_request(
+    request_id: Any,
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = dict(params or {})
+    body["_meta"] = modern_meta() if meta is None else meta
+    return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": body}
+
+
 class MCPContractTests(ComplianceTestCase):
     def test_initialize_succeeds_and_tools_list_is_available(self) -> None:
         tools = self.client.list_tools()
@@ -848,15 +884,6 @@ class MCPContractTests(ComplianceTestCase):
             ({"id": 1, "method": "ping", "params": {}}, -32600),
             ({"jsonrpc": "2.0", "id": True, "method": "ping", "params": {}}, -32600),
             ({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": []}, -32602),
-            (
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "initialize",
-                    "params": {"protocolVersion": "1900-01-01"},
-                },
-                -32602,
-            ),
         ]
         for payload, code in cases:
             with self.subTest(payload=payload):
@@ -941,20 +968,46 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(status, 400)
         self.assertEqual(response.get("error", {}).get("code"), -32600)
 
-    def test_initialize_rejects_older_client_protocol(self) -> None:
+    def test_initialize_downgrades_unsupported_client_protocol(self) -> None:
+        """A version the server cannot speak is answered with one it can.
+
+        The handshake spec asks the server to name a version of its own rather
+        than fail, so an older client, a client that guesses, and one that asks
+        for the stateless protocol (which is carried per request and never
+        negotiated) all get the newest legacy version back.
+        """
+
+        for requested in ("2024-01-01", "1900-01-01", MODERN_PROTOCOL_VERSION, 20260728):
+            with self.subTest(requested=requested):
+                response = self.raw_post(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": requested,
+                            "capabilities": {},
+                            "clientInfo": {"name": "downgrade-sdk", "version": "1.0"},
+                        },
+                    }
+                )
+                self.assertNotIn("error", response)
+                self.assertEqual(response.get("result", {}).get("protocolVersion"), "2025-11-25")
+
+    def test_initialize_echoes_a_supported_client_protocol(self) -> None:
         response = self.raw_post(
             {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-01-01",
+                    "protocolVersion": "2025-06-18",
                     "capabilities": {},
-                    "clientInfo": {"name": "older-sdk", "version": "1.0"},
+                    "clientInfo": {"name": "supported-sdk", "version": "1.0"},
                 },
             }
         )
-        self.assertEqual(response.get("error", {}).get("code"), -32602)
+        self.assertEqual(response.get("result", {}).get("protocolVersion"), "2025-06-18")
 
     def test_stdio_transport_uses_newline_delimited_json_rpc_only(self) -> None:
         process = self.start_stdio_server()
@@ -1078,6 +1131,167 @@ class MCPContractTests(ComplianceTestCase):
                 {"jsonrpc": "2.0", "id": 1, "method": "totally/unknown", "params": {}},
             )
             self.assertEqual(rejected.get("error", {}).get("code"), -32601)
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_serves_modern_tools_list_without_a_handshake(self) -> None:
+        process = self.start_stdio_server()
+        try:
+            listed = self.stdio_rpc(process, modern_request(1, "tools/list"))
+            tools = listed.get("result", {}).get("tools")
+            self.assertIsInstance(tools, list)
+            self.assertEqual(len(tools), 18)
+            self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
+
+            called = self.stdio_rpc(
+                process,
+                modern_request(2, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}}),
+            )
+            result = called.get("result", {})
+            self.assertFalse(result.get("isError", False), result)
+            structured = result.get("structuredContent")
+            self.assertIsInstance(structured, dict)
+            self.assertEqual(structured.get("path"), "src/math.js")
+            self.assertIn(structured.get("content", ""), self.assert_content_text_is_agent_readable(result))
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_modern_ping_answers_and_cancellation_stays_silent(self) -> None:
+        process = self.start_stdio_server()
+        try:
+            pong = self.stdio_rpc(process, modern_request(1, "ping"))
+            self.assertNotIn("error", pong)
+
+            self.stdio_send(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": "missing", "_meta": modern_meta()},
+                },
+            )
+            self.assert_no_stdio_response(process)
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_modern_meta_is_validated_before_the_method_runs(self) -> None:
+        cases = [
+            (
+                "non-string version",
+                modern_meta({META_PROTOCOL_VERSION: 20260728}),
+                -32602,
+            ),
+            (
+                "missing clientCapabilities",
+                modern_meta(drop=(META_CLIENT_CAPABILITIES,)),
+                -32602,
+            ),
+            (
+                "non-object clientCapabilities",
+                modern_meta({META_CLIENT_CAPABILITIES: "tools"}),
+                -32602,
+            ),
+            (
+                "non-object clientInfo",
+                modern_meta({META_CLIENT_INFO: "modern-contract-client"}),
+                -32602,
+            ),
+        ]
+        process = self.start_stdio_server()
+        try:
+            for index, (name, meta, code) in enumerate(cases):
+                with self.subTest(case=name):
+                    rejected = self.stdio_rpc_allow_error(
+                        process,
+                        modern_request(index + 1, "tools/list", meta=meta),
+                    )
+                    error = rejected.get("error", {})
+                    self.assertEqual(error.get("code"), code, rejected)
+                    self.assertNotIn("result", rejected)
+
+            unsupported = self.stdio_rpc_allow_error(
+                process,
+                modern_request(99, "tools/list", meta=modern_meta({META_PROTOCOL_VERSION: "2025-11-25"})),
+            )
+            error = unsupported.get("error", {})
+            self.assertEqual(error.get("code"), -32022)
+            # Only modern versions are offered back: naming a legacy version
+            # here would invite the client to retry it in _meta forever.
+            self.assertEqual(error.get("data", {}).get("supported"), [MODERN_PROTOCOL_VERSION])
+            self.assertEqual(error.get("data", {}).get("received"), "2025-11-25")
+
+            omitted_client_info = self.stdio_rpc(
+                process,
+                modern_request(100, "ping", meta=modern_meta(drop=(META_CLIENT_INFO,))),
+            )
+            self.assertNotIn("error", omitted_client_info)
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_modern_era_still_reports_unimplemented_methods(self) -> None:
+        process = self.start_stdio_server()
+        try:
+            probe = self.stdio_rpc_allow_error(process, modern_request("discover-probe", "server/discover"))
+            self.assertEqual(probe.get("error", {}).get("code"), -32601)
+            self.assertIsNone(process.poll(), "an unsupported probe must not end the stdio session")
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_initialize_with_modern_meta_still_negotiates_the_handshake(self) -> None:
+        process = self.start_stdio_server()
+        try:
+            initialize = self.stdio_rpc(
+                process,
+                modern_request(
+                    1,
+                    "initialize",
+                    {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "dual-era-client", "version": "1.0"},
+                    },
+                ),
+            )
+            result = initialize.get("result", {})
+            self.assertEqual(result.get("protocolVersion"), "2025-11-25")
+            self.assertNotIn("resultType", result)
+            self.assertNotIn("_meta", result)
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_legacy_progress_token_is_not_mistaken_for_a_modern_request(self) -> None:
+        process = self.start_stdio_server()
+        try:
+            self.stdio_rpc(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "progress-token-client", "version": "1.0"},
+                    },
+                },
+            )
+            called = self.stdio_rpc(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "read_file",
+                        "arguments": {"path": "src/math.js"},
+                        "_meta": {"progressToken": "token-1"},
+                    },
+                },
+            )
+            result = called.get("result", {})
+            self.assertFalse(result.get("isError", False), result)
+            for field in ("resultType", "_meta", "ttlMs", "cacheScope"):
+                self.assertNotIn(field, result)
         finally:
             self.stop_process(process)
 

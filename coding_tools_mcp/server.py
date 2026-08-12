@@ -68,12 +68,12 @@ from .processes import (
     terminate_process_group,
 )
 from .protocol import (
-    PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    LATEST_LEGACY_PROTOCOL_VERSION,
+    LEGACY_PROTOCOL_VERSIONS,
     RequestContext,
     dispatch_rpc,
     jsonrpc_error,
-    protocol_version_is_supported,
+    legacy_protocol_version_is_supported,
     response_id,
     validate_rpc_envelope,
 )
@@ -1320,7 +1320,7 @@ class Runtime:
         self._runtime_dir_resolved = False
         self._closed = False
         self.http_session_id = secrets.token_urlsafe(24)
-        self.protocol_version = PROTOCOL_VERSION
+        self.protocol_version = LATEST_LEGACY_PROTOCOL_VERSION
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
@@ -4735,7 +4735,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     read_only = [name for name in names if annotations[name].get("readOnlyHint") is True]
     mutating = [name for name in names if annotations[name].get("readOnlyHint") is not True]
     payload = {
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
         "server": {
             "name": SERVER_NAME,
             "title": SERVER_TITLE,
@@ -4894,11 +4894,11 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_rpc_error(-32600, "Content-Type must be application/json", status=415)
             return
         protocol_version = self.headers.get("MCP-Protocol-Version")
-        if protocol_version and not protocol_version_is_supported(protocol_version):
+        if protocol_version and not legacy_protocol_version_is_supported(protocol_version):
             self.send_rpc_error(
                 -32600,
                 "Unsupported MCP protocol version",
-                data={"supported": list(SUPPORTED_PROTOCOL_VERSIONS), "received": protocol_version},
+                data={"supported": list(LEGACY_PROTOCOL_VERSIONS), "received": protocol_version},
             )
             return
         raw_length = self.headers.get("Content-Length")
