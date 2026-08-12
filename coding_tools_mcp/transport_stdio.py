@@ -5,9 +5,12 @@ import sys
 from typing import Any, Protocol, TextIO
 
 from .protocol import RequestContext, dispatch_rpc, invalid_request_response, jsonrpc_error
+from .telemetry import SessionTelemetry
 
 
 class StdioRuntime(Protocol):
+    telemetry: SessionTelemetry
+
     def initialize(
         self,
         client_info: dict[str, Any] | None = None,

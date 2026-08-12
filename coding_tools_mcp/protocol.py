@@ -51,6 +51,9 @@ MODERN_METHODS = frozenset(
 )
 MODERN_CACHEABLE_METHODS = frozenset({"tools/list"})
 MODERN_RESULT_TYPE = "complete"
+# The method a dual-era client probes with before it decides to handshake.
+# Not implemented yet, but named here because the probe is worth counting.
+DISCOVER_METHOD = "server/discover"
 
 
 @dataclass(frozen=True)
@@ -348,7 +351,11 @@ def dispatch_rpc(
         validate_rpc_envelope(request)
         method = request["method"]
         params = rpc_params(request)
-        if request_era(method, params) == MODERN_ERA:
+        era = request_era(method, params)
+        # Before the method runs: a first request that fails must still be
+        # able to report the failure it caused.
+        runtime.telemetry.record_request(era, method)
+        if era == MODERN_ERA:
             context = modern_request_context(params)
             result = _dispatch_modern(runtime, method, params, context)
         else:

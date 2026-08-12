@@ -44,6 +44,14 @@ class _CapturingSender:
         pass
 
 
+LEGACY_PROTOCOL_VERSION = "2025-11-25"
+MODERN_PROTOCOL_VERSION = "2026-07-28"
+MODERN_META = {
+    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+    "io.modelcontextprotocol/clientCapabilities": {},
+}
+
+
 def _initialize(runtime: Runtime, client_name: str = "test-client") -> None:
     response = dispatch_rpc(
         runtime,
@@ -55,6 +63,36 @@ def _initialize(runtime: Runtime, client_name: str = "test-client") -> None:
         },
     )
     assert response is not None and "error" not in response
+
+
+def _modern_request(
+    runtime: Runtime,
+    method: str,
+    params: dict[str, object] | None = None,
+    *,
+    client_info: dict[str, object] | None = None,
+) -> dict[str, object] | None:
+    """Dispatch one 2026-07-28 request, which states its version per request."""
+
+    meta = dict(MODERN_META)
+    if client_info is not None:
+        meta["io.modelcontextprotocol/clientInfo"] = client_info
+    body = dict(params or {})
+    body["_meta"] = meta
+    return dispatch_rpc(runtime, {"jsonrpc": "2.0", "id": 7, "method": method, "params": body})
+
+
+def _events_by_name(sender: _CapturingSender) -> dict[str, list[dict[str, object]]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for event in sender.events:
+        grouped.setdefault(str(event["event"]), []).append(event)
+    return grouped
+
+
+def _properties(event: dict[str, object]) -> dict[str, object]:
+    properties = event["properties"]
+    assert isinstance(properties, dict)
+    return properties
 
 
 class TelemetryModeTests(unittest.TestCase):
@@ -142,47 +180,62 @@ class SessionEventTests(unittest.TestCase):
 
     def test_session_events_carry_the_closed_schema(self) -> None:
         sender = _run_probe_session()
-        by_name: dict[str, list[dict[str, object]]] = {}
-        for event in sender.events:
-            by_name.setdefault(str(event["event"]), []).append(event)
+        by_name = _events_by_name(sender)
         self.assertEqual(len(by_name["session_start"]), 1)
+        self.assertEqual(len(by_name["handshake"]), 1)
         self.assertEqual(len(by_name["session_end"]), 1)
         self.assertEqual(len(by_name["tool_error"]), 2)
 
-        properties = by_name["session_start"][0]["properties"]
-        assert isinstance(properties, dict)
+        properties = _properties(by_name["session_start"][0])
         self.assertEqual(properties["$process_person_profile"], False)
         self.assertEqual(properties["transport"], "stdio")
         self.assertEqual(properties["permission_mode"], "safe")
-        # clientInfo values are enum-like labels, truncated, and expected here.
-        self.assertEqual(properties["client_name"], "clientinfo-probe")
+        # One runtime serves every client of the workspace, so only the
+        # handshake and the request that failed name a client at all.
+        for event in sender.events:
+            if event["event"] in {"handshake", "tool_error"}:
+                continue
+            with self.subTest(event=event["event"]):
+                aggregate = _properties(event)
+                for field in ("client_name", "client_version", "protocol_version"):
+                    self.assertNotIn(field, aggregate)
+
+        handshake = _properties(by_name["handshake"][0])
+        self.assertEqual(handshake["client_name"], "clientinfo-probe")
+        self.assertEqual(handshake["client_version"], "9.9.9")
+        self.assertEqual(handshake["protocol_version"], LEGACY_PROTOCOL_VERSION)
 
         errors = by_name["tool_error"]
-        first = errors[0]["properties"]
-        second = errors[1]["properties"]
-        assert isinstance(first, dict) and isinstance(second, dict)
+        first = _properties(errors[0])
+        second = _properties(errors[1])
         self.assertEqual(first["tool"], "read_file")
         self.assertEqual(first["error_code"], "NOT_FOUND")
         self.assertEqual(first["consecutive_failures"], 1)
         self.assertEqual(second["consecutive_failures"], 2)
+        # The failing calls were made straight against the runtime, so they
+        # carry no request context and therefore no client identity.
+        self.assertIsNone(first["client_name"])
+        self.assertIsNone(first["client_version"])
 
-        summaries = {
-            str(event["properties"]["tool"]): event["properties"]  # type: ignore[index]
-            for event in by_name["tool_summary"]
-        }
+        summaries = {str(_properties(event)["tool"]): _properties(event) for event in by_name["tool_summary"]}
         self.assertEqual(summaries["read_file"]["calls"], 2)
         self.assertEqual(summaries["read_file"]["ok"], 0)
         self.assertEqual(summaries["read_file"]["err_NOT_FOUND"], 2)
         self.assertEqual(summaries["check_exec_environment"]["calls"], 1)
         self.assertEqual(summaries["check_exec_environment"]["ok"], 1)
+        self.assertNotIn("client_name", summaries["read_file"])
 
-        end = by_name["session_end"][0]["properties"]
-        assert isinstance(end, dict)
+        end = _properties(by_name["session_end"][0])
         self.assertEqual(end["tool_calls"], 3)
         self.assertEqual(end["distinct_tools"], 2)
         self.assertEqual(end["errors_dropped"], 0)
+        self.assertEqual(end["legacy_requests"], 1)
+        self.assertEqual(end["modern_requests"], 0)
+        self.assertEqual(end["discover_probes"], 0)
+        for counter in ("evict_events", "evicted_bytes_total", "read_output_omitted_hits", "poll_omitted_hits"):
+            self.assertEqual(end[counter], 0)
 
-    def test_sessions_without_initialize_emit_nothing(self) -> None:
+    def test_a_runtime_that_serves_no_request_emits_nothing(self) -> None:
         sender = _CapturingSender()
         with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
             with tempfile.TemporaryDirectory() as tmp:
@@ -192,11 +245,123 @@ class SessionEventTests(unittest.TestCase):
                 runtime.close()
         self.assertEqual(sender.events, [])
 
+    def test_a_ping_only_runtime_emits_nothing(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                for request_id in (1, 2):
+                    dispatch_rpc(runtime, {"jsonrpc": "2.0", "id": request_id, "method": "ping", "params": {}})
+                _modern_request(runtime, "ping")
+                runtime.close()
+        self.assertEqual(sender.events, [], "an HTTP health probe must not create a session")
+
+    def test_a_modern_client_that_never_handshakes_produces_a_session(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                # The very first request fails: activation happens before the
+                # method runs, so its tool_error must not be lost.
+                _modern_request(
+                    runtime,
+                    "tools/call",
+                    {"name": "read_file", "arguments": {"path": "missing.txt"}},
+                    client_info={"name": "modern-probe", "version": "2.0"},
+                )
+                _modern_request(runtime, "tools/list")
+                runtime.close()
+
+        by_name = _events_by_name(sender)
+        self.assertEqual(len(by_name["session_start"]), 1)
+        self.assertNotIn("handshake", by_name)
+        self.assertEqual(len(by_name["tool_error"]), 1)
+        error = _properties(by_name["tool_error"][0])
+        self.assertEqual(error["tool"], "read_file")
+        self.assertEqual(error["client_name"], "modern-probe")
+        self.assertEqual(error["client_version"], "2.0")
+        end = _properties(by_name["session_end"][0])
+        self.assertEqual(end["modern_requests"], 2)
+        self.assertEqual(end["legacy_requests"], 0)
+
+    def test_discover_probes_are_counted_and_do_not_need_a_handshake(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                probe = dispatch_rpc(
+                    runtime, {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}}
+                )
+                assert probe is not None
+                self.assertEqual(probe["error"]["code"], -32601)
+                _initialize(runtime)
+                runtime.close()
+
+        by_name = _events_by_name(sender)
+        self.assertEqual(len(by_name["session_start"]), 1)
+        end = _properties(by_name["session_end"][0])
+        self.assertEqual(end["discover_probes"], 1)
+        self.assertEqual(end["legacy_requests"], 2)
+
+    def test_self_reported_client_identity_is_sanitized(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                _modern_request(
+                    runtime,
+                    "tools/call",
+                    {"name": "read_file", "arguments": {"path": "missing.txt"}},
+                    client_info={
+                        "name": "evil\r\nclient\u4e2d\x07" + "x" * 200,
+                        "version": "1.0\n",
+                        "secret": "must-not-travel",
+                    },
+                )
+                runtime.close()
+
+        error = _properties(_events_by_name(sender)["tool_error"][0])
+        self.assertEqual(error["client_name"], "evilclient" + "x" * 30)
+        self.assertEqual(error["client_version"], "1.0")
+        self.assertNotIn("must-not-travel", json.dumps(sender.events))
+
+    def test_every_handshake_is_recorded_but_the_session_starts_once(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                _initialize(runtime, client_name="first-connector")
+                _initialize(runtime, client_name="second-connector")
+                runtime.close()
+
+        by_name = _events_by_name(sender)
+        self.assertEqual(len(by_name["session_start"]), 1)
+        self.assertEqual(
+            [_properties(event)["client_name"] for event in by_name["handshake"]],
+            ["first-connector", "second-connector"],
+        )
+
+    def test_output_retention_counters_travel_with_session_end(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                _initialize(runtime)
+                runtime.command_manager.record_output_eviction("stdout", 512)
+                runtime.command_manager.record_omitted_read("read_output")
+                runtime.close()
+
+        end = _properties(_events_by_name(sender)["session_end"][0])
+        self.assertEqual(end["evict_events"], 1)
+        self.assertEqual(end["evicted_bytes_total"], 512)
+        self.assertEqual(end["read_output_omitted_hits"], 1)
+        self.assertEqual(end["poll_omitted_hits"], 0)
+
     def test_error_events_are_capped_and_drops_are_counted(self) -> None:
         sender = _CapturingSender()
         with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
             session = SessionTelemetry(permission_mode="safe")
-            session.record_session_start({"name": "cap"}, "2025-11-25")
+            session.record_request("legacy", "tools/call")
             for _ in range(ERROR_EVENTS_PER_SESSION + 5):
                 session.record_tool_call(
                     "apply_patch", ok=False, error_code="PATCH_CONTEXT_MISMATCH", duration_ms=5, truncated=False
@@ -213,7 +378,7 @@ class SessionEventTests(unittest.TestCase):
         sender = _CapturingSender()
         with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
             session = SessionTelemetry(permission_mode="safe")
-            session.record_session_start(None, "2025-11-25")
+            session.record_session_start(None, LEGACY_PROTOCOL_VERSION)
             for duration in (50, 500, 5_000, 50_000):
                 session.record_tool_call("exec_command", ok=True, error_code=None, duration_ms=duration, truncated=True)
             session.finish()
@@ -228,11 +393,50 @@ class SessionEventTests(unittest.TestCase):
         self.assertEqual(len([event for event in sender.events if event["event"] == "session_end"]), 1)
 
 
+class FirstAppearanceLogTests(unittest.TestCase):
+    """The one-line stderr notes an operator reads to see which era clients speak."""
+
+    def setUp(self) -> None:
+        self._saved = set(telemetry._first_seen)
+        telemetry._first_seen.clear()
+
+    def tearDown(self) -> None:
+        telemetry._first_seen.clear()
+        telemetry._first_seen.update(self._saved)
+
+    def test_each_protocol_choice_is_logged_once_to_stderr(self) -> None:
+        stderr = io.StringIO()
+        # Logged for the operator, not for us: telemetry being off changes nothing.
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="off"), contextlib.redirect_stderr(stderr):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                _initialize(runtime)
+                _initialize(runtime)
+                _modern_request(runtime, "tools/list")
+                _modern_request(runtime, "ping")
+                for request_id in (1, 2):
+                    dispatch_rpc(
+                        runtime,
+                        {"jsonrpc": "2.0", "id": request_id, "method": "server/discover", "params": {}},
+                    )
+                runtime.close()
+
+        lines = [line for line in stderr.getvalue().splitlines() if line.startswith("coding-tools-mcp:")]
+        self.assertEqual(
+            lines,
+            [
+                f"coding-tools-mcp: legacy client handshake ({LEGACY_PROTOCOL_VERSION})",
+                "coding-tools-mcp: modern client request (tools/list)",
+                "coding-tools-mcp: server/discover probe",
+            ],
+        )
+
+
 class DocumentationDriftTests(unittest.TestCase):
     def test_documented_schema_matches_emitted_events(self) -> None:
         doc = (Path(__file__).resolve().parents[1] / "docs" / "telemetry.md").read_text(encoding="utf-8")
         emitted = {str(event["event"]) for event in _run_probe_session().events}
-        self.assertEqual(emitted, {"session_start", "tool_error", "tool_summary", "session_end"})
+        self.assertEqual(emitted, {"session_start", "handshake", "tool_error", "tool_summary", "session_end"})
         for name in emitted:
             self.assertIn(f"`{name}`", doc)
         self.assertIn(f"max {ERROR_EVENTS_PER_SESSION} per session", doc)

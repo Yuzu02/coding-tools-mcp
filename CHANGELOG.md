@@ -46,10 +46,13 @@
   head segment, one eighth of the per-stream budget) in addition to the
   rolling tail, so the command echo and first errors survive large outputs.
   `read_output` reports `head_retained_bytes` and `evicted_gap_bytes`.
-- `server_info` exposes an `output_retention` block with eviction counters
-  (`evict_events`, `evicted_bytes_total`) and omitted-read counters
-  (`read_output_omitted_hits`, `poll_omitted_hits`) so operators can measure
-  how often clients hit evicted output.
+- `server_info` exposes an `output_retention` block naming the per-stream
+  retention budget (`buffer_bytes_per_stream`, `head_bytes_per_stream`). How
+  often that budget was actually hit is a runtime-wide measurement rather than
+  an answer to one client, so the eviction counters (`evict_events`,
+  `evicted_bytes_total`) and omitted-read counters
+  (`read_output_omitted_hits`, `poll_omitted_hits`) are reported in the
+  telemetry `session_end` event instead.
 - `exec_command` and `read_output` tool descriptions now direct clients to
   redirect very large output to a file and page it with `read_file` /
   `search_text`.
@@ -72,8 +75,7 @@
   never returned. `initialize` is now idempotent: each one negotiates a
   version on its own and answers with it, so a repeat that names a different
   supported version is answered with that version instead of `-32600 Server is
-  already initialized with a different protocol version`. Only the first
-  handshake of a process records a telemetry session.
+  already initialized with a different protocol version`.
 - **Breaking:** `server_info` reports `supported_protocol_versions` (every
   version this server speaks, newest first) in place of `protocol_version`
   (the one version a session had negotiated), and the server card at
@@ -85,6 +87,21 @@
   failure reports `RUNTIME_DIR_UNWRITABLE` instead of moving a running
   command's directories, and the non-git diff fallback snapshots its patch
   baselines under the patch lock.
+- Telemetry now measures the process rather than one client's handshake. A
+  session is activated by the first request or notification that passes
+  envelope validation — in either era, and before the method runs, so a first
+  call that fails still reports it — while `ping` never activates one, leaving
+  an HTTP health probe against an idle server silent. Client identity moves
+  with the request that carried it: `initialize` emits its own `handshake`
+  event with the negotiated version and the `clientInfo` it was given, a
+  `2026-07-28` `tool_error` carries the sanitized `clientInfo` of that
+  request, and no other event claims to know who is calling.
+  `consecutive_failures` and the 20-error budget are runtime-wide across every
+  client, `session_end` adds per-era request counts and a `server/discover`
+  probe count, and the retained-output counters that `server_info` used to
+  report travel with it. Each protocol choice a process first serves is also
+  logged as one line on stderr, telemetry on or off. See
+  [docs/telemetry.md](docs/telemetry.md).
 - **Behavior change:** `initialize` no longer fails with `-32602` when a client
   asks for a `protocolVersion` this server does not speak. As the handshake
   spec requires, the server now answers with an `InitializeResult` naming the

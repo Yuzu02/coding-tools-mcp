@@ -19,9 +19,11 @@ telemetry-related is written to disk except one random install id under
 ``~/.coding-tools-mcp/id``, used only to de-duplicate active-user counts;
 deleting that file resets the identity.
 
-Events are emitted only for sessions that completed a real MCP ``initialize``
-handshake, so importing this module or exercising a Runtime directly (as unit
-tests do) produces no traffic.
+A session is activated by the first request or notification that passes
+envelope validation, whichever era it belongs to, and ``ping`` never activates
+one: one runtime serves every client of a workspace, and a client that never
+handshakes still uses the server. Importing this module, or exercising a
+Runtime without dispatching anything through it, produces no traffic.
 """
 
 from __future__ import annotations
@@ -30,16 +32,19 @@ import atexit
 import json
 import os
 import platform
+import string
 import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
 from . import __version__
 from .envutils import ENV_PREFIX, truthy_env, utc_now
+from .protocol import DISCOVER_METHOD, MODERN_ERA
 
 POSTHOG_ENDPOINT = "https://us.i.posthog.com/batch/"
 # Public write-only ingest key: it can create events but never read them back.
@@ -52,9 +57,21 @@ QUEUE_LIMIT = 500
 SEND_TIMEOUT_SECONDS = 3.0
 
 _LABEL_LIMIT = 64
+_CLIENT_LABEL_LIMIT = 40
+# clientInfo is whatever the client says it is, so it is narrowed to a
+# printable ASCII subset before it can become an event property: anything else
+# is either an injection into the log line or unbounded cardinality.
+_CLIENT_LABEL_CHARS = frozenset(string.ascii_letters + string.digits + " .,_-+/@:()")
 _OFF_VALUES = {"0", "off", "false", "no", "disable", "disabled"}
 _DURATION_BUCKETS = ((100, "dur_lt_100ms"), (1_000, "dur_lt_1s"), (10_000, "dur_lt_10s"))
 _DURATION_OVERFLOW = "dur_gte_10s"
+_RETENTION_COUNTERS = (
+    "evict_events",
+    "evicted_bytes_total",
+    "read_output_omitted_hits",
+    "poll_omitted_hits",
+)
+_LOG_PREFIX = "coding-tools-mcp"
 
 
 def telemetry_mode() -> str:
@@ -75,6 +92,67 @@ def _label(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text[:_LABEL_LIMIT] if text else None
+
+
+def _client_label(value: Any) -> str | None:
+    """Normalize one self-reported ``clientInfo`` field into an event property.
+
+    Unlike :func:`_label`, which shortens values this server produced itself,
+    this drops every character outside a printable ASCII subset — control
+    characters, newlines, and anything that would turn a name into free-form
+    text — before truncating.
+    """
+
+    if value is None:
+        return None
+    text = "".join(character for character in str(value) if character in _CLIENT_LABEL_CHARS).strip()
+    return text[:_CLIENT_LABEL_LIMIT] if text else None
+
+
+def _client_identity(client_info: Any) -> tuple[str | None, str | None]:
+    """Read the sanitized ``name`` and ``version`` a client reported, if any.
+
+    Only those two keys are read; a client may put anything else in the object
+    and none of it reaches an event.
+    """
+
+    if not isinstance(client_info, Mapping):
+        return None, None
+    return _client_label(client_info.get("name")), _client_label(client_info.get("version"))
+
+
+def _request_identity(context: Any) -> tuple[str | None, str | None]:
+    """Name the client of one request, when the request itself named it.
+
+    Only a modern request carries an identity, in the ``_meta`` the runtime
+    handed on as an opaque context. A legacy request is left anonymous: it
+    named itself in a handshake this runtime keeps no record of, and borrowing
+    a name from some other client's handshake would attribute a failure to a
+    client that never made the call.
+    """
+
+    if getattr(context, "era", None) != MODERN_ERA:
+        return None, None
+    return _client_identity(getattr(context, "client_info", None))
+
+
+_first_seen_lock = threading.Lock()
+_first_seen: set[str] = set()
+
+
+def note_first_appearance(key: str, message: str) -> None:
+    """Log one protocol choice the first time this process serves it.
+
+    Written to stderr unconditionally — over stdio, stdout is the MCP wire —
+    and never repeated, so an operator can tell from the log which era their
+    clients actually speak without turning any tracing on.
+    """
+
+    with _first_seen_lock:
+        if key in _first_seen:
+            return
+        _first_seen.add(key)
+    print(f"{_LOG_PREFIX}: {message}", file=sys.stderr, flush=True)
 
 
 def _looks_like_install_id(value: str) -> bool:
@@ -189,12 +267,14 @@ def _get_sender() -> _Sender:
 
 
 class SessionTelemetry:
-    """Per-session in-memory counters emitted as closed-schema events.
+    """Per-runtime in-memory counters emitted as closed-schema events.
 
     ``record_tool_call`` only increments dictionary counters under its lock;
-    event dictionaries are built after the lock is released. Events exist only
-    for sessions activated by a real MCP ``initialize``
-    (``record_session_start``).
+    event dictionaries are built after the lock is released. One runtime is
+    shared by every client of its workspace, so a "session" is the runtime's
+    lifetime rather than one client's: it is activated by the first request
+    that reaches :meth:`record_request` (or by a handshake) and closed once,
+    when the runtime is closed.
     """
 
     def __init__(self, *, permission_mode: str, transport: str = "stdio") -> None:
@@ -210,10 +290,10 @@ class SessionTelemetry:
             "session_id": self._session_id,
             "$process_person_profile": False,
         }
-        self._client_name: str | None = None
-        self._client_version: str | None = None
-        self._protocol_version: str | None = None
         self._tools: dict[str, dict[str, Any]] = {}
+        self._legacy_requests = 0
+        self._modern_requests = 0
+        self._discover_probes = 0
         self._error_events_sent = 0
         self._errors_dropped = 0
         self._failure_streak: tuple[str, int] | None = None
@@ -221,20 +301,73 @@ class SessionTelemetry:
         self._finished = False
         self._lock = threading.Lock()
 
-    def record_session_start(self, client_info: dict[str, Any] | None, protocol_version: str) -> None:
+    def record_request(self, era: str, method: str) -> None:
+        """Count one envelope-valid request and activate on the first of them.
+
+        Called before the method runs, so a first request that fails still
+        reports its ``tool_error``. ``ping`` is counted but never activates: an
+        HTTP health probe must not conjure a session out of an idle server.
+        """
+
         with self._lock:
-            if self._active or self._finished:
-                return
-            self._active = True
-            if client_info:
-                self._client_name = _label(client_info.get("name"))
-                self._client_version = _label(client_info.get("version"))
-            self._protocol_version = _label(protocol_version)
-        if telemetry_mode() != "off":
+            if era == MODERN_ERA:
+                self._modern_requests += 1
+            else:
+                self._legacy_requests += 1
+            if method == DISCOVER_METHOD:
+                self._discover_probes += 1
+            activated = self._activate_locked() if method != "ping" else False
+        if era == MODERN_ERA:
+            note_first_appearance("modern-request", f"modern client request ({method})")
+        if method == DISCOVER_METHOD:
+            note_first_appearance("discover-probe", f"{DISCOVER_METHOD} probe")
+        if activated:
             self._emit([self._event("session_start", {})], wake=True)
 
+    def record_session_start(self, client_info: dict[str, Any] | None, protocol_version: str) -> None:
+        """Record one legacy handshake, activating the session if it is the first.
+
+        Every ``initialize`` emits its own ``handshake`` event — a connector
+        that probes, falls back, and handshakes again produces several — while
+        ``session_start`` is emitted at most once. The client identity belongs
+        to the handshake rather than to the session: the next request may come
+        from an entirely different client.
+        """
+
+        with self._lock:
+            activated = self._activate_locked()
+        note_first_appearance("legacy-handshake", f"legacy client handshake ({protocol_version})")
+        if telemetry_mode() == "off":
+            return
+        events = [self._event("session_start", {})] if activated else []
+        client_name, client_version = _client_identity(client_info)
+        events.append(
+            self._event(
+                "handshake",
+                {
+                    "protocol_version": _label(protocol_version),
+                    "client_name": client_name,
+                    "client_version": client_version,
+                },
+            )
+        )
+        self._emit(events, wake=True)
+
+    def _activate_locked(self) -> bool:
+        if self._active or self._finished:
+            return False
+        self._active = True
+        return True
+
     def record_tool_call(
-        self, tool: str, *, ok: bool, error_code: str | None, duration_ms: int, truncated: bool
+        self,
+        tool: str,
+        *,
+        ok: bool,
+        error_code: str | None,
+        duration_ms: int,
+        truncated: bool,
+        context: Any = None,
     ) -> None:
         emit_error: tuple[str, int] | None = None
         with self._lock:
@@ -266,6 +399,7 @@ class SessionTelemetry:
                     else:
                         self._errors_dropped += 1
         if emit_error is not None and telemetry_mode() != "off":
+            client_name, client_version = _request_identity(context)
             self._emit(
                 [
                     self._event(
@@ -275,12 +409,14 @@ class SessionTelemetry:
                             "error_code": emit_error[0],
                             "duration_ms": duration_ms,
                             "consecutive_failures": emit_error[1],
+                            "client_name": client_name,
+                            "client_version": client_version,
                         },
                     )
                 ]
             )
 
-    def finish(self) -> None:
+    def finish(self, *, output_retention: Mapping[str, int] | None = None) -> None:
         with self._lock:
             if self._finished:
                 return
@@ -302,26 +438,23 @@ class SessionTelemetry:
                     properties[f"err_{code}"] = count
                 properties.update(stats["buckets"])
                 events.append(self._event("tool_summary", properties))
-            events.append(
-                self._event(
-                    "session_end",
-                    {
-                        "duration_ms": duration_ms,
-                        "tool_calls": sum(stats["calls"] for stats in self._tools.values()),
-                        "distinct_tools": len(self._tools),
-                        "errors_dropped": self._errors_dropped,
-                    },
-                )
-            )
+            end_properties: dict[str, Any] = {
+                "duration_ms": duration_ms,
+                "tool_calls": sum(stats["calls"] for stats in self._tools.values()),
+                "distinct_tools": len(self._tools),
+                "errors_dropped": self._errors_dropped,
+                "legacy_requests": self._legacy_requests,
+                "modern_requests": self._modern_requests,
+                "discover_probes": self._discover_probes,
+            }
+            for counter in _RETENTION_COUNTERS:
+                value = output_retention.get(counter, 0) if output_retention else 0
+                end_properties[counter] = int(value)
+            events.append(self._event("session_end", end_properties))
         self._emit(events, wake=True)
 
     def _event(self, name: str, properties: dict[str, Any]) -> dict[str, Any]:
-        merged: dict[str, Any] = {
-            **self._base_properties,
-            "client_name": self._client_name,
-            "client_version": self._client_version,
-            "protocol_version": self._protocol_version,
-        }
+        merged: dict[str, Any] = dict(self._base_properties)
         merged.update(properties)
         return {
             "event": name,

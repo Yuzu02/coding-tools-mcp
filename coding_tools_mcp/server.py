@@ -1348,7 +1348,7 @@ class Runtime:
         self._closed = True
         if self._owns_command_manager:
             self.command_manager.close()
-        self.telemetry.finish()
+        self.telemetry.finish(output_retention=self.command_manager.retention_stats_snapshot())
 
     @property
     def commands(self) -> dict[str, CommandRun]:
@@ -1556,10 +1556,12 @@ class Runtime:
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
+            # The static budget only: how often it was actually hit is a
+            # runtime-wide counter and is reported in telemetry, not to
+            # whichever client happened to ask.
             "output_retention": {
                 "buffer_bytes_per_stream": COMMAND_BUFFER_BYTES,
                 "head_bytes_per_stream": COMMAND_BUFFER_BYTES // COMMAND_HEAD_BUFFER_DIVISOR,
-                **self.command_manager.retention_stats_snapshot(),
             },
             "endpoint_path": MCP_ENDPOINT_PATH,
             "project_context": {
@@ -1667,17 +1669,18 @@ class Runtime:
         *,
         context: RequestContext | None = None,
     ) -> None:
-        # `context` carries the per-request facts telemetry will label traces
-        # with once observability is wired to it; nothing reads it yet.
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
+        # `context` is passed on as the opaque per-request fact it is: the
+        # runtime neither reads the client identity in it nor branches on it.
         self.telemetry.record_tool_call(
             name,
             ok=bool(payload.get("ok")),
             error_code=error.get("code"),
             duration_ms=duration_ms,
             truncated=bool(payload.get("truncated")),
+            context=context,
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return

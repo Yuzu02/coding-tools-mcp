@@ -13,10 +13,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import patch
 
 from coding_tools_mcp import server as server_module
 from coding_tools_mcp import processes as processes_module
+from coding_tools_mcp import telemetry as telemetry_module
 from coding_tools_mcp.patching import AtomicPatchCommitter, FileBaseline, StagedFile
 from coding_tools_mcp.server import (
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
@@ -38,6 +40,19 @@ from coding_tools_mcp.tool_results import (
     make_tool_result,
 )
 from tests.compliance.fixtures import git_fixture_preflight_error, init_git
+
+
+class _RecordingSender:
+    """Stands in for the telemetry sender and keeps the events in memory."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.events = events
+
+    def enqueue(self, events: list[dict[str, Any]], *, wake: bool = False) -> None:
+        self.events.extend(events)
+
+    def flush(self) -> None:
+        pass
 
 
 @contextmanager
@@ -1417,8 +1432,9 @@ Maven home: /usr/share/maven
                 self.assertEqual(third.get("content"), data[60:].decode())
                 self.assertIsNone(third.get("next_offset"))
 
-    def test_output_retention_counters_and_server_info_track_evicted_output(self) -> None:
+    def test_output_retention_counters_track_evicted_output_and_reach_telemetry(self) -> None:
         data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
+        events: list[dict[str, Any]] = []
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="trusted")
             with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
@@ -1440,18 +1456,28 @@ Maven home: /usr/share/maven
                 stats = runtime.command_manager.retention_stats_snapshot()
                 self.assertEqual(stats["read_output_omitted_hits"], 1)
 
+                # server_info reports the static budget; how often it was hit
+                # is a runtime-wide counter that belongs to telemetry.
                 retention = runtime.server_info_payload()["output_retention"]
-                self.assertEqual(retention["evict_events"], 1)
-                self.assertEqual(retention["evicted_bytes_total"], 32)
-                self.assertEqual(retention["read_output_omitted_hits"], 1)
                 self.assertEqual(
-                    retention["buffer_bytes_per_stream"],
-                    server_module.COMMAND_BUFFER_BYTES,
+                    retention,
+                    {
+                        "buffer_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES,
+                        "head_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES // 8,
+                    },
                 )
-                self.assertEqual(
-                    retention["head_bytes_per_stream"],
-                    server_module.COMMAND_BUFFER_BYTES // 8,
-                )
+
+            with patch.object(telemetry_module, "telemetry_mode", lambda: "on"):
+                with patch.object(telemetry_module, "_get_sender", lambda: _RecordingSender(events)):
+                    runtime.telemetry.record_request("legacy", "tools/call")
+                    runtime.close()
+
+        session_end = next(event for event in events if event["event"] == "session_end")
+        properties = session_end["properties"]
+        self.assertEqual(properties["evict_events"], 1)
+        self.assertEqual(properties["evicted_bytes_total"], 32)
+        self.assertEqual(properties["read_output_omitted_hits"], 1)
+        self.assertEqual(properties["poll_omitted_hits"], 0)
 
     def test_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:
