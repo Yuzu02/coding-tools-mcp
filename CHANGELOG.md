@@ -87,6 +87,9 @@
   failure reports `RUNTIME_DIR_UNWRITABLE` instead of moving a running
   command's directories, and the non-git diff fallback snapshots its patch
   baselines under the patch lock.
+- The `dev` extra now installs the official MCP python SDK (`mcp`). The
+  compliance suite drives this server with it over both transports, which is
+  the only check in the suite that does not use a client we wrote ourselves.
 - Telemetry now measures the process rather than one client's handshake. A
   session is activated by the first request or notification that passes
   envelope validation — in either era, and before the method runs, so a first

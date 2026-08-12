@@ -22,6 +22,7 @@ CONTRACT = "coding-tools-mcp-v0.2"
 
 SUITES = {
     "mcp-contract": ["tests.compliance.test_mcp_contract"],
+    "dual-era": ["tests.compliance.test_dual_era"],
     "tool-golden": ["tests.compliance.test_tool_golden"],
     "security": ["tests.compliance.test_security"],
     "e2e": ["tests.compliance.test_e2e"],

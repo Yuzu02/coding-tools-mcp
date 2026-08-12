@@ -25,6 +25,9 @@ Issues = "https://github.com/xyTom/coding-tools-mcp/issues"
 
 [project.optional-dependencies]
 dev = [
+  # The official MCP SDK is the only client in the test suite we did not
+  # write; the dual-era smoke needs it installed to run at all.
+  "mcp>=2.0",
   "mypy>=2.1,<2.2",
   "PyYAML>=6.0",
   "ruff>=0.15,<0.16",

@@ -19,7 +19,7 @@ DESKTOP_PACKAGE := apps/desktop-client/mcp_desktop_client
 DESKTOP_TS := $(DESKTOP_PACKAGE)/locales/app_zh_CN.ts
 DESKTOP_QM := $(DESKTOP_PACKAGE)/locales/app_zh_CN.qm
 
-.PHONY: start lint typecheck test ci check-dispatch-inputs check-npm-launcher check-release compliance test-protocol test-integration test-mcp-contract test-tool-golden test-security test-e2e test-runtime-semantics test-docs-required test-schema-drift dogfood-mcp dogfood-runner dogfood-smoke benchmark-latency benchmark-smoke benchmark-real-workloads swebench-reference-predictions swebench-preflight swebench-evaluate desktop-i18n-update desktop-i18n-release desktop-i18n-check install-user publish-testpypi publish-pypi publish-all report
+.PHONY: start lint typecheck test ci check-dispatch-inputs check-npm-launcher check-release compliance test-protocol test-integration test-mcp-contract test-dual-era test-tool-golden test-security test-e2e test-runtime-semantics test-docs-required test-schema-drift dogfood-mcp dogfood-runner dogfood-smoke benchmark-latency benchmark-smoke benchmark-real-workloads swebench-reference-predictions swebench-preflight swebench-evaluate desktop-i18n-update desktop-i18n-release desktop-i18n-check install-user publish-testpypi publish-pypi publish-all report
 
 start:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m coding_tools_mcp --workspace "$(MCP_WORKSPACE)" --host "$(MCP_HOST)" --port "$(MCP_PORT)" $(MCP_ARGS)
@@ -51,10 +51,13 @@ compliance:
 
 test-protocol: test-mcp-contract
 
-test-integration: test-tool-golden test-security test-e2e test-runtime-semantics
+test-integration: test-dual-era test-tool-golden test-security test-e2e test-runtime-semantics
 
 test-mcp-contract:
 	$(COMPLIANCE_RUNNER) --suite mcp-contract $(REPORT_FLAG)
+
+test-dual-era:
+	$(COMPLIANCE_RUNNER) --suite dual-era $(REPORT_FLAG)
 
 test-tool-golden:
 	$(COMPLIANCE_RUNNER) --suite tool-golden $(REPORT_FLAG)

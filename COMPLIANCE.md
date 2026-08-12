@@ -34,6 +34,7 @@ It adds lint, typecheck, unittest discovery, required docs checks, schema-drift 
 
 ```bash
 make test-mcp-contract
+make test-dual-era
 make test-tool-golden
 make test-security
 make test-e2e
