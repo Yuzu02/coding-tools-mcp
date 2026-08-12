@@ -8,12 +8,13 @@ from .protocol import RequestContext, dispatch_rpc, invalid_request_response, js
 
 
 class StdioRuntime(Protocol):
-    protocol_version: str
-    initialized: bool
+    def initialize(
+        self,
+        client_info: dict[str, Any] | None = None,
+        protocol_version: str = ...,
+    ) -> dict[str, Any]: ...
 
-    def initialize(self, client_info: dict[str, Any] | None = None) -> dict[str, Any]: ...
-
-    def initialize_result(self) -> dict[str, Any]: ...
+    def initialize_result(self, protocol_version: str = ...) -> dict[str, Any]: ...
 
     def server_identity(self) -> dict[str, Any]: ...
 

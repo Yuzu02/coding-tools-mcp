@@ -103,7 +103,6 @@ class MCPClient:
     workspace: Path
     url: str | None = None
     process: subprocess.Popen[str] | None = None
-    session_id: str | None = None
     request_id: int = 0
     initialized: bool = False
 
@@ -257,15 +256,10 @@ class MCPClient:
         auth_token = os.environ.get("CODING_TOOLS_MCP_AUTH_TOKEN")
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
         request = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
         try:
             request_timeout = float(os.environ.get("CODING_TOOLS_MCP_CLIENT_TIMEOUT", "30"))
             with urllib.request.urlopen(request, timeout=request_timeout) as response:
-                session_id = response.headers.get("Mcp-Session-Id")
-                if session_id:
-                    self.session_id = session_id
                 body = response.read()
                 if response.status in (202, 204) or not body:
                     return {}

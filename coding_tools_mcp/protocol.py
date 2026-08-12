@@ -25,16 +25,6 @@ META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
 
-KNOWN_METHODS = frozenset(
-    {
-        "initialize",
-        "notifications/initialized",
-        "notifications/cancelled",
-        "ping",
-        "tools/list",
-        "tools/call",
-    }
-)
 MODERN_METHODS = frozenset(
     {
         "notifications/cancelled",
@@ -234,9 +224,10 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
     """Dispatch one MCP JSON-RPC request against a runtime, shared by all transports.
 
     The era is decided first, from the request itself: a modern request states
-    its protocol version per request and never touches the handshake state a
-    legacy client builds up on ``runtime.initialized``. Transports add only
-    their transport-specific framing (session headers, stream handling) around
+    its protocol version per request, a legacy one negotiated it through a
+    handshake this runtime keeps no record of. Neither era leaves state behind,
+    so one runtime answers every client of the workspace. Transports add only
+    their transport-specific framing (stream handling, status codes) around
     this. Returns None for notifications and requests without an id.
     """
 
@@ -249,7 +240,7 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
             context = modern_request_context(params)
             result = _dispatch_modern(runtime, method, params, context)
         else:
-            context = RequestContext(era=LEGACY_ERA, protocol_version=runtime.protocol_version)
+            context = RequestContext(era=LEGACY_ERA, protocol_version=LATEST_LEGACY_PROTOCOL_VERSION)
             result = _dispatch_legacy(runtime, request, method, params, context)
         if result is None or request_id is None:
             return None
@@ -295,37 +286,22 @@ def _dispatch_legacy(
 ) -> dict[str, Any] | None:
     """Handle a request that negotiated its version through ``initialize``.
 
-    Handshake state lives on ``runtime.initialized``. A method this server does
-    not implement is rejected before that state is consulted, so a client
-    probing for an unsupported method learns the method is unknown instead of
-    being told to handshake first. Returns None for a notification.
+    No handshake state is kept, so nothing here depends on what a client sent
+    before: a method this server does not implement is unknown, and every other
+    method is served whether or not the client handshook first. ``initialize``
+    is therefore idempotent — it negotiates a version and answers with it as
+    often as it is asked, which is what a connector that probes, falls back,
+    and handshakes again needs. Returns None for a notification.
     """
 
-    if method not in KNOWN_METHODS:
-        raise JsonRpcError(-32601, f"Unknown method: {method}")
-    if not runtime.initialized and method not in {"initialize", "ping"}:
-        raise JsonRpcError(-32002, "Server not initialized")
     if method == "initialize":
         validate_initialize_request(request)
         negotiated_version = validate_initialize_params(params)
-        if runtime.initialized:
-            # Some connectors send a second initialize on one persistent
-            # STDIO process. Rejecting it fails their tool scan even though
-            # the session is healthy, so replay the negotiated handshake
-            # instead. The initializer is not run again, so no session
-            # state is reset by a repeat.
-            if negotiated_version != runtime.protocol_version:
-                raise JsonRpcError(
-                    -32600,
-                    "Server is already initialized with a different protocol version",
-                    {"expected": runtime.protocol_version, "received": negotiated_version},
-                )
-            return runtime.initialize_result()
-        runtime.protocol_version = negotiated_version
         client_info = params.get("clientInfo")
-        result = runtime.initialize(client_info if isinstance(client_info, dict) else None)
-        runtime.initialized = True
-        return result
+        return runtime.initialize(
+            client_info if isinstance(client_info, dict) else None,
+            negotiated_version,
+        )
     if method == "notifications/initialized":
         return None
     if method == "notifications/cancelled":
@@ -340,7 +316,6 @@ def _dispatch_legacy(
         return runtime.list_tools()
     if method == "tools/call":
         return _call_tool(runtime, params, context)
-    # only reachable if KNOWN_METHODS gains a method without a branch here
     raise JsonRpcError(-32601, f"Unknown method: {method}")
 
 

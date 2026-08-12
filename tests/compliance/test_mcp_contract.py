@@ -132,7 +132,7 @@ class MCPContractTests(ComplianceTestCase):
                 with self.subTest(tool=name, fragment=fragment):
                     self.assertIn(fragment, description)
 
-    def test_http_sessions_share_workspace_commands(self) -> None:
+    def test_concurrent_http_clients_share_workspace_commands(self) -> None:
         with MCPClient(self.workspace.root, url=self.client.url) as sibling:
             started = self.client.call_tool(
                 "exec_command",
@@ -150,7 +150,7 @@ class MCPContractTests(ComplianceTestCase):
             )
             self.assertIn(killed.get("status"), {"killed", "exited"})
 
-    def test_http_session_delete_does_not_terminate_workspace_command(self) -> None:
+    def test_http_client_disconnect_does_not_terminate_workspace_command(self) -> None:
         with MCPClient(self.workspace.root, url=self.client.url) as owner:
             started = self.assert_tool_success(
                 owner.call_tool(
@@ -406,44 +406,55 @@ class MCPContractTests(ComplianceTestCase):
                 self.assertEqual(response.get("error", {}).get("code"), -32600)
                 self.assertIn("Origin denied", response.get("error", {}).get("message", ""))
 
-    def test_http_rejects_unknown_session_id_header(self) -> None:
-        self.assertIsNotNone(self.client.session_id)
-        body = b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}'
-        accepted_status, accepted = self.raw_http_post(body, headers={"Mcp-Session-Id": str(self.client.session_id)})
-        self.assertEqual(accepted_status, 200)
-        self.assertEqual(accepted.get("result"), {})
+    def test_http_ignores_any_session_id_header(self) -> None:
+        """A client that still echoes a session id from an older server is served.
 
-        rejected_status, rejected = self.raw_http_post(body, headers={"Mcp-Session-Id": "not-the-current-session"})
-        self.assertEqual(rejected_status, 404)
-        self.assertEqual(rejected.get("id"), 1)
-        self.assertEqual(rejected.get("error", {}).get("code"), -32001)
-        self.assertIn("Unknown MCP session", rejected.get("error", {}).get("message", ""))
+        The header was only ever sent because a server issued one; this server
+        issues none, so whatever a client returns is neither trusted nor a
+        reason to refuse the request.
+        """
 
-    def test_http_delete_terminates_only_the_selected_session(self) -> None:
+        body = b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+        for session_id in ("not-the-current-session", "", "..stale-handle.."):
+            with self.subTest(session_id=session_id):
+                status, response = self.raw_http_post(body, headers={"Mcp-Session-Id": session_id})
+                self.assertEqual(status, 200)
+                self.assertNotIn("error", response)
+                self.assertIsInstance(response.get("result", {}).get("tools"), list)
+
+    def test_http_delete_is_rejected_without_disturbing_running_commands(self) -> None:
         self.assertIsNotNone(self.client.url)
-        with MCPClient(self.workspace.root, url=self.client.url) as sibling:
-            sibling_session = str(sibling.session_id)
-            parsed = urllib.parse.urlparse(str(self.client.url))
-            base = f"{parsed.scheme}://{parsed.netloc}"
-            status, _, body = self.raw_base_http_request(
-                base,
-                "DELETE",
-                parsed.path or "/mcp",
-                headers={
-                    "Mcp-Session-Id": sibling_session,
-                    "MCP-Protocol-Version": "2025-06-18",
-                },
+        started = self.assert_tool_success(
+            self.client.call_tool(
+                "exec_command",
+                {"cmd": "sleep 5", "timeout_ms": 10000, "yield_time_ms": 0},
             )
-            self.assertEqual(status, 200, body)
-            rejected_status, rejected = self.raw_http_post(
-                b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}',
-                headers={"Mcp-Session-Id": sibling_session},
-            )
-            self.assertEqual(rejected_status, 404)
-            self.assertEqual(rejected.get("error", {}).get("code"), -32001)
+        )
+        command_id = started.get("command_id")
+        self.assertIsInstance(command_id, str)
 
-        still_alive = self.client.rpc("ping", {})
-        self.assertEqual(still_alive, {})
+        parsed = urllib.parse.urlparse(str(self.client.url))
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        status, headers, body = self.raw_base_http_request(
+            base,
+            "DELETE",
+            parsed.path or "/mcp",
+            headers={"MCP-Protocol-Version": "2025-06-18"},
+        )
+        self.assertEqual(status, 405, body)
+        self.assertEqual(headers.get("allow"), "POST")
+
+        unknown_status, _, _ = self.raw_base_http_request(base, "DELETE", "/not-mcp")
+        self.assertEqual(unknown_status, 404)
+
+        polled = self.assert_tool_success(
+            self.client.call_tool("write_stdin", {"command_id": command_id, "chars": "", "yield_time_ms": 0})
+        )
+        self.assertEqual(polled.get("status"), "running")
+        killed = self.assert_tool_success(
+            self.client.call_tool("kill_command", {"command_id": command_id, "signal": "KILL"})
+        )
+        self.assertIn(killed.get("status"), {"killed", "exited"})
 
     def test_http_discovery_endpoints_return_server_card_metadata(self) -> None:
         self.assertIsNotNone(self.client.url)
@@ -454,9 +465,14 @@ class MCPContractTests(ComplianceTestCase):
                 request = urllib.request.Request(base + path, method="GET")
                 with urllib.request.urlopen(request, timeout=5) as response:
                     body = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(body.get("protocolVersion"), "2025-11-25")
+                self.assertEqual(
+                    body.get("supportedProtocolVersions"),
+                    [MODERN_PROTOCOL_VERSION, "2025-11-25", "2025-06-18"],
+                )
+                self.assertNotIn("protocolVersion", body)
                 self.assertEqual(body.get("server", {}).get("name"), "coding-tools-mcp")
                 self.assertEqual(body.get("transport", {}).get("endpoint"), "/mcp")
+                self.assertEqual(body.get("transport", {}).get("methods"), ["POST", "OPTIONS"])
                 self.assertEqual(body.get("auth", {}).get("type"), "none")
                 self.assertIn("tools", body)
 
@@ -900,15 +916,15 @@ class MCPContractTests(ComplianceTestCase):
         self.assertIsNone(response.get("id"))
         self.assertEqual(response.get("error", {}).get("code"), -32700)
 
-    def test_http_rejects_tools_before_initialize(self) -> None:
+    def test_http_serves_tools_without_a_handshake(self) -> None:
         process, url = self.start_raw_http_server()
         try:
             self.wait_for_ping(url)
-            with self.assertRaises(urllib.error.HTTPError) as raised:
-                self.raw_post_to(url, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-            response = json.loads(raised.exception.read().decode("utf-8"))
-            self.assertEqual(response.get("error", {}).get("code"), -32002)
-            self.assertIn("not initialized", response.get("error", {}).get("message", "").lower())
+            response = self.raw_post_to(url, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            self.assertNotIn("error", response)
+            tools = response.get("result", {}).get("tools")
+            self.assertIsInstance(tools, list)
+            self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
         finally:
             self.stop_process(process)
 
@@ -1057,14 +1073,16 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
-    def test_stdio_rejects_preinitialize_calls_and_accepts_cancel_notification(self) -> None:
+    def test_stdio_serves_preinitialize_calls_and_accepts_cancel_notification(self) -> None:
         process = self.start_stdio_server()
         try:
-            rejected = self.stdio_rpc_allow_error(
+            listed = self.stdio_rpc(
                 process,
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
             )
-            self.assertEqual(rejected.get("error", {}).get("code"), -32002)
+            tools = listed.get("result", {}).get("tools")
+            self.assertIsInstance(tools, list)
+            self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
 
             initialize = self.stdio_rpc(
                 process,
@@ -1085,7 +1103,7 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
-    def test_stdio_replays_duplicate_initialize_after_a_failed_probe(self) -> None:
+    def test_stdio_repeats_initialize_after_a_failed_probe(self) -> None:
         """Replay the sequence from issue #39: probe, initialize, initialize again."""
 
         process = self.start_stdio_server()
@@ -1111,11 +1129,24 @@ class MCPContractTests(ComplianceTestCase):
             )
             self.assertEqual(first.get("result", {}).get("protocolVersion"), "2025-11-25")
 
-            replayed = self.stdio_rpc(
+            repeated = self.stdio_rpc(
                 process,
                 {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": params},
             )
-            self.assertEqual(replayed.get("result"), first.get("result"))
+            self.assertEqual(repeated.get("result"), first.get("result"))
+
+            # Each handshake negotiates on its own, so a repeat that asks for
+            # another supported version gets that version rather than an error.
+            other_version = self.stdio_rpc(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": "other-version",
+                    "method": "initialize",
+                    "params": {**params, "protocolVersion": "2025-06-18"},
+                },
+            )
+            self.assertEqual(other_version.get("result", {}).get("protocolVersion"), "2025-06-18")
 
             self.stdio_send(process, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
             self.assert_no_stdio_response(process)

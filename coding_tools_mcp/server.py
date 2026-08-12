@@ -70,6 +70,7 @@ from .processes import (
 from .protocol import (
     LATEST_LEGACY_PROTOCOL_VERSION,
     LEGACY_PROTOCOL_VERSIONS,
+    MODERN_PROTOCOL_VERSIONS,
     RequestContext,
     dispatch_rpc,
     jsonrpc_error,
@@ -81,7 +82,6 @@ from .project_context import ProjectContext, load_project_context
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
-from .transport_http import HTTPSessionManager
 from .transport_stdio import serve_stdio
 
 
@@ -1319,18 +1319,15 @@ class Runtime:
         self._runtime_dir_lock = threading.Lock()
         self._runtime_dir_resolved = False
         self._closed = False
-        self.http_session_id = secrets.token_urlsafe(24)
-        self.protocol_version = LATEST_LEGACY_PROTOCOL_VERSION
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
         # ProjectContext is frozen and derived only from the workspace tree, so
-        # per-session HTTP runtimes reuse the server's copy instead of re-running
-        # discovery (git ls-files / directory walk) on every connect.
+        # an embedder that builds several runtimes over one workspace can reuse
+        # the discovery (git ls-files / directory walk) result.
         self.project_context: ProjectContext = (
             project_context if project_context is not None else load_project_context(self.workspace.root)
         )
-        self.initialized = False
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
 
@@ -1453,19 +1450,24 @@ class Runtime:
             return False
         return is_relative_to(resolved, self.runtime_dir)
 
-    def initialize(self, client_info: dict[str, Any] | None = None) -> dict[str, Any]:
-        self.telemetry.record_session_start(client_info, self.protocol_version)
-        return self.initialize_result()
+    def initialize(
+        self,
+        client_info: dict[str, Any] | None = None,
+        protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION,
+    ) -> dict[str, Any]:
+        self.telemetry.record_session_start(client_info, protocol_version)
+        return self.initialize_result(protocol_version)
 
-    def initialize_result(self) -> dict[str, Any]:
-        """Build the handshake payload without recording a new session.
+    def initialize_result(self, protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION) -> dict[str, Any]:
+        """Build the handshake payload for one negotiated version.
 
-        Replaying a duplicate initialize uses this so the telemetry session
-        count stays tied to real sessions.
+        The version is negotiated per request rather than stored: one runtime
+        serves every client of the workspace, and two of them may well have
+        handshaken on different versions.
         """
 
         return {
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": self.server_identity(),
             "instructions": self.project_context.server_instructions(),
@@ -1534,7 +1536,7 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
-            "protocol_version": self.protocol_version,
+            "supported_protocol_versions": [*MODERN_PROTOCOL_VERSIONS, *LEGACY_PROTOCOL_VERSIONS],
             **self._exec_environment_summary(),
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
@@ -4744,7 +4746,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     read_only = [name for name in names if annotations[name].get("readOnlyHint") is True]
     mutating = [name for name in names if annotations[name].get("readOnlyHint") is not True]
     payload = {
-        "protocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+        "supportedProtocolVersions": [*MODERN_PROTOCOL_VERSIONS, *LEGACY_PROTOCOL_VERSIONS],
         "server": {
             "name": SERVER_NAME,
             "title": SERVER_TITLE,
@@ -4753,7 +4755,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         "transport": {
             "type": "streamable_http",
             "endpoint": MCP_ENDPOINT_PATH,
-            "methods": ["POST", "DELETE", "OPTIONS"],
+            "methods": ["POST", "OPTIONS"],
         },
         "auth": _server_card_auth(runtime, oauth_base_url=oauth_base_url),
         "tools": {
@@ -4775,7 +4777,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
     @property
     def runtime(self) -> Runtime:
-        return cast(Runtime, getattr(self, "_runtime", self.server.control_runtime))  # type: ignore[attr-defined]
+        return cast(Runtime, self.server.runtime)  # type: ignore[attr-defined]
 
     def log_message(self, format: str, *args: Any) -> None:
         print(format % args, file=sys.stderr)
@@ -4812,14 +4814,14 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if not self.is_authorized():
             self.send_unauthorized()
             return
-        session_id = self.headers.get("Mcp-Session-Id")
-        if not session_id or not self.server.sessions.delete(session_id):  # type: ignore[attr-defined]
-            self.send_rpc_error(-32001, "Unknown MCP session", status=404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.send_cors_headers()
-        self.end_headers()
+        # There is no session to terminate: every request is served by the one
+        # workspace runtime, which outlives any single client.
+        self.send_rpc_error(
+            -32601,
+            "DELETE is not supported: this endpoint has no sessions to terminate",
+            status=405,
+            extra_headers={"Allow": "POST"},
+        )
 
     def do_OPTIONS(self) -> None:
         request_path = self.path.split("?", 1)[0]
@@ -4840,7 +4842,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "Origin denied"}, status=403)
             return
         self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
+        self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
         self.send_cors_headers()
         self.end_headers()
 
@@ -4868,7 +4870,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 -32000,
                 "SSE GET stream is not supported",
                 status=405,
-                extra_headers={"Allow": "POST, DELETE"},
+                extra_headers={"Allow": "POST"},
                 head_only=head_only,
             )
             return
@@ -4950,52 +4952,13 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 exc.code, exc.message, status=200, request_id=response_id(request), data=exc.data
             )
             return
-        method = request.get("method")
-        session_id = self.headers.get("Mcp-Session-Id")
-        created_session = False
-        if method == "initialize":
-            if session_id:
-                self.send_rpc_error(
-                    -32600, "initialize must not include Mcp-Session-Id", request_id=request.get("id")
-                )
-                return
-            try:
-                self._runtime = self.server.sessions.create()  # type: ignore[attr-defined]
-            except RuntimeError as exc:
-                self.send_rpc_error(-32000, str(exc), status=503, request_id=request.get("id"))
-                return
-            self._send_session_header = True
-            created_session = True
-        elif session_id:
-            runtime = self.server.sessions.get(session_id)  # type: ignore[attr-defined]
-            if runtime is None:
-                self.send_rpc_error(
-                    -32001, "Unknown MCP session", status=404, request_id=response_id(request)
-                )
-                return
-            self._runtime = runtime
-            self._send_session_header = True
-            if protocol_version != runtime.protocol_version:
-                self.send_rpc_error(
-                    -32600,
-                    "MCP-Protocol-Version does not match the initialized session",
-                    request_id=request.get("id"),
-                    data={"expected": runtime.protocol_version, "received": protocol_version},
-                )
-                return
-        elif method == "ping":
-            self._runtime = self.server.control_runtime  # type: ignore[attr-defined]
-        else:
-            self.send_rpc_error(-32002, "Server not initialized", request_id=request.get("id"))
-            return
+        # Every request is served by the one workspace runtime. A client that
+        # still echoes an ``Mcp-Session-Id`` from an older server is served
+        # like any other rather than rejected, so an upgrade needs no client
+        # change.
         response = self.handle_rpc(request)
-        if created_session and response is not None and "error" in response:
-            self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
-            self._send_session_header = False
         if response is None:
             self.send_response(202)
-            if getattr(self, "_send_session_header", False):
-                self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
             self.send_cors_headers()
             self.end_headers()
             return
@@ -5367,7 +5330,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if origin and is_allowed_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
             self.send_header(
                 "Access-Control-Allow-Headers",
                 "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id",
@@ -5386,8 +5349,6 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        if getattr(self, "_send_session_header", False):
-            self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
         self.send_cors_headers()
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
@@ -5403,16 +5364,13 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
         self,
         address: tuple[str, int],
         handler: type[MCPHandler],
-        control_runtime: Runtime,
-        runtime_factory: Any,
+        runtime: Runtime,
     ) -> None:
         super().__init__(address, handler)
-        self.control_runtime = control_runtime
-        self.sessions = HTTPSessionManager(runtime_factory)
+        self.runtime = runtime
 
     def server_close(self) -> None:
-        self.sessions.close()
-        self.control_runtime.close()
+        self.runtime.close()
         super().server_close()
 
 
@@ -5567,20 +5525,7 @@ def run_http(args: argparse.Namespace) -> int:
         return 2
 
     runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
-
-    def runtime_factory() -> Runtime:
-        return build_runtime(
-            args,
-            runtime_policy,
-            auth_token=auth_token,
-            oauth_config=oauth_config,
-            emit_warning=False,
-            project_context=runtime.project_context,
-            transport="http",
-            command_manager=runtime.command_manager,
-        )
-
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)
+    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
         suffix = " + bearer" if runtime.auth_token else ""

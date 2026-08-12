@@ -56,8 +56,29 @@
 - A method this server does not implement now returns `-32601` before the
   handshake as well as after it. Such a call previously returned `-32002 Server
   not initialized`, which tells a client to handshake and retry a method that
-  will never exist. Implemented methods are unchanged: calling one before
-  `initialize` still returns `-32002`.
+  will never exist.
+- **Breaking:** HTTP is now stateless. The server no longer issues an
+  `Mcp-Session-Id`, and a request that returns one from an older server is
+  served normally instead of being refused with `-32001 Unknown MCP session`.
+  Every request is answered by the one runtime that owns the workspace, so the
+  128-session ceiling and its `503`, the session idle expiry, and the
+  `MCP-Protocol-Version`-must-match-the-session check are all gone.
+- **Breaking:** `DELETE /mcp` now returns `405` with `Allow: POST`; there is no
+  session to terminate. `DELETE` is no longer advertised in the `Allow`,
+  `Access-Control-Allow-Methods`, or server card `transport.methods` lists.
+- **Breaking:** the handshake is no longer an admission gate. `tools/list`,
+  `tools/call`, and the other implemented methods are served whether or not
+  the caller sent `initialize` first, and `-32002 Server not initialized` is
+  never returned. `initialize` is now idempotent: each one negotiates a
+  version on its own and answers with it, so a repeat that names a different
+  supported version is answered with that version instead of `-32600 Server is
+  already initialized with a different protocol version`. Only the first
+  handshake of a process records a telemetry session.
+- **Breaking:** `server_info` reports `supported_protocol_versions` (every
+  version this server speaks, newest first) in place of `protocol_version`
+  (the one version a session had negotiated), and the server card at
+  `/.well-known/mcp.json` reports `supportedProtocolVersions` in place of
+  `protocolVersion`. Neither is a session-scoped value any more.
 - Runtime state a shared server exposes to concurrent requests is hardened:
   the runtime directory (and the `HOME`, `TMPDIR`, and cache directories under
   it) is resolved to the primary or fallback location exactly once, so a later
