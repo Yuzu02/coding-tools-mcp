@@ -26,7 +26,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from coding_tools_mcp.protocol import KNOWN_PROTOCOL_VERSIONS
 from coding_tools_mcp.server import Runtime
 from tests.compliance.fixtures import FixtureWorkspace, workspace_from_fixture
 from tests.compliance.mcp_client import prepend_repo_pythonpath, safe_server_env
@@ -37,6 +36,7 @@ LEGACY_PROTOCOL_VERSION = "2025-11-25"
 MODERN_PROTOCOL_VERSION = "2026-07-28"
 META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 MODERN_META_PREFIX = "io.modelcontextprotocol/"
 MODERN_RESULT_FIELDS = ("resultType", "ttlMs", "cacheScope")
 
@@ -158,6 +158,7 @@ class StdioConnection:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.process: subprocess.Popen[str] | None = None
+        self.methods_sent: list[str] = []
         self._responses: queue.Queue[str] = queue.Queue()
         self._stderr: list[str] = []
 
@@ -211,6 +212,7 @@ class StdioConnection:
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         process = self.process
         assert process is not None and process.stdin is not None
+        self.methods_sent.append(str(payload.get("method")))
         process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
         process.stdin.flush()
         try:
@@ -296,6 +298,47 @@ def legacy_script() -> list[tuple[str, dict[str, Any], str]]:
         ("ping", {}, "result"),
         ("resources/read", {"uri": "file:///nope"}, "rpc_error"),
     ]
+
+
+class ModernLifecycleTests(unittest.TestCase):
+    """The new era from first byte to last: one process, no handshake in it."""
+
+    def test_a_client_that_discovers_never_needs_to_initialize(self) -> None:
+        with workspace_from_fixture("tiny-js-project", git=False) as workspace:
+            with StdioConnection(workspace.root) as connection:
+                discovered = connection.request(modern_request(1, "server/discover"))
+                discovery = self.assert_modern_result(discovered)
+                self.assertEqual(discovery.get("supportedVersions"), [MODERN_PROTOCOL_VERSION])
+                self.assertEqual(discovery.get("capabilities"), {"tools": {"listChanged": False}})
+                self.assertTrue(discovery.get("instructions"), discovery)
+                self.assertEqual(discovery.get("ttlMs"), 0)
+                self.assertEqual(discovery.get("cacheScope"), "private")
+
+                listed = self.assert_modern_result(connection.request(modern_request(2, "tools/list")))
+                self.assertTrue({tool["name"] for tool in listed["tools"]} >= {"read_file"})
+
+                called = self.assert_modern_result(
+                    connection.request(
+                        modern_request(3, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}})
+                    )
+                )
+                self.assertFalse(called.get("isError", False), called)
+                self.assertEqual(structured_payload(called).get("path"), "src/math.js")
+
+                self.assertNotIn("initialize", connection.methods_sent)
+
+    def assert_modern_result(self, response: dict[str, Any]) -> dict[str, Any]:
+        self.assertNotIn("error", response, response)
+        result = response.get("result")
+        self.assertIsInstance(result, dict, response)
+        assert isinstance(result, dict)
+        self.assertEqual(result.get("resultType"), "complete", result)
+        self.assertEqual(
+            result.get("_meta", {}).get(META_SERVER_INFO, {}).get("name"),
+            "coding-tools-mcp",
+            result,
+        )
+        return result
 
 
 class ConcurrentClientTests(ComplianceTestCase):
@@ -468,11 +511,9 @@ def require_official_sdk(test: unittest.TestCase) -> None:
 async def sdk_smoke(transport: Any) -> dict[str, Any]:
     """Connect, negotiate, list the tools, and call one cheap read-only tool.
 
-    The SDK probes `server/discover` first and, until that method is enabled,
-    is answered with `-32601` and falls back to the handshake era on its own.
-    So this reports only that the server was usable and never asserts a
-    `2026-07-28` result shape; those assertions belong with the switch that
-    turns discover on.
+    The SDK probes `server/discover` before it considers a handshake, so what
+    it reports back is also the verdict on that answer: a client we did not
+    write read our discover result and settled on the era it describes.
     """
 
     from mcp import Client
@@ -480,9 +521,12 @@ async def sdk_smoke(transport: Any) -> dict[str, Any]:
     async with Client(transport, raise_exceptions=True) as client:
         listed = await client.list_tools()
         result = await client.call_tool("check_exec_environment", {})
+        tools_capability = getattr(client.server_capabilities, "tools", None)
         return {
             "protocol_version": client.protocol_version,
             "server_name": getattr(client.server_info, "name", None),
+            "instructions": client.instructions or "",
+            "tools_capability": None if tools_capability is None else tools_capability.list_changed,
             "tools": sorted(tool.name for tool in listed.tools),
             "is_error": bool(result.is_error),
             "content": [type(item).__name__ for item in result.content],
@@ -499,8 +543,13 @@ def run_sdk_smoke(transport: Any) -> dict[str, Any]:
 
 
 def assert_sdk_smoke(test: unittest.TestCase, summary: dict[str, Any]) -> None:
-    test.assertIn(summary["protocol_version"], KNOWN_PROTOCOL_VERSIONS, summary)
+    # Anything less than the modern version means the SDK read our discover
+    # result and went back to the handshake anyway, which is the failure this
+    # smoke exists to catch.
+    test.assertEqual(summary["protocol_version"], MODERN_PROTOCOL_VERSION, summary)
     test.assertEqual(summary["server_name"], "coding-tools-mcp", summary)
+    test.assertEqual(summary["tools_capability"], False, summary)
+    test.assertIn("inside the configured workspace", summary["instructions"], summary)
     test.assertIn("check_exec_environment", summary["tools"])
     test.assertGreaterEqual(len(summary["tools"]), 18, summary)
     test.assertFalse(summary["is_error"], summary)

@@ -72,6 +72,7 @@ from .protocol import (
     KNOWN_PROTOCOL_VERSIONS,
     LATEST_LEGACY_PROTOCOL_VERSION,
     MODERN_ERA,
+    MODERN_PROTOCOL_VERSIONS,
     UNSUPPORTED_PROTOCOL_VERSION,
     RequestContext,
     dispatch_rpc,
@@ -1475,6 +1476,23 @@ class Runtime:
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": self.server_identity(),
+            "instructions": self.project_context.server_instructions(),
+        }
+
+    def discover_payload(self) -> dict[str, Any]:
+        """Tell a client that never handshakes what this server can do.
+
+        The modern counterpart of the handshake result, minus everything the
+        handshake only needed because it was a handshake: no version is
+        negotiated here, so the versions this server speaks per request are
+        listed instead, and only those — a legacy version named here would
+        invite a client to put one in its ``_meta``. The encoder adds the
+        result envelope, so the fields returned are the answer itself.
+        """
+
+        return {
+            "supportedVersions": list(MODERN_PROTOCOL_VERSIONS),
+            "capabilities": {"tools": {"listChanged": False}},
             "instructions": self.project_context.server_instructions(),
         }
 

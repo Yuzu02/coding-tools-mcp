@@ -577,8 +577,26 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(missing_status, 400, missing)
         self.assertEqual(missing.get("error", {}).get("code"), -32020)
 
+    def test_http_modern_discover_answers_without_a_name_header(self) -> None:
+        """Discover names no subject, so the mirror is version and method only."""
+
+        request = modern_request(1, "server/discover")
+        status, response = self.modern_http_post(request)
+        self.assertEqual(status, 200, response)
+        result = response.get("result", {})
+        self.assert_modern_result(result)
+        self.assertEqual(result.get("supportedVersions"), [MODERN_PROTOCOL_VERSION])
+        self.assertEqual(result.get("capabilities"), {"tools": {"listChanged": False}})
+        self.assertTrue(result.get("instructions"))
+        self.assertEqual(result.get("ttlMs"), 0)
+        self.assertEqual(result.get("cacheScope"), "private")
+
+        missing_method_status, missing_method = self.modern_http_post(request, drop=("Mcp-Method",))
+        self.assertEqual(missing_method_status, 400, missing_method)
+        self.assertEqual(missing_method.get("error", {}).get("code"), -32020)
+
     def test_http_modern_protocol_errors_map_to_http_statuses(self) -> None:
-        unknown_status, unknown = self.modern_http_post(modern_request(1, "server/discover"))
+        unknown_status, unknown = self.modern_http_post(modern_request(1, "prompts/list"))
         self.assertEqual(unknown_status, 404, unknown)
         self.assertEqual(unknown.get("error", {}).get("code"), -32601)
 
@@ -600,7 +618,8 @@ class MCPContractTests(ComplianceTestCase):
         )
 
         # A handshake client reads only the JSON-RPC error, and mapping its
-        # errors onto statuses now would break it.
+        # errors onto statuses now would break it. A probe that states no
+        # protocol version is such a client, discover being a modern method.
         legacy_status, legacy = self.raw_http_post(
             b'{"jsonrpc":"2.0","id":4,"method":"server/discover","params":{}}'
         )
@@ -1476,8 +1495,55 @@ class MCPContractTests(ComplianceTestCase):
     def test_stdio_modern_era_still_reports_unimplemented_methods(self) -> None:
         process = self.start_stdio_server()
         try:
-            probe = self.stdio_rpc_allow_error(process, modern_request("discover-probe", "server/discover"))
+            probe = self.stdio_rpc_allow_error(process, modern_request(1, "prompts/list"))
             self.assertEqual(probe.get("error", {}).get("code"), -32601)
+            self.assertIsNone(process.poll(), "an unsupported method must not end the stdio session")
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_modern_discover_describes_the_server_to_a_client_that_never_handshakes(self) -> None:
+        """The probe that replaces the handshake, answered in full."""
+
+        instructions_file = "Fixture instructions: prefer npm test over ad-hoc runs."
+        (self.workspace.root / "AGENTS.md").write_text(f"{instructions_file}\n", encoding="utf-8")
+        process = self.start_stdio_server()
+        try:
+            discovered = self.stdio_rpc(process, modern_request("discover-probe", "server/discover"))
+            result = discovered.get("result", {})
+            self.assert_modern_result(result)
+            # Only the modern version: a legacy version offered here would
+            # invite the client to send one back in _meta, where it is
+            # unsupported.
+            self.assertEqual(result.get("supportedVersions"), [MODERN_PROTOCOL_VERSION])
+            self.assertEqual(result.get("capabilities"), {"tools": {"listChanged": False}})
+            # The workspace's own instruction files travel in the answer, which
+            # is why the result may never be cached or shared.
+            instructions = result.get("instructions")
+            self.assertIsInstance(instructions, str)
+            self.assertTrue(instructions)
+            self.assertIn("only for coding operations inside the configured workspace", instructions)
+            self.assertIn(instructions_file, instructions)
+            self.assertEqual(result.get("ttlMs"), 0)
+            self.assertEqual(result.get("cacheScope"), "private")
+        finally:
+            self.stop_process(process)
+
+    def test_stdio_discover_without_meta_stays_unknown_and_sends_the_client_to_the_handshake(self) -> None:
+        """A bare probe is a legacy request, and discover is a modern method.
+
+        Answering it would mean guessing that a client which stated no
+        protocol version speaks the newest one. The client reads the error and
+        handshakes instead, which is the path it already has.
+        """
+
+        process = self.start_stdio_server()
+        try:
+            probe = self.stdio_rpc_allow_error(
+                process,
+                {"jsonrpc": "2.0", "id": "bare-probe", "method": "server/discover", "params": {}},
+            )
+            self.assertEqual(probe.get("error", {}).get("code"), -32601)
+            self.assertNotIn("result", probe)
             self.assertIsNone(process.poll(), "an unsupported probe must not end the stdio session")
         finally:
             self.stop_process(process)

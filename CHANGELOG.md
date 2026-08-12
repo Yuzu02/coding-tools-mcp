@@ -119,13 +119,24 @@
   Such a request states its own protocol version in `params._meta`
   (`io.modelcontextprotocol/protocolVersion` and
   `io.modelcontextprotocol/clientCapabilities` are required,
-  `io.modelcontextprotocol/clientInfo` is optional) and may call `ping`,
-  `tools/list`, and `tools/call` immediately. A `_meta` version this server
+  `io.modelcontextprotocol/clientInfo` is optional) and may call
+  `server/discover`, `ping`, `tools/list`, and `tools/call` immediately. A
+  `_meta` version this server
   does not speak is answered with `-32022` and the versions it does
   (`data.supported`); a missing or mistyped required `_meta` field is answered
   with `-32602`. Requests without that `_meta` key — including legacy requests
   that carry `_meta.progressToken`, and every `initialize` — keep the
   handshake behavior they had.
+- `server/discover` answers the probe a `2026-07-28` client sends instead of a
+  handshake, so such a client never has to send one: it reports the versions
+  this server speaks per request (`["2026-07-28"]` alone, since naming a
+  handshake-era version here would invite the client to put one in its
+  `_meta`, where it is unsupported), the `tools` capability, and the same
+  workspace instructions `initialize` returns. Those instructions quote the
+  workspace's own instruction files, so the result carries `ttlMs: 0` and
+  `cacheScope: "private"` as `tools/list` does. A probe that states no
+  protocol version in `_meta` is a handshake-era request and is still answered
+  with `-32601`, which is what sends such a client to `initialize`.
 - Streamable HTTP serves `2026-07-28` as well, with the mirror headers
   SEP-2243 requires. Such a request must repeat its `_meta` protocol version
   in `MCP-Protocol-Version` and its method in `Mcp-Method`; `tools/call`,

@@ -41,19 +41,19 @@ MIRRORED_NAME_METHODS = {
 BASE64_SENTINEL_PREFIX = "=?base64?"
 BASE64_SENTINEL_SUFFIX = "?="
 
+# The method a dual-era client probes with before it decides to handshake.
+DISCOVER_METHOD = "server/discover"
 MODERN_METHODS = frozenset(
     {
+        DISCOVER_METHOD,
         "notifications/cancelled",
         "ping",
         "tools/list",
         "tools/call",
     }
 )
-MODERN_CACHEABLE_METHODS = frozenset({"tools/list"})
+MODERN_CACHEABLE_METHODS = frozenset({DISCOVER_METHOD, "tools/list"})
 MODERN_RESULT_TYPE = "complete"
-# The method a dual-era client probes with before it decides to handshake.
-# Not implemented yet, but named here because the probe is worth counting.
-DISCOVER_METHOD = "server/discover"
 
 
 @dataclass(frozen=True)
@@ -321,8 +321,9 @@ def shape_result(
     shaped["_meta"] = meta
     if method in MODERN_CACHEABLE_METHODS:
         # A catalog is shaped by the workspace and the permission mode it was
-        # served under, so the conservative defaults apply: never shared,
-        # never reused.
+        # served under, and a discover result quotes the workspace's own
+        # instruction files, so the conservative defaults apply to both:
+        # never shared, never reused.
         shaped["ttlMs"] = 0
         shaped["cacheScope"] = "private"
     return shaped
@@ -394,6 +395,8 @@ def _dispatch_modern(
         return None
     if method == "ping":
         return {}
+    if method == DISCOVER_METHOD:
+        return runtime.discover_payload()
     if method == "tools/list":
         return runtime.list_tools()
     return _call_tool(runtime, params, context)
@@ -413,7 +416,10 @@ def _dispatch_legacy(
     method is served whether or not the client handshook first. ``initialize``
     is therefore idempotent — it negotiates a version and answers with it as
     often as it is asked, which is what a connector that probes, falls back,
-    and handshakes again needs. Returns None for a notification.
+    and handshakes again needs. ``server/discover`` is deliberately absent: it
+    answers for the modern era only, so a probe that states no protocol version
+    is unknown here and the client falls back to the handshake, which is a
+    working path rather than a failure. Returns None for a notification.
     """
 
     if method == "initialize":
