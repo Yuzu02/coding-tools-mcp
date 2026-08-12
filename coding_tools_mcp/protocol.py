@@ -7,6 +7,16 @@ from .errors import JsonRpcError
 
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION, "2025-06-18")
+KNOWN_METHODS = frozenset(
+    {
+        "initialize",
+        "notifications/initialized",
+        "notifications/cancelled",
+        "ping",
+        "tools/list",
+        "tools/call",
+    }
+)
 
 
 def jsonrpc_error(
@@ -82,6 +92,9 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
 
     Handshake state lives on ``runtime.initialized``; transports add only their
     transport-specific framing (session headers, stream handling) around this.
+    A method this server does not implement is rejected before that state is
+    consulted, so a client probing for an unsupported method learns the method
+    is unknown instead of being told to handshake first.
     Returns None for notifications and requests without an id.
     """
 
@@ -90,6 +103,8 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
         validate_rpc_envelope(request)
         method = request["method"]
         params = rpc_params(request)
+        if method not in KNOWN_METHODS:
+            raise JsonRpcError(-32601, f"Unknown method: {method}")
         if not runtime.initialized and method not in {"initialize", "ping"}:
             raise JsonRpcError(-32002, "Server not initialized")
         if method == "initialize":
@@ -131,7 +146,7 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
             if not isinstance(arguments, dict):
                 raise JsonRpcError(-32602, "tools/call arguments must be an object")
             result = runtime.call_tool(params["name"], arguments, request_id=request_id)
-        else:
+        else:  # only reachable if KNOWN_METHODS gains a method without a branch here
             raise JsonRpcError(-32601, f"Unknown method: {method}")
         if request_id is None:
             return None

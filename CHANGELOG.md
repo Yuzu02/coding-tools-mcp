@@ -38,6 +38,11 @@
 - `exec_command` and `read_output` tool descriptions now direct clients to
   redirect very large output to a file and page it with `read_file` /
   `search_text`.
+- A method this server does not implement now returns `-32601` before the
+  handshake as well as after it. Such a call previously returned `-32002 Server
+  not initialized`, which tells a client to handshake and retry a method that
+  will never exist. Implemented methods are unchanged: calling one before
+  `initialize` still returns `-32002`.
 
 ### Fixed
 

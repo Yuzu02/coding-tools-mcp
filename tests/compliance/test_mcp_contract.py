@@ -1057,6 +1057,17 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
+    def test_stdio_reports_unknown_methods_before_initialize(self) -> None:
+        process = self.start_stdio_server()
+        try:
+            rejected = self.stdio_rpc_allow_error(
+                process,
+                {"jsonrpc": "2.0", "id": 1, "method": "totally/unknown", "params": {}},
+            )
+            self.assertEqual(rejected.get("error", {}).get("code"), -32601)
+        finally:
+            self.stop_process(process)
+
     def assert_content_text_is_agent_readable(self, result: dict[str, Any]) -> str:
         structured = result.get("structuredContent")
         self.assertIsInstance(structured, dict, f"structuredContent must be an object: {result!r}")
