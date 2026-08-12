@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-08-12
 
 ### Changed
 
@@ -112,6 +112,16 @@
   supported version still gets that version back. Asking to handshake with
   `2026-07-28` downgrades the same way, because that protocol states its
   version per request instead of negotiating one.
+- **Behavior change:** an HTTP request without an `MCP-Protocol-Version` header
+  is treated as `2025-11-25`, the newest handshake version this server speaks.
+  The older spec suggests assuming `2025-03-26`, which this server has never
+  spoken; the value only selects what is echoed and recorded, never what a
+  method does.
+- The runtime contract is now
+  [docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md), and
+  [docs/migration-0.3.md](docs/migration-0.3.md) collects every breaking change
+  above with what to do about it. The v0.2 contract is kept, frozen, as the
+  0.2.x record.
 
 ### Added
 
@@ -121,8 +131,8 @@
   `io.modelcontextprotocol/clientCapabilities` are required,
   `io.modelcontextprotocol/clientInfo` is optional) and may call
   `server/discover`, `ping`, `tools/list`, and `tools/call` immediately. A
-  `_meta` version this server
-  does not speak is answered with `-32022` and the versions it does
+  `_meta` version this server does not speak is answered with `-32022` and the
+  versions it does
   (`data.supported`); a missing or mistyped required `_meta` field is answered
   with `-32602`. Requests without that `_meta` key — including legacy requests
   that carry `_meta.progressToken`, and every `initialize` — keep the
@@ -156,20 +166,40 @@
 - CORS preflight allows `Mcp-Method` and `Mcp-Name`, and no longer allows
   `Mcp-Session-Id`.
 - Results for `2026-07-28` requests carry `resultType: "complete"` and an
-  `_meta.io.modelcontextprotocol/serverInfo`, and `tools/list` also carries the
-  conservative cache hints `ttlMs: 0` and `cacheScope: "private"` on the result
-  root. Responses to handshake clients are byte-for-byte what they were and
-  never carry these fields.
+  `_meta.io.modelcontextprotocol/serverInfo`; `tools/list` and
+  `server/discover` also carry the conservative cache hints `ttlMs: 0` and
+  `cacheScope: "private"` on the result root. Responses to handshake clients
+  are byte-for-byte what they were and never carry these fields.
 
 ### Fixed
 
-- A second `initialize` on one persistent STDIO session now replays the
-  negotiated handshake result instead of failing with `-32600 Server is already
-  initialized`. Connectors that probe for a newer protocol, fall back to the
-  legacy handshake, and then re-send `initialize` on the same process could not
-  finish a tool scan at all. The replay reuses the existing session, so no
-  session state is reset and no extra telemetry session is recorded; a repeat
-  that asks for a different protocol version is still rejected.
+- A repeated `initialize` on one persistent STDIO process is answered instead
+  of failing with `-32600 Server is already initialized`. Connectors that probe
+  for a newer protocol, fall back to the handshake, and then send `initialize`
+  again on the same process could not finish a tool scan at all (issue #39).
+  This shipped first in 0.2.3, which replayed the negotiated result; here there
+  is no handshake state to replay, so each `initialize` simply negotiates and
+  answers on its own, and a repeat naming a different supported version is
+  answered with that version rather than rejected.
+- Two clients patching the same file no longer lose an update. Each HTTP
+  session used to own a runtime with its own patch lock while the files they
+  wrote were shared, so a second patch could validate against a baseline it had
+  read before the first one committed and overwrite it silently. One runtime
+  now owns the workspace, so its lock covers every client: the later patch is
+  answered with a retryable conflict.
+
+## 0.2.3 - 2026-08-12
+
+### Fixed
+
+- A repeated `initialize` on one persistent STDIO session now replays the
+  negotiated handshake result instead of failing with `-32600 Server is
+  already initialized`. The initializer does not run again, so no session
+  state is reset and no second telemetry session is recorded. Connectors that
+  send `initialize` twice on the same process — the OpenAI Secure MCP Tunnel
+  probes with `server/discover` and then initializes twice — had their tool
+  scan aborted, surfacing as HTTP 424, even though the session was healthy
+  (issue #39).
 
 ## 0.2.2 - 2026-07-28
 

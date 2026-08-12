@@ -29,6 +29,8 @@ class RequiredDocsTests(unittest.TestCase):
             "docs/telemetry.md",
             "docs/troubleshooting.md",
             "docs/competitive-analysis.md",
+            "docs/runtime-contract-v0.3.md",
+            "docs/migration-0.3.md",
             "docs/runtime-contract-v0.2.md",
             "Dockerfile",
             ".dockerignore",
@@ -72,6 +74,7 @@ class RequiredDocsTests(unittest.TestCase):
             "docs/security-boundary.md": ["Landlock", "external container or VM"],
             "docs/docker.md": ["permission-mode trusted", "permission_mode=dangerous", "mvn -version"],
             "docs/competitive-analysis.md": ["Claude Code", "Aider", "OpenHands", "Cline"],
+            "docs/migration-0.3.md": ["Breaking changes", "server/discover", "one trust domain"],
         }
         for rel_path, needles in expectations.items():
             text = (ROOT / rel_path).read_text(encoding="utf-8")

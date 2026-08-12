@@ -2,7 +2,9 @@
 """Small MCP-over-HTTP JSON-RPC client used by deterministic benchmarks.
 
 The client intentionally depends only on the Python standard library so the
-dogfood path can run before project packaging is complete.
+dogfood path can run before project packaging is complete. It speaks the
+handshake era, which keeps the benchmark numbers comparable with earlier runs;
+the `2026-07-28` path is exercised by the compliance suite instead.
 """
 
 from __future__ import annotations

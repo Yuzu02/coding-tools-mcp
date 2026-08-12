@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 REPORT_DIR = ROOT / "reports" / "compliance"
 JSON_REPORT = REPORT_DIR / "latest.json"
 MD_REPORT = REPORT_DIR / "latest.md"
-CONTRACT = "coding-tools-mcp-v0.2"
+CONTRACT = "coding-tools-mcp-v0.3"
 
 SUITES = {
     "mcp-contract": ["tests.compliance.test_mcp_contract"],

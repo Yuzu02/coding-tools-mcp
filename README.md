@@ -66,9 +66,12 @@ same everywhere (swap `uvx` for `npx` if you prefer Node):
 Then ask your client: *"run the test suite and fix the first failure."*
 
 Prefer HTTP? Drop `--stdio` and the server speaks Streamable HTTP on
-`http://127.0.0.1:8765/mcp` (MCP `2025-11-25`, with `2025-06-18`
-compatibility). A one-line installer, per-client walkthroughs, and
-troubleshooting live in [docs/quickstart.md](docs/quickstart.md) and
+`http://127.0.0.1:8765/mcp`. Both protocol eras are served on either
+transport: MCP `2026-07-28` in full, with `tools` as the only advertised
+capability, and the handshake era `2025-11-25` with `2025-06-18`
+compatibility. Neither has sessions. A one-line installer, per-client
+walkthroughs, and troubleshooting live in
+[docs/quickstart.md](docs/quickstart.md) and
 [docs/mcp-client-config.md](docs/mcp-client-config.md).
 
 ## Seven things to try
@@ -139,11 +142,12 @@ rollback.
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
 | Runtime | `server_info` · `check_exec_environment` |
 
-Root `AGENTS.md`/`CLAUDE.md` files load into the initialize context
-automatically. Tool `content` is concise agent-facing text;
+Root `AGENTS.md`/`CLAUDE.md` files load automatically and come back in the
+`instructions` of `initialize`, or of `server/discover` for a client that
+never handshakes. Tool `content` is concise agent-facing text;
 `structuredContent` carries the complete machine result. Schemas and result
 envelopes: [docs/tools-and-schemas.md](docs/tools-and-schemas.md) ·
-[docs/runtime-contract-v0.2.md](docs/runtime-contract-v0.2.md).
+[docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md).
 
 ## Safety Boundary
 
@@ -190,7 +194,7 @@ measured. More: [COMPLIANCE.md](COMPLIANCE.md) · [BENCHMARK.md](BENCHMARK.md) �
 | --- | --- |
 | Getting started | [Quickstart](docs/quickstart.md) · [Client configuration](docs/mcp-client-config.md) · [Troubleshooting](docs/troubleshooting.md) |
 | Remote & sandboxed | [Remote MCP](docs/remote-mcp.md) · [Docker sandbox](docs/docker.md) · [Cloud sandbox worker](cloudflare/sandbox-control/README.md) |
-| Tools & contract | [Tools and schemas](docs/tools-and-schemas.md) · [Runtime contract](docs/runtime-contract-v0.2.md) · [Permission modes](docs/permission-modes.md) |
+| Tools & contract | [Tools and schemas](docs/tools-and-schemas.md) · [Runtime contract](docs/runtime-contract-v0.3.md) · [Migrating to 0.3](docs/migration-0.3.md) · [Permission modes](docs/permission-modes.md) |
 | Execution | [Exec recipes](docs/exec-command-recipes.md) · [Exec troubleshooting](docs/troubleshooting-exec.md) |
 | Integration | [Embedding](docs/embedding.md) · [npm launcher](npm/coding-tools-mcp/README.md) |
 | Security & quality | [Security policy](SECURITY.md) · [Security boundary](docs/security-boundary.md) · [CI and tests](docs/ci-and-tests.md) · [Limitations](docs/limitations.md) · [Competitive analysis](docs/competitive-analysis.md) |

@@ -1,7 +1,7 @@
 # Coding Tools MCP Spec
 
-This repository implements the `coding-tools-mcp-v0.2` runtime contract defined
-in [docs/runtime-contract-v0.2.md](docs/runtime-contract-v0.2.md).
+This repository implements the `coding-tools-mcp-v0.3` runtime contract defined
+in [docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md).
 
 ## Product boundary
 
@@ -31,16 +31,23 @@ fixed.
 
 ## Protocol
 
-- MCP `2025-11-25` is current; `2025-06-18` is explicitly supported.
+- Two eras are served at once: `2026-07-28`, which carries its version, client
+  capabilities, and identity in each request's `params._meta`, and the
+  handshake era `2025-11-25` with `2025-06-18` explicitly supported. A request
+  belongs to the modern era if and only if its `_meta` names that version.
 - Streamable HTTP uses `/mcp`; stdio uses newline-delimited JSON-RPC.
-- Every HTTP `Mcp-Session-Id` owns an independent `Runtime`.
-- JSON-RPC batches are rejected, cancellation follows `requestId`, and
-  unimplemented logging is not advertised.
+- There are no sessions in either era. One `Runtime` owns the workspace and
+  serves every client of it; HTTP issues no `Mcp-Session-Id` and `DELETE /mcp`
+  returns `405`.
+- JSON-RPC batches are rejected, unimplemented logging is not advertised, and
+  `notifications/cancelled` is accepted without terminating the command the
+  cancelled request started — a command is stopped with `kill_command`.
 - `content` is agent-readable text normally sized by each tool's per-call
   limits, with a documented emergency safety ceiling for pathological entries.
   `structuredContent` is the complete stable machine result. `_meta` is
   optional UI space only.
-- Root project instructions enter the initialization context automatically.
+- Root project instructions are loaded automatically and returned in the
+  `instructions` of `initialize` and of `server/discover`.
 
 ## Correctness guarantees
 
@@ -52,7 +59,9 @@ reported explicitly rather than hidden.
 Commands use a 10-second default yield, real POSIX PTYs, bounded active and
 retained-command stores, per-command and runtime output budgets, TTL cleanup,
 and explicit `next_action` objects for polling or truncated output. Command
-handles are `command_id` values and are distinct from HTTP `Mcp-Session-Id`.
+handles are `command_id` values, owned by the workspace rather than by a
+client: any authenticated client of the workspace can continue, read, or kill
+a command with one, and no transport event ends it.
 
 ## Security boundary
 
@@ -61,9 +70,15 @@ Direct tools reject absolute paths, traversal, NULs, and symlink escapes.
 but remains a coding runtime rather than a complete container sandbox. Remote
 deployment must use bearer or OAuth authentication. OAuth supports protected
 resource metadata, PKCE S256, exact redirect binding, and RFC 7591 dynamic client
-registration.
+registration. Authentication admits a client to a workspace and does not
+partition it: one workspace is one trust domain, shared by every client of it.
 
 ## Compatibility
+
+Version 0.3 adds `2026-07-28` and removes every session. The handshake era is
+unchanged on the wire; the cwd tools, the HTTP session, and several
+`server_info` fields are not. See
+[docs/migration-0.3.md](docs/migration-0.3.md).
 
 Version 0.2 changes model-facing result text from a JSON mirror to summaries.
 Clients that parsed `content[0].text` as JSON must read `structuredContent`.
