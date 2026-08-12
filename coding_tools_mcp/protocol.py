@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from .errors import JsonRpcError
 LEGACY_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18")
 LATEST_LEGACY_PROTOCOL_VERSION = LEGACY_PROTOCOL_VERSIONS[0]
 MODERN_PROTOCOL_VERSIONS = ("2026-07-28",)
+KNOWN_PROTOCOL_VERSIONS = (*MODERN_PROTOCOL_VERSIONS, *LEGACY_PROTOCOL_VERSIONS)
 LEGACY_ERA = "legacy"
 MODERN_ERA = "modern"
 
@@ -24,6 +26,20 @@ META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
+HEADER_MISMATCH = -32020
+
+# SEP-2243 lets a gateway route a modern request on its headers alone, so the
+# headers must mirror the body they travel with. These methods name their
+# subject in the body, and the name is mirrored in ``Mcp-Name``; the two this
+# server does not implement are listed as well, because the mirror is a
+# property of the request, not of what we can answer.
+MIRRORED_NAME_METHODS = {
+    "tools/call": "name",
+    "resources/read": "uri",
+    "prompts/get": "name",
+}
+BASE64_SENTINEL_PREFIX = "=?base64?"
+BASE64_SENTINEL_SUFFIX = "?="
 
 MODERN_METHODS = frozenset(
     {
@@ -124,6 +140,95 @@ def legacy_protocol_version_is_supported(version: Any) -> bool:
     return isinstance(version, str) and version in LEGACY_PROTOCOL_VERSIONS
 
 
+def protocol_version_is_known(version: Any) -> bool:
+    return isinstance(version, str) and version in KNOWN_PROTOCOL_VERSIONS
+
+
+def decode_mirror_header(value: str) -> str:
+    """Read one mirror header value, unwrapping a base64 sentinel if present.
+
+    A value that cannot travel as an HTTP field is wrapped as
+    ``=?base64?<payload>?=``. The affixes are matched exactly, so a value that
+    merely resembles one is compared as the literal it is.
+    """
+
+    if not (value.startswith(BASE64_SENTINEL_PREFIX) and value.endswith(BASE64_SENTINEL_SUFFIX)):
+        return value
+    payload = value[len(BASE64_SENTINEL_PREFIX) : -len(BASE64_SENTINEL_SUFFIX)]
+    try:
+        return base64.b64decode(payload, validate=True).decode("utf-8")
+    except ValueError as exc:  # binascii.Error and UnicodeDecodeError both subclass it
+        raise JsonRpcError(
+            HEADER_MISMATCH,
+            "Mirror header carries a base64 sentinel that does not decode to UTF-8",
+            {"reason": "invalid_base64"},
+        ) from exc
+
+
+def validate_mirror_headers(
+    era: str,
+    method: str,
+    params: Mapping[str, Any],
+    *,
+    version_header: str | None,
+    method_header: str | None,
+    name_header: str | None,
+) -> None:
+    """Check that a request's headers mirror the body they travel with.
+
+    SEP-2243 asks a modern request to restate its version, method, and subject
+    in headers so a gateway can route on them alone. We read the body first
+    and enforce the mirror against it, which gives up part of that intent but
+    is the only way to tell the two eras apart: a legacy request carries no
+    such headers and is left alone, except that a modern version header over a
+    legacy body is a mismatch like any other.
+    """
+
+    if era != MODERN_ERA:
+        if version_header in MODERN_PROTOCOL_VERSIONS:
+            raise _mirror_error(
+                "MCP-Protocol-Version",
+                f"MCP-Protocol-Version {version_header} needs a request that states the same "
+                f"version in params._meta.{META_PROTOCOL_VERSION}",
+                "body_is_not_modern",
+            )
+        return
+
+    meta = params.get("_meta")
+    meta_version = meta.get(META_PROTOCOL_VERSION) if isinstance(meta, dict) else None
+    if version_header is None:
+        raise _mirror_error(
+            "MCP-Protocol-Version",
+            "MCP-Protocol-Version is required and must repeat the version in params._meta",
+            "missing",
+        )
+    if version_header != meta_version:
+        raise _mirror_error(
+            "MCP-Protocol-Version",
+            "MCP-Protocol-Version does not match the version in params._meta",
+            "mismatch",
+        )
+    if method_header is None:
+        raise _mirror_error("Mcp-Method", "Mcp-Method is required and must repeat the request method", "missing")
+    if method_header != method:
+        raise _mirror_error("Mcp-Method", "Mcp-Method does not match the request method", "mismatch")
+    subject = MIRRORED_NAME_METHODS.get(method)
+    if subject is None:
+        return
+    if name_header is None:
+        raise _mirror_error(
+            "Mcp-Name",
+            f"Mcp-Name is required for {method} and must repeat params.{subject}",
+            "missing",
+        )
+    if decode_mirror_header(name_header) != params.get(subject):
+        raise _mirror_error("Mcp-Name", f"Mcp-Name does not match params.{subject}", "mismatch")
+
+
+def _mirror_error(header: str, message: str, reason: str) -> JsonRpcError:
+    return JsonRpcError(HEADER_MISMATCH, message, {"header": header, "reason": reason})
+
+
 def request_era(method: str, params: Mapping[str, Any]) -> str:
     """Decide which protocol era a request belongs to.
 
@@ -220,7 +325,12 @@ def shape_result(
     return shaped
 
 
-def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None:
+def dispatch_rpc(
+    runtime: Any,
+    request: dict[str, Any],
+    *,
+    transport_protocol_version: str | None = None,
+) -> dict[str, Any] | None:
     """Dispatch one MCP JSON-RPC request against a runtime, shared by all transports.
 
     The era is decided first, from the request itself: a modern request states
@@ -228,7 +338,9 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
     handshake this runtime keeps no record of. Neither era leaves state behind,
     so one runtime answers every client of the workspace. Transports add only
     their transport-specific framing (stream handling, status codes) around
-    this. Returns None for notifications and requests without an id.
+    this, and may report the legacy version their framing negotiated through
+    ``transport_protocol_version``; it is echoed and recorded, never acted on.
+    Returns None for notifications and requests without an id.
     """
 
     request_id = request.get("id")
@@ -240,7 +352,10 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
             context = modern_request_context(params)
             result = _dispatch_modern(runtime, method, params, context)
         else:
-            context = RequestContext(era=LEGACY_ERA, protocol_version=LATEST_LEGACY_PROTOCOL_VERSION)
+            context = RequestContext(
+                era=LEGACY_ERA,
+                protocol_version=transport_protocol_version or LATEST_LEGACY_PROTOCOL_VERSION,
+            )
             result = _dispatch_legacy(runtime, request, method, params, context)
         if result is None or request_id is None:
             return None

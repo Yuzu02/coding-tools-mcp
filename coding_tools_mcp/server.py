@@ -68,14 +68,19 @@ from .processes import (
     terminate_process_group,
 )
 from .protocol import (
+    HEADER_MISMATCH,
+    KNOWN_PROTOCOL_VERSIONS,
     LATEST_LEGACY_PROTOCOL_VERSION,
-    LEGACY_PROTOCOL_VERSIONS,
-    MODERN_PROTOCOL_VERSIONS,
+    MODERN_ERA,
+    UNSUPPORTED_PROTOCOL_VERSION,
     RequestContext,
     dispatch_rpc,
     jsonrpc_error,
     legacy_protocol_version_is_supported,
+    protocol_version_is_known,
+    request_era,
     response_id,
+    validate_mirror_headers,
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
@@ -1536,7 +1541,7 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
-            "supported_protocol_versions": [*MODERN_PROTOCOL_VERSIONS, *LEGACY_PROTOCOL_VERSIONS],
+            "supported_protocol_versions": list(KNOWN_PROTOCOL_VERSIONS),
             **self._exec_environment_summary(),
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
@@ -4746,7 +4751,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     read_only = [name for name in names if annotations[name].get("readOnlyHint") is True]
     mutating = [name for name in names if annotations[name].get("readOnlyHint") is not True]
     payload = {
-        "supportedProtocolVersions": [*MODERN_PROTOCOL_VERSIONS, *LEGACY_PROTOCOL_VERSIONS],
+        "supportedProtocolVersions": list(KNOWN_PROTOCOL_VERSIONS),
         "server": {
             "name": SERVER_NAME,
             "title": SERVER_TITLE,
@@ -4770,6 +4775,27 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         },
     }
     return payload
+
+
+# A modern client reads the HTTP status as well as the JSON-RPC error, so the
+# protocol errors that name a fault in the request are reported as such. Every
+# other code — including -32603, which says the request was fine and we were
+# not — stays a 200 carrying a JSON-RPC error, as the legacy era always does.
+MODERN_ERROR_STATUSES = {
+    -32601: 404,
+    -32602: 400,
+    HEADER_MISMATCH: 400,
+    UNSUPPORTED_PROTOCOL_VERSION: 400,
+}
+
+
+def rpc_response_status(era: str, response: dict[str, Any]) -> int:
+    if era != MODERN_ERA:
+        return 200
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return 200
+    return MODERN_ERROR_STATUSES.get(error.get("code"), 200)
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
@@ -4904,12 +4930,15 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if self.headers.get_content_type().lower() != "application/json":
             self.send_rpc_error(-32600, "Content-Type must be application/json", status=415)
             return
+        # Which era a request belongs to is decided by its body, so a version
+        # header naming something from neither era is refused before the body
+        # is read: there is nothing to decide it against.
         protocol_version = self.headers.get("MCP-Protocol-Version")
-        if protocol_version and not legacy_protocol_version_is_supported(protocol_version):
+        if protocol_version and not protocol_version_is_known(protocol_version):
             self.send_rpc_error(
                 -32600,
                 "Unsupported MCP protocol version",
-                data={"supported": list(LEGACY_PROTOCOL_VERSIONS), "received": protocol_version},
+                data={"supported": list(KNOWN_PROTOCOL_VERSIONS), "received": protocol_version},
             )
             return
         raw_length = self.headers.get("Content-Length")
@@ -4952,21 +4981,47 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 exc.code, exc.message, status=200, request_id=response_id(request), data=exc.data
             )
             return
-        # Every request is served by the one workspace runtime. A client that
-        # still echoes an ``Mcp-Session-Id`` from an older server is served
-        # like any other rather than rejected, so an upgrade needs no client
-        # change.
-        response = self.handle_rpc(request)
+        # Every request is served by the one workspace runtime, and a client
+        # that still echoes an ``Mcp-Session-Id`` from an older server is
+        # served like any other rather than rejected. What the request must
+        # carry beyond that depends on its era, which only its body can decide.
+        method = str(request["method"])
+        raw_params = request.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        era = request_era(method, params)
+        try:
+            validate_mirror_headers(
+                era,
+                method,
+                params,
+                version_header=protocol_version,
+                method_header=self.headers.get("Mcp-Method"),
+                name_header=self.headers.get("Mcp-Name"),
+            )
+        except JsonRpcError as exc:
+            self.send_rpc_error(exc.code, exc.message, request_id=response_id(request), data=exc.data)
+            return
+        response = self.handle_rpc(request, transport_protocol_version=protocol_version)
         if response is None:
             self.send_response(202)
             self.send_cors_headers()
             self.end_headers()
             return
-        self.send_json(response)
+        self.send_json(response, status=rpc_response_status(era, response))
 
-    def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
+    def handle_rpc(
+        self,
+        request: dict[str, Any],
+        *,
+        transport_protocol_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        legacy_version = (
+            transport_protocol_version
+            if legacy_protocol_version_is_supported(transport_protocol_version)
+            else None
+        )
         try:
-            return dispatch_rpc(self.runtime, request)
+            return dispatch_rpc(self.runtime, request, transport_protocol_version=legacy_version)
         except Exception as exc:  # noqa: BLE001 - HTTP must always answer with JSON-RPC
             return jsonrpc_error(response_id(request), -32603, str(exc))
 
@@ -5333,7 +5388,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
             self.send_header(
                 "Access-Control-Allow-Headers",
-                "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id",
+                "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Method, Mcp-Name",
             )
 
     def send_json(

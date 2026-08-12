@@ -103,10 +103,27 @@
   `tools/list`, and `tools/call` immediately. A `_meta` version this server
   does not speak is answered with `-32022` and the versions it does
   (`data.supported`); a missing or mistyped required `_meta` field is answered
-  with `-32602`. Available over STDIO in this change; HTTP support follows.
-  Requests without that `_meta` key — including legacy requests that carry
-  `_meta.progressToken`, and every `initialize` — keep the handshake behavior
-  they had.
+  with `-32602`. Requests without that `_meta` key — including legacy requests
+  that carry `_meta.progressToken`, and every `initialize` — keep the
+  handshake behavior they had.
+- Streamable HTTP serves `2026-07-28` as well, with the mirror headers
+  SEP-2243 requires. Such a request must repeat its `_meta` protocol version
+  in `MCP-Protocol-Version` and its method in `Mcp-Method`; `tools/call`,
+  `resources/read`, and `prompts/get` must also repeat their subject
+  (`params.name`, or `params.uri` for `resources/read`) in `Mcp-Name`, either
+  literally or wrapped as `=?base64?<payload>?=`. Any header that contradicts
+  the body — including a `2026-07-28` version header on a request whose body
+  is a handshake-era one — is answered with `400` and the new `-32020`.
+  Handshake-era requests are not asked for these headers and are unaffected.
+- A `2026-07-28` request that fails now reports it in the HTTP status as well:
+  `-32601` is `404`, and `-32602`, `-32020`, and `-32022` are `400`. Any other
+  code, `-32603` included, stays `200` with the JSON-RPC error, which is also
+  what every handshake-era error keeps returning.
+- `MCP-Protocol-Version` accepts any version this server speaks. A header
+  naming an unknown version is still refused with `400` and `-32600`, and
+  `data.supported` now lists both eras.
+- CORS preflight allows `Mcp-Method` and `Mcp-Name`, and no longer allows
+  `Mcp-Session-Id`.
 - Results for `2026-07-28` requests carry `resultType: "complete"` and an
   `_meta.io.modelcontextprotocol/serverInfo`, and `tools/list` also carries the
   conservative cache hints `ttlMs: 0` and `cacheScope: "private"` on the result

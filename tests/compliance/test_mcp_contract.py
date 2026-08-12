@@ -71,6 +71,18 @@ def modern_request(
     return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": body}
 
 
+# The methods that name their subject in the body, and the params field a
+# 2026-07-28 client repeats in Mcp-Name.
+MIRRORED_NAME_METHODS = {"tools/call": "name", "resources/read": "uri", "prompts/get": "name"}
+
+
+def base64_sentinel(value: str) -> str:
+    """Wrap a header value the way a client encodes one that is not ASCII."""
+
+    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    return f"=?base64?{encoded}?="
+
+
 class MCPContractTests(ComplianceTestCase):
     def test_initialize_succeeds_and_tools_list_is_available(self) -> None:
         tools = self.client.list_tools()
@@ -344,6 +356,12 @@ class MCPContractTests(ComplianceTestCase):
         self.assertIsNone(body.get("id"))
         self.assertEqual(body.get("error", {}).get("code"), -32600)
         self.assertIn("Unsupported MCP protocol version", body.get("error", {}).get("message", ""))
+        # Both eras are offered: the header alone cannot say which one the
+        # client meant to speak.
+        self.assertEqual(
+            body.get("error", {}).get("data", {}).get("supported"),
+            [MODERN_PROTOCOL_VERSION, "2025-11-25", "2025-06-18"],
+        )
 
     def test_http_rejects_non_json_content_type(self) -> None:
         status, body = self.raw_http_post(
@@ -455,6 +473,161 @@ class MCPContractTests(ComplianceTestCase):
             self.client.call_tool("kill_command", {"command_id": command_id, "signal": "KILL"})
         )
         self.assertIn(killed.get("status"), {"killed", "exited"})
+
+    def test_http_modern_request_succeeds_with_mirrored_headers(self) -> None:
+        status, response = self.modern_http_post(
+            modern_request(1, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}})
+        )
+        self.assertEqual(status, 200, response)
+        result = response.get("result", {})
+        self.assert_modern_result(result)
+        self.assertEqual(result.get("structuredContent", {}).get("path"), "src/math.js")
+
+        ping_status, ping = self.modern_http_post(modern_request(2, "ping"))
+        self.assertEqual(ping_status, 200, ping)
+        self.assert_modern_result(ping.get("result", {}))
+
+        listed_status, listed = self.modern_http_post(modern_request(3, "tools/list"))
+        self.assertEqual(listed_status, 200, listed)
+        self.assert_modern_result(listed.get("result", {}))
+        self.assertEqual(listed.get("result", {}).get("ttlMs"), 0)
+
+        # A notification mirrors its method too, and is still answered with an
+        # empty 202 rather than a JSON-RPC response.
+        parsed = urllib.parse.urlparse(str(self.client.url))
+        notified_status, _, notified_body = self.raw_base_http_request(
+            f"{parsed.scheme}://{parsed.netloc}",
+            "POST",
+            parsed.path or "/mcp",
+            body=json.dumps(
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"_meta": modern_meta()}}
+            ).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "MCP-Protocol-Version": MODERN_PROTOCOL_VERSION,
+                "Mcp-Method": "notifications/cancelled",
+            },
+        )
+        self.assertEqual(notified_status, 202)
+        self.assertEqual(notified_body, "")
+
+    def test_http_modern_name_header_accepts_a_base64_sentinel(self) -> None:
+        status, response = self.modern_http_post(
+            modern_request(1, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}}),
+            headers={"Mcp-Name": base64_sentinel("read_file")},
+        )
+        self.assertEqual(status, 200, response)
+        self.assert_modern_result(response.get("result", {}))
+
+    def test_http_modern_headers_must_mirror_the_request_body(self) -> None:
+        """Every mirror violation is one error: the headers contradict the body."""
+
+        call = modern_request(1, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}})
+        cases: list[tuple[str, dict[str, Any], dict[str, str], tuple[str, ...]]] = [
+            ("missing version header", call, {}, ("MCP-Protocol-Version",)),
+            ("version header disagrees with _meta", call, {"MCP-Protocol-Version": "2025-11-25"}, ()),
+            (
+                "modern version header over a legacy body",
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {"MCP-Protocol-Version": MODERN_PROTOCOL_VERSION, "Mcp-Method": "tools/list"},
+                (),
+            ),
+            ("missing method header", call, {}, ("Mcp-Method",)),
+            ("method header disagrees with body", call, {"Mcp-Method": "tools/list"}, ()),
+            (
+                "missing method header on a notification",
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"_meta": modern_meta()}},
+                {},
+                ("Mcp-Method",),
+            ),
+            ("missing name header", call, {}, ("Mcp-Name",)),
+            ("name header disagrees with params.name", call, {"Mcp-Name": "list_dir"}, ()),
+            (
+                "name header sentinel is not base64",
+                call,
+                {"Mcp-Name": "=?base64?not valid base64!?="},
+                (),
+            ),
+        ]
+        for name, request, headers, drop in cases:
+            with self.subTest(case=name):
+                status, response = self.modern_http_post(request, headers=headers, drop=drop)
+                self.assertEqual(status, 400, response)
+                self.assertEqual(response.get("error", {}).get("code"), -32020, response)
+                self.assertNotIn("result", response)
+
+    def test_http_modern_name_header_is_required_by_method_name(self) -> None:
+        """The mirror is checked before the method is looked up.
+
+        ``resources/read`` is one of the methods that names its subject, and
+        this server does not implement it. A request that mirrors correctly
+        gets that verdict; one that does not is refused before we ever find
+        out the method is unknown.
+        """
+
+        request = modern_request(1, "resources/read", {"uri": "file:///workspace/src/math.js"})
+        status, response = self.modern_http_post(
+            request,
+            headers={"Mcp-Name": "file:///workspace/src/math.js"},
+        )
+        self.assertEqual(status, 404, response)
+        self.assertEqual(response.get("error", {}).get("code"), -32601)
+
+        missing_status, missing = self.modern_http_post(request, drop=("Mcp-Name",))
+        self.assertEqual(missing_status, 400, missing)
+        self.assertEqual(missing.get("error", {}).get("code"), -32020)
+
+    def test_http_modern_protocol_errors_map_to_http_statuses(self) -> None:
+        unknown_status, unknown = self.modern_http_post(modern_request(1, "server/discover"))
+        self.assertEqual(unknown_status, 404, unknown)
+        self.assertEqual(unknown.get("error", {}).get("code"), -32601)
+
+        invalid_status, invalid = self.modern_http_post(
+            modern_request(2, "tools/list", meta=modern_meta(drop=(META_CLIENT_CAPABILITIES,)))
+        )
+        self.assertEqual(invalid_status, 400, invalid)
+        self.assertEqual(invalid.get("error", {}).get("code"), -32602)
+
+        unsupported_status, unsupported = self.modern_http_post(
+            modern_request(3, "tools/list", meta=modern_meta({META_PROTOCOL_VERSION: "2025-11-25"})),
+            headers={"MCP-Protocol-Version": "2025-11-25"},
+        )
+        self.assertEqual(unsupported_status, 400, unsupported)
+        self.assertEqual(unsupported.get("error", {}).get("code"), -32022)
+        self.assertEqual(
+            unsupported.get("error", {}).get("data", {}).get("supported"),
+            [MODERN_PROTOCOL_VERSION],
+        )
+
+        # A handshake client reads only the JSON-RPC error, and mapping its
+        # errors onto statuses now would break it.
+        legacy_status, legacy = self.raw_http_post(
+            b'{"jsonrpc":"2.0","id":4,"method":"server/discover","params":{}}'
+        )
+        self.assertEqual(legacy_status, 200, legacy)
+        self.assertEqual(legacy.get("error", {}).get("code"), -32601)
+
+    def test_http_preflight_advertises_the_mirror_headers(self) -> None:
+        self.assertIsNotNone(self.client.url)
+        parsed = urllib.parse.urlparse(str(self.client.url))
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        status, headers, _ = self.raw_base_http_request(
+            base,
+            "OPTIONS",
+            parsed.path or "/mcp",
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Mcp-Method, Mcp-Name",
+            },
+        )
+        self.assertEqual(status, 204)
+        allowed = headers.get("access-control-allow-headers", "")
+        self.assertIn("Mcp-Method", allowed)
+        self.assertIn("Mcp-Name", allowed)
+        self.assertNotIn("Mcp-Session-Id", allowed)
+        self.assertNotIn("DELETE", headers.get("access-control-allow-methods", ""))
+        self.assertNotIn("DELETE", headers.get("allow", ""))
 
     def test_http_discovery_endpoints_return_server_card_metadata(self) -> None:
         self.assertIsNotNone(self.client.url)
@@ -987,6 +1160,10 @@ class MCPContractTests(ComplianceTestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(response.get("error", {}).get("code"), -32600)
+        self.assertEqual(
+            response.get("error", {}).get("data", {}).get("supported"),
+            [MODERN_PROTOCOL_VERSION, "2025-11-25", "2025-06-18"],
+        )
 
     def test_initialize_downgrades_unsupported_client_protocol(self) -> None:
         """A version the server cannot speak is answered with one it can.
@@ -1510,6 +1687,7 @@ class MCPContractTests(ComplianceTestCase):
         content_length: int | str | None = None,
         headers: dict[str, str] | None = None,
         path: str | None = None,
+        default_protocol_version: str | None = "2025-11-25",
     ) -> tuple[int, dict[str, Any]]:
         self.assertIsNotNone(self.client.url)
         parsed = urllib.parse.urlparse(str(self.client.url))
@@ -1520,8 +1698,8 @@ class MCPContractTests(ComplianceTestCase):
             connection.putrequest("POST", path or parsed.path or "/mcp")
             connection.putheader("Accept", "application/json, text/event-stream")
             connection.putheader("Content-Type", content_type)
-            if not headers or "MCP-Protocol-Version" not in headers:
-                connection.putheader("MCP-Protocol-Version", "2025-11-25")
+            if default_protocol_version and (not headers or "MCP-Protocol-Version" not in headers):
+                connection.putheader("MCP-Protocol-Version", default_protocol_version)
             connection.putheader("Content-Length", str(len(body) if content_length is None else content_length))
             for name, value in (headers or {}).items():
                 connection.putheader(name, value)
@@ -1533,6 +1711,30 @@ class MCPContractTests(ComplianceTestCase):
             return response.status, json.loads(response_body)
         finally:
             connection.close()
+
+    def modern_http_post(
+        self,
+        request: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+        drop: tuple[str, ...] = (),
+    ) -> tuple[int, dict[str, Any]]:
+        """POST a 2026-07-28 request with the headers that mirror its body."""
+
+        method = str(request.get("method", ""))
+        params = request.get("params", {})
+        mirrored = {"MCP-Protocol-Version": MODERN_PROTOCOL_VERSION, "Mcp-Method": method}
+        subject = MIRRORED_NAME_METHODS.get(method)
+        if subject is not None and isinstance(params.get(subject), str):
+            mirrored["Mcp-Name"] = params[subject]
+        mirrored.update(headers or {})
+        for name in drop:
+            mirrored.pop(name, None)
+        return self.raw_http_post(
+            json.dumps(request).encode("utf-8"),
+            headers=mirrored,
+            default_protocol_version=None,
+        )
 
     def raw_post_to_auth_server(
         self,
