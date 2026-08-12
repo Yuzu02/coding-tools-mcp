@@ -944,23 +944,7 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(response.get("error", {}).get("code"), -32602)
 
     def test_stdio_transport_uses_newline_delimited_json_rpc_only(self) -> None:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "coding_tools_mcp",
-                "--workspace",
-                str(self.workspace.root),
-                "--stdio",
-            ],
-            cwd=str(self.workspace.root),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=self.server_process_env(),
-            text=True,
-            start_new_session=True,
-        )
+        process = self.start_stdio_server()
         try:
             self.assertIsNotNone(process.stdin)
             process.stdin.write("{not-json}\n")
@@ -1001,37 +985,10 @@ class MCPContractTests(ComplianceTestCase):
             self.assertIsInstance(tools, list)
             self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
         finally:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=2)
-            for stream in (process.stdin, process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
+            self.stop_process(process)
 
     def test_stdio_rejects_preinitialize_calls_and_accepts_cancel_notification(self) -> None:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "coding_tools_mcp",
-                "--workspace",
-                str(self.workspace.root),
-                "--stdio",
-            ],
-            cwd=str(self.workspace.root),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=self.server_process_env(),
-            text=True,
-            start_new_session=True,
-        )
+        process = self.start_stdio_server()
         try:
             rejected = self.stdio_rpc_allow_error(
                 process,
@@ -1058,6 +1015,48 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
+    def test_stdio_replays_duplicate_initialize_after_a_failed_probe(self) -> None:
+        """Replay the sequence from issue #39: probe, initialize, initialize again."""
+
+        process = self.start_stdio_server()
+        try:
+            probe = self.stdio_rpc_allow_error(
+                process,
+                {"jsonrpc": "2.0", "id": "openai-mcp-discover", "method": "server/discover", "params": {}},
+            )
+            # The probe's error code is free to change as new methods land; what
+            # the client depends on is an answered request on a live process.
+            self.assertIn("error", probe)
+            self.assertEqual(probe.get("id"), "openai-mcp-discover")
+            self.assertIsNone(process.poll(), "an unsupported probe must not end the stdio session")
+
+            params = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "duplicate-initialize-client", "version": "1.0"},
+            }
+            first = self.stdio_rpc(
+                process,
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params},
+            )
+            self.assertEqual(first.get("result", {}).get("protocolVersion"), "2025-11-25")
+
+            replayed = self.stdio_rpc(
+                process,
+                {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": params},
+            )
+            self.assertEqual(replayed.get("result"), first.get("result"))
+
+            self.stdio_send(process, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+            self.assert_no_stdio_response(process)
+
+            listed = self.stdio_rpc(process, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+            tools = listed.get("result", {}).get("tools")
+            self.assertIsInstance(tools, list)
+            self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
+        finally:
+            self.stop_process(process)
+
     def assert_content_text_is_agent_readable(self, result: dict[str, Any]) -> str:
         structured = result.get("structuredContent")
         self.assertIsInstance(structured, dict, f"structuredContent must be an object: {result!r}")
@@ -1066,6 +1065,25 @@ class MCPContractTests(ComplianceTestCase):
         text_items = [item.get("text") for item in content if isinstance(item, dict) and item.get("type") == "text"]
         self.assertTrue(text_items, f"content must include agent-readable text: {result!r}")
         return "\n".join(str(item) for item in text_items)
+
+    def start_stdio_server(self) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "coding_tools_mcp",
+                "--workspace",
+                str(self.workspace.root),
+                "--stdio",
+            ],
+            cwd=str(self.workspace.root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.server_process_env(),
+            text=True,
+            start_new_session=True,
+        )
 
     def stdio_send(self, process: subprocess.Popen[str], payload: dict[str, Any]) -> None:
         self.assertIsNotNone(process.stdin)

@@ -39,6 +39,16 @@
   redirect very large output to a file and page it with `read_file` /
   `search_text`.
 
+### Fixed
+
+- A second `initialize` on one persistent STDIO session now replays the
+  negotiated handshake result instead of failing with `-32600 Server is already
+  initialized`. Connectors that probe for a newer protocol, fall back to the
+  legacy handshake, and then re-send `initialize` on the same process could not
+  finish a tool scan at all. The replay reuses the existing session, so no
+  session state is reset and no extra telemetry session is recorded; a repeat
+  that asks for a different protocol version is still rejected.
+
 ## 0.2.2 - 2026-07-28
 
 ### Fixed
