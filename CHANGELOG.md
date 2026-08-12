@@ -86,6 +86,11 @@
   Requests without that `_meta` key — including legacy requests that carry
   `_meta.progressToken`, and every `initialize` — keep the handshake behavior
   they had.
+- Results for `2026-07-28` requests carry `resultType: "complete"` and an
+  `_meta.io.modelcontextprotocol/serverInfo`, and `tools/list` also carries the
+  conservative cache hints `ttlMs: 0` and `cacheScope: "private"` on the result
+  root. Responses to handshake clients are byte-for-byte what they were and
+  never carry these fields.
 
 ### Fixed
 

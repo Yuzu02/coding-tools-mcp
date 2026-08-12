@@ -1467,12 +1467,21 @@ class Runtime:
         return {
             "protocolVersion": self.protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {
-                "name": SERVER_NAME,
-                "title": SERVER_TITLE,
-                "version": __version__,
-            },
+            "serverInfo": self.server_identity(),
             "instructions": self.project_context.server_instructions(),
+        }
+
+    def server_identity(self) -> dict[str, Any]:
+        """Name this server for the handshake and for modern result metadata.
+
+        The protocol layer cannot import this module, so it reads the identity
+        through the runtime it is already dispatching against.
+        """
+
+        return {
+            "name": SERVER_NAME,
+            "title": SERVER_TITLE,
+            "version": __version__,
         }
 
     def list_tools(self) -> dict[str, Any]:

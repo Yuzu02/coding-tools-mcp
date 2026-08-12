@@ -14,9 +14,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+from coding_tools_mcp import __version__
 from coding_tools_mcp.server import MAX_HTTP_REQUEST_BYTES
+from tests.compliance.fixtures import workspace_from_fixture
 from tests.compliance.mcp_client import (
     FORBIDDEN_TOOL_NAMES,
     FORBIDDEN_TOOL_TERMS,
@@ -35,6 +38,7 @@ MODERN_PROTOCOL_VERSION = "2026-07-28"
 META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
 META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 
 def modern_meta(
@@ -1138,21 +1142,51 @@ class MCPContractTests(ComplianceTestCase):
         process = self.start_stdio_server()
         try:
             listed = self.stdio_rpc(process, modern_request(1, "tools/list"))
-            tools = listed.get("result", {}).get("tools")
+            result = listed.get("result", {})
+            self.assert_modern_result(result)
+            self.assertEqual(result.get("ttlMs"), 0)
+            self.assertEqual(result.get("cacheScope"), "private")
+
+            tools = result.get("tools")
             self.assertIsInstance(tools, list)
             self.assertEqual(len(tools), 18)
             self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
+            for tool in tools:
+                # The cache hints describe the catalog, not the entries in it;
+                # a tool definition is a schema clients validate against.
+                self.assertNotIn("ttlMs", tool, tool)
+                self.assertNotIn("cacheScope", tool, tool)
+                self.assertNotIn("ttlMs", tool.get("outputSchema", {}), tool)
+                self.assertNotIn("cacheScope", tool.get("outputSchema", {}), tool)
+        finally:
+            self.stop_process(process)
 
+    def test_stdio_modern_tools_call_shapes_success_and_tool_failure(self) -> None:
+        process = self.start_stdio_server()
+        try:
             called = self.stdio_rpc(
                 process,
-                modern_request(2, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}}),
+                modern_request(1, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}}),
             )
             result = called.get("result", {})
+            self.assert_modern_result(result)
+            self.assertNotIn("ttlMs", result)
+            self.assertNotIn("cacheScope", result)
             self.assertFalse(result.get("isError", False), result)
             structured = result.get("structuredContent")
             self.assertIsInstance(structured, dict)
             self.assertEqual(structured.get("path"), "src/math.js")
             self.assertIn(structured.get("content", ""), self.assert_content_text_is_agent_readable(result))
+
+            failed = self.stdio_rpc(
+                process,
+                modern_request(2, "tools/call", {"name": "read_file", "arguments": {"path": "no/such/file.js"}}),
+            )
+            failure = failed.get("result", {})
+            self.assertTrue(failure.get("isError"), failure)
+            # resultType describes the result envelope; isError is a
+            # tools-domain verdict. A failed tool still answered completely.
+            self.assert_modern_result(failure)
         finally:
             self.stop_process(process)
 
@@ -1160,7 +1194,10 @@ class MCPContractTests(ComplianceTestCase):
         process = self.start_stdio_server()
         try:
             pong = self.stdio_rpc(process, modern_request(1, "ping"))
-            self.assertNotIn("error", pong)
+            result = pong.get("result", {})
+            self.assert_modern_result(result)
+            self.assertNotIn("ttlMs", result)
+            self.assertNotIn("cacheScope", result)
 
             self.stdio_send(
                 process,
@@ -1224,7 +1261,7 @@ class MCPContractTests(ComplianceTestCase):
                 process,
                 modern_request(100, "ping", meta=modern_meta(drop=(META_CLIENT_INFO,))),
             )
-            self.assertNotIn("error", omitted_client_info)
+            self.assert_modern_result(omitted_client_info.get("result", {}))
         finally:
             self.stop_process(process)
 
@@ -1295,6 +1332,39 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
+    def test_stdio_modern_image_result_carries_the_encoded_image_once(self) -> None:
+        with workspace_from_fixture("image-project") as workspace:
+            process = self.start_stdio_server(workspace=workspace.root)
+            try:
+                viewed = self.stdio_rpc(
+                    process,
+                    modern_request(
+                        1,
+                        "tools/call",
+                        {"name": "view_image", "arguments": {"path": "assets/screenshot.png"}},
+                    ),
+                )
+                result = viewed.get("result", {})
+                self.assert_modern_result(result)
+                blocks = [item for item in result.get("content", []) if item.get("type") == "image"]
+                self.assertEqual(len(blocks), 1)
+                encoded = blocks[0].get("data")
+                self.assertIsInstance(encoded, str)
+                # The result metadata names the server, never echoes payloads.
+                self.assertEqual(json.dumps(result).count(str(encoded)), 1)
+            finally:
+                self.stop_process(process)
+
+    def assert_modern_result(self, result: dict[str, Any]) -> None:
+        self.assertEqual(result.get("resultType"), "complete", result)
+        meta = result.get("_meta")
+        self.assertIsInstance(meta, dict, result)
+        self.assertEqual(
+            meta.get(META_SERVER_INFO),
+            {"name": "coding-tools-mcp", "title": "Coding Tools MCP", "version": __version__},
+            result,
+        )
+
     def assert_content_text_is_agent_readable(self, result: dict[str, Any]) -> str:
         structured = result.get("structuredContent")
         self.assertIsInstance(structured, dict, f"structuredContent must be an object: {result!r}")
@@ -1304,17 +1374,18 @@ class MCPContractTests(ComplianceTestCase):
         self.assertTrue(text_items, f"content must include agent-readable text: {result!r}")
         return "\n".join(str(item) for item in text_items)
 
-    def start_stdio_server(self) -> subprocess.Popen[str]:
+    def start_stdio_server(self, workspace: Path | None = None) -> subprocess.Popen[str]:
+        root = workspace or self.workspace.root
         return subprocess.Popen(
             [
                 sys.executable,
                 "-m",
                 "coding_tools_mcp",
                 "--workspace",
-                str(self.workspace.root),
+                str(root),
                 "--stdio",
             ],
-            cwd=str(self.workspace.root),
+            cwd=str(root),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

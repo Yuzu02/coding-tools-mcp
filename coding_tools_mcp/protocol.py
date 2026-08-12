@@ -20,6 +20,7 @@ MODERN_ERA = "modern"
 META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
 META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
@@ -42,6 +43,8 @@ MODERN_METHODS = frozenset(
         "tools/call",
     }
 )
+MODERN_CACHEABLE_METHODS = frozenset({"tools/list"})
+MODERN_RESULT_TYPE = "complete"
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,38 @@ def modern_request_context(params: Mapping[str, Any]) -> RequestContext:
     )
 
 
+def shape_result(
+    context: RequestContext,
+    method: str,
+    result: dict[str, Any],
+    server_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Encode one successful result for the era that asked for it.
+
+    Handlers return business fields only; every era-specific field is added
+    here so no handler can add one twice. A legacy result is returned as it
+    was built — a client that never spoke the modern protocol must not receive
+    fields its schema does not know. A modern result is decorated on a shallow
+    copy so the runtime's own dict is left alone.
+    """
+
+    if context.era != MODERN_ERA:
+        return result
+    shaped = dict(result)
+    shaped["resultType"] = MODERN_RESULT_TYPE
+    carried = shaped.get("_meta")
+    meta = dict(carried) if isinstance(carried, dict) else {}
+    meta[META_SERVER_INFO] = dict(server_identity)
+    shaped["_meta"] = meta
+    if method in MODERN_CACHEABLE_METHODS:
+        # A catalog is shaped by the workspace and the permission mode it was
+        # served under, so the conservative defaults apply: never shared,
+        # never reused.
+        shaped["ttlMs"] = 0
+        shaped["cacheScope"] = "private"
+    return shaped
+
+
 def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None:
     """Dispatch one MCP JSON-RPC request against a runtime, shared by all transports.
 
@@ -218,7 +253,11 @@ def dispatch_rpc(runtime: Any, request: dict[str, Any]) -> dict[str, Any] | None
             result = _dispatch_legacy(runtime, request, method, params, context)
         if result is None or request_id is None:
             return None
-        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": shape_result(context, method, result, runtime.server_identity()),
+        }
     except JsonRpcError as exc:
         return jsonrpc_error(response_id(request), exc.code, exc.message, exc.data)
 
