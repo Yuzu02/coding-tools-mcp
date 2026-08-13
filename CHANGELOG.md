@@ -36,6 +36,16 @@
 - Tool descriptions now direct remote clients to pass explicit `path`/`workdir`
   arguments and include concrete examples for patching and command
   continuation.
+- Error text now names the error's category and whether it is retryable, and
+  tells a model not to repeat a call that cannot succeed. `retryable` and
+  `category` were only ever in `structuredContent`, which most clients do not
+  forward to the model, so a permanent failure was indistinguishable from a
+  transient one.
+- `COMMAND_NOT_FOUND` from `write_stdin`, `kill_command`, and `read_output` now
+  explains that the handle expired or never existed, states the retention
+  window a finished command's output has, and names `exec_command` as the way
+  to recover. Retrying a dead handle is the single largest source of failed
+  `write_stdin` calls.
 - `kill_command` now declares `kill_wait_ms` (hard-kill escalation wait,
   default 2000 ms) in its input schema; previously the runtime honored it but
   schema validation rejected any call that passed it.

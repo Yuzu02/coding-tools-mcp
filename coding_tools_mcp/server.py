@@ -198,6 +198,13 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+_COMMAND_RECOVERY_HINT = (
+    "This command_id has expired or never existed; a finished command keeps its"
+    f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
+    f" {MAX_RETAINED_OUTPUT_COMMANDS} commands are retained. Retrying with the"
+    " same command_id cannot succeed. Start the work again with exec_command and"
+    " use the command_id it returns."
+)
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -2780,7 +2787,12 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
-            raise ToolFailure("COMMAND_NOT_FOUND", "Output command not found.", category="runtime")
+            raise ToolFailure(
+                "COMMAND_NOT_FOUND",
+                "Output command not found.",
+                category="runtime",
+                details={"retry_hint": _COMMAND_RECOVERY_HINT},
+            )
         return command
 
     def _format_command_output(self, command: CommandRun, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -3064,7 +3076,12 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
-            raise ToolFailure("COMMAND_NOT_FOUND", "Command not found; stdin access denied.", category="not_found")
+            raise ToolFailure(
+                "COMMAND_NOT_FOUND",
+                "Command not found; stdin access denied.",
+                category="not_found",
+                details={"retry_hint": _COMMAND_RECOVERY_HINT},
+            )
         return command
 
     def git_status(self, args: dict[str, Any]) -> dict[str, Any]:

@@ -49,6 +49,20 @@ def _render_error(payload: dict[str, Any]) -> str:
     code = str(error.get("code") or "TOOL_ERROR")
     message = str(error.get("message") or "Tool call failed.")
     lines = [f"{code}: {message}"]
+    # Most clients feed the model this text and nothing else, so terminality
+    # has to be stated here; leaving it in structuredContent alone is what
+    # lets a model retry a call that can never succeed.
+    retryable = error.get("retryable")
+    category = error.get("category")
+    facts: list[str] = []
+    if isinstance(category, str) and category:
+        facts.append(f"Category: {category}.")
+    if isinstance(retryable, bool):
+        facts.append(f"Retryable: {'yes' if retryable else 'no'}.")
+        if not retryable:
+            facts.append("Do not repeat this call unchanged.")
+    if facts:
+        lines.append(" ".join(facts))
     raw_details = error.get("details")
     details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
     retry_hint = details.get("retry_hint")

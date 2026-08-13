@@ -44,6 +44,7 @@ from coding_tools_mcp.textutils import truncate_text_head, truncate_text_tail
 from coding_tools_mcp.tool_results import (
     MODEL_TEXT_SAFETY_LIMIT_BYTES,
     make_tool_result,
+    render_tool_text,
 )
 from tests.compliance.fixtures import git_fixture_preflight_error, init_git
 
@@ -1751,6 +1752,105 @@ class PatchLineFidelityTests(unittest.TestCase):
             apply_update_hunks("alpha\nomega\n", [[" omega", "+tail"]]),
             "alpha\nomega\ntail\n",
         )
+
+
+class ErrorTextTerminalityTests(unittest.TestCase):
+    """Whether a failure is worth retrying has to be in the model text.
+
+    `retryable` and `category` live in structuredContent, but most clients
+    forward only the text content to the model. A model that cannot see
+    "this can never work" keeps calling a dead command handle.
+    """
+
+    @staticmethod
+    def error_text(
+        code: str,
+        message: str,
+        *,
+        category: str | None = "runtime",
+        retryable: bool | None = False,
+        details: dict[str, Any] | None = None,
+    ) -> str:
+        error: dict[str, Any] = {"code": code, "message": message, "details": details or {}}
+        if category is not None:
+            error["category"] = category
+        if retryable is not None:
+            error["retryable"] = retryable
+        return render_tool_text("write_stdin", {"ok": False, "error": error}, is_error=True)
+
+    def test_first_line_is_still_code_and_message(self) -> None:
+        text = self.error_text("COMMAND_NOT_FOUND", "Command not found.")
+        self.assertEqual(text.splitlines()[0], "COMMAND_NOT_FOUND: Command not found.")
+
+    def test_terminal_failure_says_so_and_forbids_a_bare_retry(self) -> None:
+        text = self.error_text("COMMAND_NOT_FOUND", "Command not found.", category="not_found")
+        self.assertIn("Category: not_found.", text)
+        self.assertIn("Retryable: no.", text)
+        self.assertIn("Do not repeat this call unchanged.", text)
+
+    def test_retryable_failure_is_not_told_to_stop(self) -> None:
+        text = self.error_text(
+            "PATCH_CONFLICT",
+            "File changed while the patch was being prepared.",
+            category="conflict",
+            retryable=True,
+        )
+        self.assertIn("Category: conflict.", text)
+        self.assertIn("Retryable: yes.", text)
+        self.assertNotIn("Do not repeat", text)
+
+    def test_absent_fields_are_omitted_rather_than_guessed(self) -> None:
+        without_category = self.error_text("TOOL_ERROR", "Failed.", category=None)
+        self.assertNotIn("Category:", without_category)
+        self.assertIn("Retryable: no.", without_category)
+
+        without_retryable = self.error_text("TOOL_ERROR", "Failed.", retryable=None)
+        self.assertIn("Category: runtime.", without_retryable)
+        self.assertNotIn("Retryable:", without_retryable)
+        self.assertNotIn("Do not repeat", without_retryable)
+
+        bare = self.error_text("TOOL_ERROR", "Failed.", category=None, retryable=None)
+        self.assertEqual(bare, "TOOL_ERROR: Failed.")
+
+    def test_retry_hint_still_follows_the_terminality_line(self) -> None:
+        text = self.error_text(
+            "COMMAND_NOT_FOUND",
+            "Command not found.",
+            category="not_found",
+            details={"retry_hint": "Start over with exec_command."},
+        )
+        self.assertEqual(
+            text.splitlines(),
+            [
+                "COMMAND_NOT_FOUND: Command not found.",
+                "Category: not_found. Retryable: no. Do not repeat this call unchanged.",
+                "Retry: Start over with exec_command.",
+            ],
+        )
+
+    def test_dead_command_handle_tells_the_model_how_to_recover(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="dangerous")
+            for tool, arguments in (
+                ("write_stdin", {"command_id": "cmd-does-not-exist", "chars": "y\n"}),
+                ("kill_command", {"command_id": "cmd-does-not-exist"}),
+                ("read_output", {"output_ref": "command:cmd-does-not-exist:stdout"}),
+            ):
+                with self.subTest(tool=tool):
+                    result = runtime.call_tool(tool, arguments)
+                    self.assertTrue(result["isError"])
+                    text = "\n".join(
+                        item["text"]
+                        for item in result["content"]
+                        if item.get("type") == "text"
+                    )
+                    self.assertIn("COMMAND_NOT_FOUND", text)
+                    self.assertIn("Retryable: no", text)
+                    self.assertIn("Do not repeat this call unchanged.", text)
+                    self.assertIn("exec_command", text)
+                    self.assertIn(str(server_module.COMPLETED_COMMAND_TTL_SECONDS), text)
+                    self.assertIn(str(server_module.MAX_RETAINED_OUTPUT_COMMANDS), text)
+                    self.assertIs(result["structuredContent"]["error"]["retryable"], False)
 
 
 class FakeReadonlyAnnotationTests(unittest.TestCase):
