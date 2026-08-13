@@ -491,6 +491,16 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(listed_status, 200, listed)
         self.assert_modern_result(listed.get("result", {}))
         self.assertEqual(listed.get("result", {}).get("ttlMs"), 0)
+        self.assertEqual(listed.get("result", {}).get("cacheScope"), "private")
+
+        # A tool that failed still answered completely: isError is a
+        # tools-domain verdict, resultType describes the envelope.
+        failed_status, failed = self.modern_http_post(
+            modern_request(4, "tools/call", {"name": "read_file", "arguments": {"path": "no/such/file.js"}})
+        )
+        self.assertEqual(failed_status, 200, failed)
+        self.assertTrue(failed.get("result", {}).get("isError"), failed)
+        self.assert_modern_result(failed.get("result", {}))
 
         # A notification mirrors its method too, and is still answered with an
         # empty 202 rather than a JSON-RPC response.
@@ -625,6 +635,83 @@ class MCPContractTests(ComplianceTestCase):
         )
         self.assertEqual(legacy_status, 200, legacy)
         self.assertEqual(legacy.get("error", {}).get("code"), -32601)
+
+    def test_http_answers_a_mirrored_future_version_with_the_modern_error(self) -> None:
+        """A version from neither era, stated consistently, is the body's fault.
+
+        The header alone cannot say which era a client meant, so a header
+        naming an unknown version is a transport error — but not when the body
+        settles the question. Here `_meta` names the same future version, so
+        this is a modern request asking for a version this server does not
+        speak, and it is owed `-32022` with the versions that do work.
+        """
+
+        future = "2027-01-01"
+        status, response = self.raw_http_post(
+            json.dumps(modern_request(1, "tools/list", meta=modern_meta({META_PROTOCOL_VERSION: future}))).encode(
+                "utf-8"
+            ),
+            headers={"MCP-Protocol-Version": future, "Mcp-Method": "tools/list"},
+            default_protocol_version=None,
+        )
+        self.assertEqual(status, 400, response)
+        error = response.get("error", {})
+        self.assertEqual(error.get("code"), -32022, response)
+        self.assertEqual(error.get("data", {}).get("supported"), [MODERN_PROTOCOL_VERSION])
+        self.assertEqual(error.get("data", {}).get("received"), future)
+
+    def test_http_answers_a_mistyped_meta_version_exactly_as_stdio_does(self) -> None:
+        """The `_meta` contract is checked before the headers that mirror it.
+
+        A mistyped version fails the mirror as well — the header cannot equal
+        a number — but the transport must not answer for the body: the client
+        gets the same `-32602` it would get over stdio.
+        """
+
+        status, response = self.raw_http_post(
+            json.dumps(modern_request(1, "tools/list", meta=modern_meta({META_PROTOCOL_VERSION: 20260728}))).encode(
+                "utf-8"
+            ),
+            headers={"MCP-Protocol-Version": MODERN_PROTOCOL_VERSION, "Mcp-Method": "tools/list"},
+            default_protocol_version=None,
+        )
+        self.assertEqual(status, 400, response)
+        error = response.get("error", {})
+        self.assertEqual(error.get("code"), -32602, response)
+        self.assertEqual(error.get("data", {}).get("reason"), "protocol_version")
+
+    def test_http_rejects_a_repeated_mirror_header(self) -> None:
+        """A mirror sent twice has no single value to check the body against."""
+
+        request = modern_request(1, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}})
+        status, response = self.raw_http_post(
+            json.dumps(request).encode("utf-8"),
+            headers={
+                "MCP-Protocol-Version": MODERN_PROTOCOL_VERSION,
+                "Mcp-Method": "tools/call",
+                "Mcp-Name": "read_file",
+            },
+            repeated_headers=(("Mcp-Name", "read_file"),),
+            default_protocol_version=None,
+        )
+        self.assertEqual(status, 400, response)
+        error = response.get("error", {})
+        self.assertEqual(error.get("code"), -32020, response)
+        self.assertEqual(error.get("data", {}).get("header"), "Mcp-Name")
+        self.assertEqual(error.get("data", {}).get("reason"), "duplicate")
+
+    def test_http_rejects_an_oversized_base64_sentinel(self) -> None:
+        """The sentinel is decoded before the body is read, so it is bounded."""
+
+        request = modern_request(1, "tools/call", {"name": "read_file", "arguments": {"path": "src/math.js"}})
+        status, response = self.modern_http_post(
+            request,
+            headers={"Mcp-Name": f"=?base64?{'A' * 8193}?="},
+        )
+        self.assertEqual(status, 400, response)
+        error = response.get("error", {})
+        self.assertEqual(error.get("code"), -32020, response)
+        self.assertEqual(error.get("data", {}).get("reason"), "oversized")
 
     def test_http_preflight_advertises_the_mirror_headers(self) -> None:
         self.assertIsNotNone(self.client.url)
@@ -1120,23 +1207,63 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
-    def test_initialize_notification_is_rejected(self) -> None:
-        status, response = self.raw_http_post(
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-11-25",
-                        "capabilities": {},
-                        "clientInfo": {"name": "invalid-notification", "version": "1"},
-                    },
-                }
-            ).encode("utf-8"),
+    def test_initialize_notification_is_ignored(self) -> None:
+        """A handshake sent as a notification is answered with nothing.
+
+        It cannot work — the negotiated version has nowhere to go — but
+        JSON-RPC forbids answering a notification at all, so the failure is
+        the client's to notice from the reply it never gets.
+        """
+
+        status, body = self.raw_notification_post(
+            {
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "invalid-notification", "version": "1"},
+                },
+            },
             headers={"MCP-Protocol-Version": "2025-11-25"},
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(response.get("error", {}).get("code"), -32600)
+        self.assertEqual(status, 202, body)
+        self.assertEqual(body, "")
+
+    def test_a_notification_whose_meta_is_invalid_is_answered_with_silence(self) -> None:
+        """Nothing may be sent back for a notification, valid or not.
+
+        The mirror headers are a transport-level contract and are still
+        enforced on a notification; the `_meta` this one carries is the
+        protocol's own business, and a fault in it is answered with nothing
+        on either transport.
+        """
+
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {
+                "requestId": "missing",
+                "_meta": modern_meta(drop=(META_CLIENT_CAPABILITIES,)),
+            },
+        }
+        process = self.start_stdio_server()
+        try:
+            self.stdio_send(process, notification)
+            self.assert_no_stdio_response(process)
+            self.assertIsNone(process.poll(), "a rejected notification must not end the stdio session")
+        finally:
+            self.stop_process(process)
+
+        status, body = self.raw_notification_post(
+            notification,
+            headers={
+                "MCP-Protocol-Version": MODERN_PROTOCOL_VERSION,
+                "Mcp-Method": "notifications/cancelled",
+            },
+        )
+        self.assertEqual(status, 202, body)
+        self.assertEqual(body, "")
 
     def test_initialize_with_newer_client_protocol_negotiates_server_version(self) -> None:
         payload = {
@@ -1492,6 +1619,31 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
+    def test_stdio_modern_meta_is_validated_without_walking_what_it_carries(self) -> None:
+        """Declared capabilities are checked for their type, never copied.
+
+        A client controls how deeply nested its `_meta` objects are, so any
+        recursive handling of them is an outage a small request can cause: 600
+        levels fit in well under 10 KB.
+        """
+
+        nested: dict[str, Any] = {}
+        node = nested
+        for _ in range(600):
+            node["child"] = {}
+            node = node["child"]
+
+        process = self.start_stdio_server()
+        try:
+            listed = self.stdio_rpc(
+                process,
+                modern_request(1, "tools/list", meta=modern_meta({META_CLIENT_CAPABILITIES: nested})),
+            )
+            self.assert_modern_result(listed.get("result", {}))
+            self.assertIsInstance(listed.get("result", {}).get("tools"), list)
+        finally:
+            self.stop_process(process)
+
     def test_stdio_modern_era_still_reports_unimplemented_methods(self) -> None:
         process = self.start_stdio_server()
         try:
@@ -1752,6 +1904,7 @@ class MCPContractTests(ComplianceTestCase):
         content_type: str = "application/json",
         content_length: int | str | None = None,
         headers: dict[str, str] | None = None,
+        repeated_headers: tuple[tuple[str, str], ...] = (),
         path: str | None = None,
         default_protocol_version: str | None = "2025-11-25",
     ) -> tuple[int, dict[str, Any]]:
@@ -1769,6 +1922,8 @@ class MCPContractTests(ComplianceTestCase):
             connection.putheader("Content-Length", str(len(body) if content_length is None else content_length))
             for name, value in (headers or {}).items():
                 connection.putheader(name, value)
+            for name, value in repeated_headers:
+                connection.putheader(name, value)
             connection.endheaders()
             if body:
                 connection.send(body)
@@ -1777,6 +1932,25 @@ class MCPContractTests(ComplianceTestCase):
             return response.status, json.loads(response_body)
         finally:
             connection.close()
+
+    def raw_notification_post(
+        self,
+        notification: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        """POST a message with no id and return the status with the raw body."""
+
+        self.assertNotIn("id", notification)
+        parsed = urllib.parse.urlparse(str(self.client.url))
+        status, _, body = self.raw_base_http_request(
+            f"{parsed.scheme}://{parsed.netloc}",
+            "POST",
+            parsed.path or "/mcp",
+            body=json.dumps(notification).encode("utf-8"),
+            headers={"Content-Type": "application/json", **(headers or {})},
+        )
+        return status, body
 
     def modern_http_post(
         self,

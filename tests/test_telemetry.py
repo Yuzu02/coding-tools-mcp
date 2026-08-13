@@ -136,6 +136,28 @@ class OffMeansOffTests(unittest.TestCase):
                         runtime.close()
                 get_sender.assert_not_called()
 
+    def test_an_activating_request_writes_nothing_while_telemetry_is_off(self) -> None:
+        """Off means no sender and no install id: building an event reads one."""
+
+        saved_install_id = telemetry._install_id
+        telemetry._install_id = None
+        get_sender = Mock()
+        try:
+            with tempfile.TemporaryDirectory() as home:
+                with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="off", HOME=home):
+                    with patch.object(telemetry, "_get_sender", get_sender):
+                        with tempfile.TemporaryDirectory() as tmp:
+                            runtime = Runtime(Path(tmp))
+                            dispatch_rpc(
+                                runtime,
+                                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                            )
+                            runtime.close()
+                get_sender.assert_not_called()
+                self.assertFalse((Path(home) / ".coding-tools-mcp").exists(), "off must not create an install id")
+        finally:
+            telemetry._install_id = saved_install_id
+
     def test_post_sends_nothing_when_disabled(self) -> None:
         with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="off"):
             with patch.object(telemetry, "urlopen", Mock()) as opener:
@@ -304,26 +326,43 @@ class SessionEventTests(unittest.TestCase):
         self.assertEqual(end["legacy_requests"], 2)
 
     def test_self_reported_client_identity_is_sanitized(self) -> None:
-        sender = _CapturingSender()
-        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
-            with tempfile.TemporaryDirectory() as tmp:
-                runtime = Runtime(Path(tmp))
-                _modern_request(
-                    runtime,
-                    "tools/call",
-                    {"name": "read_file", "arguments": {"path": "missing.txt"}},
-                    client_info={
-                        "name": "evil\r\nclient\u4e2d\x07" + "x" * 200,
-                        "version": "1.0\n",
-                        "secret": "must-not-travel",
-                    },
-                )
-                runtime.close()
+        # A client names itself; the label is ours. Anything that would turn
+        # one into free-form text, an address, or a path is dropped rather
+        # than escaped, and a name is never long enough to be an identifier.
+        cases = [
+            (
+                {
+                    "name": "evil\r\nclient\u4e2d\x07" + "x" * 200,
+                    "version": "1.0\n",
+                    "secret": "must-not-travel",
+                },
+                "evilclient" + "x" * 30,
+                "1.0",
+            ),
+            ({"name": "alice@example.com", "version": "2.0"}, "aliceexample.com", "2.0"),
+            ({"name": "/home/alice/repo", "version": "3.0"}, "homealicerepo", "3.0"),
+        ]
+        for client_info, expected_name, expected_version in cases:
+            with self.subTest(client_name=client_info["name"]):
+                sender = _CapturingSender()
+                with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        runtime = Runtime(Path(tmp))
+                        _modern_request(
+                            runtime,
+                            "tools/call",
+                            {"name": "read_file", "arguments": {"path": "missing.txt"}},
+                            client_info=client_info,
+                        )
+                        runtime.close()
 
-        error = _properties(_events_by_name(sender)["tool_error"][0])
-        self.assertEqual(error["client_name"], "evilclient" + "x" * 30)
-        self.assertEqual(error["client_version"], "1.0")
-        self.assertNotIn("must-not-travel", json.dumps(sender.events))
+                serialized = json.dumps(sender.events)
+                error = _properties(_events_by_name(sender)["tool_error"][0])
+                self.assertEqual(error["client_name"], expected_name)
+                self.assertEqual(error["client_version"], expected_version)
+                self.assertNotIn("must-not-travel", serialized)
+                for character in ("@", "/"):
+                    self.assertNotIn(character, str(error["client_name"]))
 
     def test_every_handshake_is_recorded_but_the_session_starts_once(self) -> None:
         sender = _CapturingSender()
@@ -430,6 +469,27 @@ class FirstAppearanceLogTests(unittest.TestCase):
                 "coding-tools-mcp: server/discover probe",
             ],
         )
+
+    def test_a_method_name_cannot_write_a_second_line_into_the_log(self) -> None:
+        """The method comes off the wire, and the note is one line about it."""
+
+        stderr = io.StringIO()
+        method = "tools/list\r\ncoding-tools-mcp: forged operator note\x07"
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="off"), contextlib.redirect_stderr(stderr):
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Runtime(Path(tmp))
+                _modern_request(runtime, method)
+                runtime.close()
+
+        output = stderr.getvalue()
+        lines = [line for line in output.splitlines() if line.startswith("coding-tools-mcp:")]
+        self.assertEqual(
+            lines,
+            ["coding-tools-mcp: modern client request (tools/listcoding-tools-mcpforgedoperatornote)"],
+            output,
+        )
+        self.assertNotIn("forged operator note", output)
+        self.assertNotIn("\x07", output)
 
 
 class DocumentationDriftTests(unittest.TestCase):

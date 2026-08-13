@@ -82,6 +82,7 @@ from .protocol import (
     request_era,
     response_id,
     validate_mirror_headers,
+    validate_modern_meta,
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
@@ -4798,6 +4799,10 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     return payload
 
 
+# The headers a modern request mirrors its body in, each of which may appear
+# exactly once.
+MIRROR_HEADERS = ("MCP-Protocol-Version", "Mcp-Method", "Mcp-Name")
+
 # A modern client reads the HTTP status as well as the JSON-RPC error, so the
 # protocol errors that name a fault in the request are reported as such. Every
 # other code — including -32603, which says the request was fine and we were
@@ -4951,17 +4956,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if self.headers.get_content_type().lower() != "application/json":
             self.send_rpc_error(-32600, "Content-Type must be application/json", status=415)
             return
-        # Which era a request belongs to is decided by its body, so a version
-        # header naming something from neither era is refused before the body
-        # is read: there is nothing to decide it against.
         protocol_version = self.headers.get("MCP-Protocol-Version")
-        if protocol_version and not protocol_version_is_known(protocol_version):
-            self.send_rpc_error(
-                -32600,
-                "Unsupported MCP protocol version",
-                data={"supported": list(KNOWN_PROTOCOL_VERSIONS), "received": protocol_version},
-            )
-            return
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             self.send_rpc_error(-32600, "Content-Length is required", status=411)
@@ -4986,7 +4981,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             request = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            # RecursionError included: a deeply nested document is a document
+            # this server cannot parse, not a reason to unwind the handler.
             self.send_rpc_error(-32700, "Parse error")
             return
         if isinstance(request, list):
@@ -5010,6 +5007,44 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         raw_params = request.get("params")
         params = raw_params if isinstance(raw_params, dict) else {}
         era = request_era(method, params)
+        if era == MODERN_ERA:
+            duplicate = self.duplicated_mirror_header()
+            if duplicate is not None:
+                self.send_rpc_error(
+                    HEADER_MISMATCH,
+                    f"{duplicate} must appear exactly once",
+                    request_id=response_id(request),
+                    data={"header": duplicate, "reason": "duplicate"},
+                )
+                return
+            # The body's own contract comes first: a version this server does
+            # not speak, or a mistyped ``_meta`` field, is the same fault here
+            # as it is over stdio, and mirror headers that faithfully repeat a
+            # wrong body must not answer for it instead. A notification is
+            # exempt — nothing may be sent back for one — and is left to the
+            # dispatcher, which stays silent.
+            if "id" in request:
+                try:
+                    validate_modern_meta(params)
+                except JsonRpcError as exc:
+                    self.send_rpc_error(
+                        exc.code,
+                        exc.message,
+                        status=MODERN_ERROR_STATUSES.get(exc.code, 200),
+                        request_id=response_id(request),
+                        data=exc.data,
+                    )
+                    return
+        elif protocol_version and not protocol_version_is_known(protocol_version):
+            # A handshake-era request naming a version from neither era: the
+            # body cannot decide it, so the transport refuses it and offers
+            # everything this server speaks.
+            self.send_rpc_error(
+                -32600,
+                "Unsupported MCP protocol version",
+                data={"supported": list(KNOWN_PROTOCOL_VERSIONS), "received": protocol_version},
+            )
+            return
         try:
             validate_mirror_headers(
                 era,
@@ -5029,6 +5064,20 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.send_json(response, status=rpc_response_status(era, response))
+
+    def duplicated_mirror_header(self) -> str | None:
+        """Name the first mirror header that was sent more than once, if any.
+
+        A gateway routes on these headers alone, and which of two values it
+        reads is its own business, so a request that states its version,
+        method, or subject twice has no single mirror to check the body
+        against and is refused rather than resolved.
+        """
+
+        for header in MIRROR_HEADERS:
+            if len(self.headers.get_all(header) or ()) > 1:
+                return header
+        return None
 
     def handle_rpc(
         self,

@@ -61,7 +61,12 @@ _CLIENT_LABEL_LIMIT = 40
 # clientInfo is whatever the client says it is, so it is narrowed to a
 # printable ASCII subset before it can become an event property: anything else
 # is either an injection into the log line or unbounded cardinality.
-_CLIENT_LABEL_CHARS = frozenset(string.ascii_letters + string.digits + " .,_-+/@:()")
+_CLIENT_LABEL_CHARS = frozenset(string.ascii_letters + string.digits + " ._-")
+# A method name is ours to expect rather than the client's to invent, but it
+# still arrives from the wire, so the log line is built from the characters a
+# method name is made of and nothing else.
+_METHOD_LABEL_CHARS = frozenset(string.ascii_letters + string.digits + "/._-")
+_UNKNOWN_LABEL = "unknown"
 _OFF_VALUES = {"0", "off", "false", "no", "disable", "disabled"}
 _DURATION_BUCKETS = ((100, "dur_lt_100ms"), (1_000, "dur_lt_1s"), (10_000, "dur_lt_10s"))
 _DURATION_OVERFLOW = "dur_gte_10s"
@@ -107,6 +112,13 @@ def _client_label(value: Any) -> str | None:
         return None
     text = "".join(character for character in str(value) if character in _CLIENT_LABEL_CHARS).strip()
     return text[:_CLIENT_LABEL_LIMIT] if text else None
+
+
+def _method_label(value: Any) -> str:
+    """Normalize a wire method name into something safe to log on one line."""
+
+    text = "".join(character for character in str(value) if character in _METHOD_LABEL_CHARS).strip()
+    return text[:_LABEL_LIMIT] if text else _UNKNOWN_LABEL
 
 
 def _client_identity(client_info: Any) -> tuple[str | None, str | None]:
@@ -318,10 +330,12 @@ class SessionTelemetry:
                 self._discover_probes += 1
             activated = self._activate_locked() if method != "ping" else False
         if era == MODERN_ERA:
-            note_first_appearance("modern-request", f"modern client request ({method})")
+            note_first_appearance("modern-request", f"modern client request ({_method_label(method)})")
         if method == DISCOVER_METHOD:
             note_first_appearance("discover-probe", f"{DISCOVER_METHOD} probe")
-        if activated:
+        # ``_event`` reads (and, once per install, writes) the install id, so
+        # it must not be built at all while telemetry is off.
+        if activated and telemetry_mode() != "off":
             self._emit([self._event("session_start", {})], wake=True)
 
     def record_session_start(self, client_info: dict[str, Any] | None, protocol_version: str) -> None:

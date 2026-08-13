@@ -115,8 +115,9 @@
 - **Behavior change:** an HTTP request without an `MCP-Protocol-Version` header
   is treated as `2025-11-25`, the newest handshake version this server speaks.
   The older spec suggests assuming `2025-03-26`, which this server has never
-  spoken; the value only selects what is echoed and recorded, never what a
-  method does.
+  spoken. The header value travels with the request as context and is available
+  to the runtime; nothing echoes it, records it, or acts on it, and no method
+  behaves differently for it.
 - The runtime contract is now
   [docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md), and
   [docs/migration-0.3.md](docs/migration-0.3.md) collects every breaking change

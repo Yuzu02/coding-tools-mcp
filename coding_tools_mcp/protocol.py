@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -40,6 +39,10 @@ MIRRORED_NAME_METHODS = {
 }
 BASE64_SENTINEL_PREFIX = "=?base64?"
 BASE64_SENTINEL_SUFFIX = "?="
+# A mirrored subject is a tool name, a URI, or a prompt name. Nothing this
+# server answers needs more than a few hundred characters of it, and the
+# decode happens before the body is compared, so the payload is capped.
+BASE64_SENTINEL_MAX_PAYLOAD = 8192
 
 # The method a dual-era client probes with before it decides to handshake.
 DISCOVER_METHOD = "server/discover"
@@ -55,6 +58,11 @@ MODERN_METHODS = frozenset(
 MODERN_CACHEABLE_METHODS = frozenset({DISCOVER_METHOD, "tools/list"})
 MODERN_RESULT_TYPE = "complete"
 
+# The only two ``clientInfo`` fields anything reads, and the length a label
+# built from one is worth carrying.
+CLIENT_INFO_KEYS = ("name", "version")
+CLIENT_INFO_VALUE_LIMIT = 200
+
 
 @dataclass(frozen=True)
 class RequestContext:
@@ -62,15 +70,14 @@ class RequestContext:
 
     One runtime serves concurrent clients, so a request carries its own
     context instead of parking it on runtime state. ``frozen`` freezes only
-    the top level: ``client_info`` and ``client_capabilities`` hold deep copies
-    of the validated ``_meta`` objects so a later mutation of the request body
-    cannot reach into a context that has already been handed on.
+    the top level, so ``client_info`` is not the object the request carried:
+    it is a small dict rebuilt from the two string fields anything reads,
+    which is both bounded and immune to a later mutation of the request body.
     """
 
     era: str = LEGACY_ERA
     protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION
     client_info: Mapping[str, Any] | None = None
-    client_capabilities: Mapping[str, Any] | None = None
 
 
 def jsonrpc_error(
@@ -158,6 +165,12 @@ def decode_mirror_header(value: str) -> str:
     if not (value.startswith(BASE64_SENTINEL_PREFIX) and value.endswith(BASE64_SENTINEL_SUFFIX)):
         return value
     payload = value[len(BASE64_SENTINEL_PREFIX) : -len(BASE64_SENTINEL_SUFFIX)]
+    if len(payload) > BASE64_SENTINEL_MAX_PAYLOAD:
+        raise JsonRpcError(
+            HEADER_MISMATCH,
+            f"Mirror header carries a base64 sentinel longer than {BASE64_SENTINEL_MAX_PAYLOAD} characters",
+            {"reason": "oversized", "max_length": BASE64_SENTINEL_MAX_PAYLOAD},
+        )
     try:
         return base64.b64decode(payload, validate=True).decode("utf-8")
     except ValueError as exc:  # binascii.Error and UnicodeDecodeError both subclass it
@@ -250,11 +263,13 @@ def request_era(method: str, params: Mapping[str, Any]) -> str:
     return LEGACY_ERA
 
 
-def modern_request_context(params: Mapping[str, Any]) -> RequestContext:
-    """Validate a modern request's ``_meta`` and turn it into a context.
+def validate_modern_meta(params: Mapping[str, Any]) -> str:
+    """Check every ``_meta`` field a modern request owes, and return its version.
 
     Only called once :func:`request_era` has found the protocol version key, so
-    ``_meta`` is known to be an object that carries it.
+    ``_meta`` is known to be an object that carries it. A transport may run
+    this before its own checks so that a request which is wrong in both ways
+    is answered with the protocol's verdict rather than the transport's.
     """
 
     meta = params["_meta"]
@@ -271,28 +286,48 @@ def modern_request_context(params: Mapping[str, Any]) -> RequestContext:
             f"Unsupported MCP protocol version in _meta: {version}",
             {"supported": list(MODERN_PROTOCOL_VERSIONS), "received": version},
         )
-    capabilities = meta.get(META_CLIENT_CAPABILITIES)
-    if not isinstance(capabilities, dict):
+    if not isinstance(meta.get(META_CLIENT_CAPABILITIES), dict):
         raise JsonRpcError(
             -32602,
             f"{META_CLIENT_CAPABILITIES} is required and must be an object",
             {"reason": "client_capabilities"},
         )
-    client_info: Mapping[str, Any] | None = None
-    if META_CLIENT_INFO in meta:
-        declared = meta[META_CLIENT_INFO]
-        if not isinstance(declared, dict):
-            raise JsonRpcError(
-                -32602,
-                f"{META_CLIENT_INFO} must be an object when present",
-                {"reason": "client_info"},
-            )
-        client_info = copy.deepcopy(declared)
+    if META_CLIENT_INFO in meta and not isinstance(meta[META_CLIENT_INFO], dict):
+        raise JsonRpcError(
+            -32602,
+            f"{META_CLIENT_INFO} must be an object when present",
+            {"reason": "client_info"},
+        )
+    return version
+
+
+def bounded_client_info(declared: Mapping[str, Any]) -> dict[str, str]:
+    """Rebuild a client's self-description as a small, flat dict.
+
+    A client controls both the shape and the size of what it declares, so
+    nothing it sent is carried onwards: only ``name`` and ``version`` are
+    read, only when they are strings, and each is truncated. Copying the
+    object instead would let an arbitrarily nested one travel with every
+    request that carried it.
+    """
+
+    bounded: dict[str, str] = {}
+    for key in CLIENT_INFO_KEYS:
+        value = declared.get(key)
+        if isinstance(value, str):
+            bounded[key] = value[:CLIENT_INFO_VALUE_LIMIT]
+    return bounded
+
+
+def modern_request_context(params: Mapping[str, Any]) -> RequestContext:
+    """Validate a modern request's ``_meta`` and turn it into a context."""
+
+    version = validate_modern_meta(params)
+    declared = params["_meta"].get(META_CLIENT_INFO)
     return RequestContext(
         era=MODERN_ERA,
         protocol_version=version,
-        client_info=client_info,
-        client_capabilities=copy.deepcopy(capabilities),
+        client_info=bounded_client_info(declared) if isinstance(declared, dict) else None,
     )
 
 
@@ -343,13 +378,21 @@ def dispatch_rpc(
     so one runtime answers every client of the workspace. Transports add only
     their transport-specific framing (stream handling, status codes) around
     this, and may report the legacy version their framing negotiated through
-    ``transport_protocol_version``; it is echoed and recorded, never acted on.
-    Returns None for notifications and requests without an id.
+    ``transport_protocol_version``; it reaches the runtime in the request
+    context and is not acted on, echoed, or recorded today.
+
+    Returns None for notifications and requests without an id. A notification
+    that fails is answered with nothing at all, as JSON-RPC requires: only a
+    message whose envelope is too malformed to tell a notification from a
+    request is answered with an error carrying a null id.
     """
 
-    request_id = request.get("id")
     try:
         validate_rpc_envelope(request)
+    except JsonRpcError as exc:
+        return jsonrpc_error(response_id(request), exc.code, exc.message, exc.data)
+    is_notification = "id" not in request
+    try:
         method = request["method"]
         params = rpc_params(request)
         era = request_era(method, params)
@@ -365,6 +408,7 @@ def dispatch_rpc(
                 protocol_version=transport_protocol_version or LATEST_LEGACY_PROTOCOL_VERSION,
             )
             result = _dispatch_legacy(runtime, request, method, params, context)
+        request_id = request.get("id")
         if result is None or request_id is None:
             return None
         return {
@@ -373,6 +417,8 @@ def dispatch_rpc(
             "result": shape_result(context, method, result, runtime.server_identity()),
         }
     except JsonRpcError as exc:
+        if is_notification:
+            return None
         return jsonrpc_error(response_id(request), exc.code, exc.message, exc.data)
 
 

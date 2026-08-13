@@ -4,7 +4,13 @@ import json
 import sys
 from typing import Any, Protocol, TextIO
 
-from .protocol import RequestContext, dispatch_rpc, invalid_request_response, jsonrpc_error
+from .protocol import (
+    RequestContext,
+    dispatch_rpc,
+    invalid_request_response,
+    jsonrpc_error,
+    response_id,
+)
 from .telemetry import SessionTelemetry
 
 
@@ -50,7 +56,10 @@ def serve_stdio(
                 continue
             try:
                 request = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                # RecursionError included: a deeply nested document is a
+                # document this server cannot parse, not a reason to end the
+                # session.
                 response = jsonrpc_error(None, -32700, "Parse error")
             else:
                 try:
@@ -60,7 +69,15 @@ def serve_stdio(
                         else invalid_request_response()
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the stdio server alive
-                    response = jsonrpc_error(None, -32603, str(exc))
+                    if isinstance(request, dict) and "id" not in request:
+                        # A notification is answered with nothing, however
+                        # badly its handling went.
+                        continue
+                    response = jsonrpc_error(
+                        response_id(request) if isinstance(request, dict) else None,
+                        -32603,
+                        str(exc),
+                    )
             if response is not None:
                 sink.write(
                     json.dumps(response, separators=(",", ":")) + "\n"
