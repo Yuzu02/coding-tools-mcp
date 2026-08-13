@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class SchemaDriftTests(unittest.TestCase):
-    CONTRACT_PATH = ROOT / "docs/runtime-contract-v0.2.md"
+    CONTRACT_PATH = ROOT / "docs/runtime-contract-v0.3.md"
 
     def test_input_schemas_cover_exactly_the_registered_tools(self) -> None:
         self.assertEqual(set(input_schemas()), set(TOOL_REGISTRY))

@@ -49,6 +49,20 @@ def _render_error(payload: dict[str, Any]) -> str:
     code = str(error.get("code") or "TOOL_ERROR")
     message = str(error.get("message") or "Tool call failed.")
     lines = [f"{code}: {message}"]
+    # Most clients feed the model this text and nothing else, so terminality
+    # has to be stated here; leaving it in structuredContent alone is what
+    # lets a model retry a call that can never succeed.
+    retryable = error.get("retryable")
+    category = error.get("category")
+    facts: list[str] = []
+    if isinstance(category, str) and category:
+        facts.append(f"Category: {category}.")
+    if isinstance(retryable, bool):
+        facts.append(f"Retryable: {'yes' if retryable else 'no'}.")
+        if not retryable:
+            facts.append("Do not repeat this call unchanged.")
+    if facts:
+        lines.append(" ".join(facts))
     raw_details = error.get("details")
     details: dict[str, Any] = raw_details if isinstance(raw_details, dict) else {}
     retry_hint = details.get("retry_hint")
@@ -79,10 +93,6 @@ def _render_exec_environment(payload: dict[str, Any]) -> str:
     warnings = payload.get("warnings") if isinstance(payload.get("warnings"), list) else []
     suffix = "\n" + "\n".join(str(item) for item in warnings) if warnings else ""
     return f"Execution environment checked. Landlock: {state}.{suffix}"
-
-
-def _render_cwd(payload: dict[str, Any]) -> str:
-    return f"Default working directory: {payload.get('default_cwd', '.')}"
 
 
 def _render_read_file(payload: dict[str, Any]) -> str:
@@ -388,8 +398,6 @@ def _render_image(payload: dict[str, Any]) -> str:
 _RENDERERS = {
     "server_info": _render_server_info,
     "check_exec_environment": _render_exec_environment,
-    "get_default_cwd": _render_cwd,
-    "set_default_cwd": _render_cwd,
     "read_file": _render_read_file,
     "list_dir": _render_list,
     "list_files": _render_list,

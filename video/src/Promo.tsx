@@ -165,7 +165,7 @@ const ClientsScene: React.FC = () => {
         </FadeUp>
         <FadeUp delay={100}>
           <div style={{ fontSize: 40, color: TEXT, marginTop: 70 }}>
-            One MCP server · every AI client · the same 20 tools
+            One MCP server · every AI client · the same 18 tools
           </div>
         </FadeUp>
       </AbsoluteFill>
@@ -408,7 +408,7 @@ const CtaScene: React.FC = () => (
     >
       <FadeUp delay={5}>
         <div style={{ fontSize: 40, color: DIM, fontFamily: MONO }}>
-          −37% tool-result bytes · 20 tools · Apache-2.0 · PyPI + npm
+          −37% tool-result bytes · 18 tools · Apache-2.0 · PyPI + npm
         </div>
       </FadeUp>
       <FadeUp delay={30}>

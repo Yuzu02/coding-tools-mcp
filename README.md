@@ -16,7 +16,7 @@ Coding Tools MCP is a **model-neutral coding runtime** served over the
 search, structured multi-file patches, command execution, interactive
 sessions, and git — one server that any MCP client can drive. Claude Desktop,
 Claude Code, Cursor, Cline, or an agent you build yourself all get the same
-20 battle-tested tools, confined to one workspace, gated by permission modes.
+18 battle-tested tools, confined to one workspace, gated by permission modes.
 
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -66,10 +66,29 @@ same everywhere (swap `uvx` for `npx` if you prefer Node):
 Then ask your client: *"run the test suite and fix the first failure."*
 
 Prefer HTTP? Drop `--stdio` and the server speaks Streamable HTTP on
-`http://127.0.0.1:8765/mcp` (MCP `2025-11-25`, with `2025-06-18`
-compatibility). A one-line installer, per-client walkthroughs, and
-troubleshooting live in [docs/quickstart.md](docs/quickstart.md) and
+`http://127.0.0.1:8765/mcp`. Both protocol eras are served on either
+transport: MCP `2026-07-28` in full, with `tools` as the only advertised
+capability, and the handshake era `2025-11-25` with `2025-06-18`
+compatibility. Neither has sessions. A one-line installer, per-client
+walkthroughs, and troubleshooting live in
+[docs/quickstart.md](docs/quickstart.md) and
 [docs/mcp-client-config.md](docs/mcp-client-config.md).
+
+On Windows, string commands prefer PowerShell 7 (`pwsh`) with
+`-NoLogo -NoProfile -NonInteractive`. If `pwsh` is unavailable, the server
+automatically preserves command execution through a trusted `cmd.exe`
+compatibility fallback. `server_info`, `check_exec_environment`, and each
+`exec_command` result disclose the selected shell so agents can use the right
+syntax. Set `CODING_TOOLS_MCP_PWSH_PATH` to an absolute trusted `pwsh.exe` path
+to pin PowerShell; an invalid explicit pin is reported instead of ignored.
+
+Because PowerShell resolves commands at runtime, `safe` mode on Windows gates
+dynamic syntax — variables, splatting, call and dot-source operators, `::`
+member access, alias/expression evaluation, and nested shells — behind the
+`shell_expansion` and `inline_script` permissions. Literal commands are
+unaffected; use `request_permissions` or `trusted` mode for the rest. Under the
+`cmd.exe` fallback, percent expansion, caret escaping, and `CALL`/`FOR`
+evaluation likewise require `shell_expansion`.
 
 ## Seven things to try
 
@@ -116,9 +135,11 @@ Per-workspace profiles, server and tunnel start/stop, credential setup with
 clipboard helpers, live health checks. English and 简体中文.
 
 **6. Keep an interactive command alive.** `exec_command` starts a REPL or
-debugger under a real PTY; `write_stdin` feeds it across turns; `read_output`
-pages long output; `kill_command` cleans up. Long-running processes are
-first-class, with deadline watchdogs and bounded buffers.
+debugger under a real POSIX PTY; `write_stdin` feeds it across turns;
+`read_output` pages long output; `kill_command` cleans up. Long-running
+processes are first-class, with deadline watchdogs and bounded buffers.
+Windows prefers PowerShell 7 and otherwise uses the disclosed `cmd.exe`
+fallback for non-TTY commands; ConPTY remains a separate limitation.
 
 **7. Give your own agent production-grade hands.** Building an agent loop with
 the Anthropic SDK or anything else? Don't hand-roll file and exec tools —
@@ -137,13 +158,14 @@ rollback.
 | Files & search | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
 | Execution | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
-| Runtime | `server_info` · `check_exec_environment` · `get_default_cwd` · `set_default_cwd` |
+| Runtime | `server_info` · `check_exec_environment` |
 
-Root `AGENTS.md`/`CLAUDE.md` files load into the initialize context
-automatically. Tool `content` is concise agent-facing text;
+Root `AGENTS.md`/`CLAUDE.md` files load automatically and come back in the
+`instructions` of `initialize`, or of `server/discover` for a client that
+never handshakes. Tool `content` is concise agent-facing text;
 `structuredContent` carries the complete machine result. Schemas and result
 envelopes: [docs/tools-and-schemas.md](docs/tools-and-schemas.md) ·
-[docs/runtime-contract-v0.2.md](docs/runtime-contract-v0.2.md).
+[docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md).
 
 ## Safety Boundary
 
@@ -190,7 +212,7 @@ measured. More: [COMPLIANCE.md](COMPLIANCE.md) · [BENCHMARK.md](BENCHMARK.md) �
 | --- | --- |
 | Getting started | [Quickstart](docs/quickstart.md) · [Client configuration](docs/mcp-client-config.md) · [Troubleshooting](docs/troubleshooting.md) |
 | Remote & sandboxed | [Remote MCP](docs/remote-mcp.md) · [Docker sandbox](docs/docker.md) · [Cloud sandbox worker](cloudflare/sandbox-control/README.md) |
-| Tools & contract | [Tools and schemas](docs/tools-and-schemas.md) · [Runtime contract](docs/runtime-contract-v0.2.md) · [Permission modes](docs/permission-modes.md) |
+| Tools & contract | [Tools and schemas](docs/tools-and-schemas.md) · [Runtime contract](docs/runtime-contract-v0.3.md) · [Migrating to 0.3](docs/migration-0.3.md) · [Permission modes](docs/permission-modes.md) |
 | Execution | [Exec recipes](docs/exec-command-recipes.md) · [Exec troubleshooting](docs/troubleshooting-exec.md) |
 | Integration | [Embedding](docs/embedding.md) · [npm launcher](npm/coding-tools-mcp/README.md) |
 | Security & quality | [Security policy](SECURITY.md) · [Security boundary](docs/security-boundary.md) · [CI and tests](docs/ci-and-tests.md) · [Limitations](docs/limitations.md) · [Competitive analysis](docs/competitive-analysis.md) |

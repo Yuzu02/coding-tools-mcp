@@ -1,6 +1,8 @@
 # Coding Tools MCP Runtime Contract v0.2
 
-Status: implemented contract for `coding-tools-mcp` 0.2.x.
+Status: frozen. This is the implemented contract for `coding-tools-mcp` 0.2.x
+and is kept as it was; the current one is
+[runtime-contract-v0.3.md](runtime-contract-v0.3.md).
 
 Protocol target: MCP `2025-11-25`, with explicit compatibility for `2025-06-18`.
 
@@ -290,11 +292,14 @@ Input example: `{"command_id":"abc","chars":"yes\n"}`.
 
 ### kill_command
 
-Inputs: `"command_id"`, `"signal"`, `"wait_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
+Inputs: `"command_id"`, `"signal"`, `"wait_ms"`, `"kill_wait_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
 
 Annotations: `{"title":"Kill command","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}`.
 
 Statuses are `["terminated", "killed", "exited", "terminating", "not_found"]`.
+
+If the process is still alive `"wait_ms"` after a non-KILL signal, the runtime
+escalates to a hard kill and waits up to `"kill_wait_ms"` for the exit.
 
 Example: `{"command_id":"abc","signal":"KILL"}`.
 
@@ -303,6 +308,12 @@ Example: `{"command_id":"abc","signal":"KILL"}`.
 Inputs: `"output_ref"`, `"stream"`, `"offset"`, `"limit"`.
 
 Annotations: `{"title":"Read output","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Retention is head+tail per stream: the earliest bytes (head) and the most
+recent bytes (rolling tail) are kept; the range between them may be evicted
+once the per-stream buffer overflows. Responses report `head_retained_bytes`,
+`evicted_gap_bytes`, and `omitted_bytes`; reads inside the evicted range clamp
+forward to the tail. Offsets remain absolute and stable.
 
 Example: `{"output_ref":"command:abc:stdout","offset":0,"limit":4096}`.
 

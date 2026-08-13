@@ -60,26 +60,37 @@ from .patching import (
 from .processes import (
     HARD_KILL_SIGNAL,
     COMMAND_BUFFER_BYTES,
+    COMMAND_HEAD_BUFFER_DIVISOR,
     CommandRun,
+    WindowsCommandShell,
+    selected_windows_command_shell,
     spawn_process,
     start_reader_threads,
     start_command_watchdog,
     terminate_process_group,
 )
 from .protocol import (
-    PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    HEADER_MISMATCH,
+    KNOWN_PROTOCOL_VERSIONS,
+    LATEST_LEGACY_PROTOCOL_VERSION,
+    MODERN_ERA,
+    MODERN_PROTOCOL_VERSIONS,
+    UNSUPPORTED_PROTOCOL_VERSION,
+    RequestContext,
     dispatch_rpc,
     jsonrpc_error,
-    protocol_version_is_supported,
+    legacy_protocol_version_is_supported,
+    protocol_version_is_known,
+    request_era,
     response_id,
+    validate_mirror_headers,
+    validate_modern_meta,
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
-from .transport_http import HTTPSessionManager
 from .transport_stdio import serve_stdio
 
 
@@ -178,9 +189,62 @@ NETWORK_RE = re.compile(
     r"(https?://|urllib\.request|urllib3|requests\.|http\.client|\bHTTPConnection\b|\bHTTPSConnection\b|socket\.|aiohttp|httpx|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\bftp\b)",
     re.I,
 )
+POWERSHELL_NETWORK_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:[\w.]+[\\/])?(?:Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|"
+    r"Test-NetConnection|Test-Connection|Resolve-DnsName|iwr|irm|tnc|ping(?:\.exe)?|"
+    r"nslookup(?:\.exe)?|tracert(?:\.exe)?)\b|\b(?:System\.)?Net\.",
+    re.I,
+)
 SHELL_EXPANSION_RE = re.compile(r"(`|\$\(|\$\{)")
 DESTRUCTIVE_RE = re.compile(
     r"(^|\s)(sudo|su|chmod\s+-R|chown\s+-R|mkfs|mount|umount|find\b[^;&|]*\s-delete\b|git\b[^;&|]*\breset\s+--hard\b|git\b[^;&|]*\bclean\s+-[^\s]*[fx][^\s]*|rm\s+-[^\s]*r[^\s]*f|rm\s+-[^\s]*f[^\s]*r)\b",
+    re.I,
+)
+# A module-qualified spelling (Microsoft.PowerShell.Management\Remove-Item)
+# invokes the same cmdlet, so the command-position match accepts an optional
+# Module\ prefix in both PowerShell scans above and below.
+POWERSHELL_DESTRUCTIVE_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:[\w.]+[\\/])?(?:Remove-Item|rm|ri|del|erase|rmdir|rd)\b"
+    r"(?=[^;&|{}\r\n]*\s-(?:r|re|rec|recu|recur|recurs|recurse)\b)",
+    re.I,
+)
+# Single-quoted PowerShell strings are inert text ('' is the only escape), so
+# the dynamic-syntax scan drops them before matching; a literal '$5' or 'a::b'
+# argument is not expansion. Backticks never reach this far in safe mode
+# because SHELL_EXPANSION_RE already gates them.
+POWERSHELL_SINGLE_QUOTED_RE = re.compile(r"'[^']*(?:''[^']*)*'")
+# PowerShell resolves commands at runtime, so scanning for cmdlet names cannot
+# see through a variable, a splatted parameter set, a redefined alias, or a
+# .NET member call. Any of those constructs makes the destructive and network
+# scans above unsound, so they require the same explicit permission that POSIX
+# command substitution already requires instead of being scanned for keywords.
+POWERSHELL_DYNAMIC_RE = re.compile(
+    r"(?P<expansion>\$)"
+    r"|(?P<splatting>(?:^|[\s;&|(){},=])@)"
+    r"|(?P<static_member>::)"
+    r"|(?P<call_operator>(?:^|[;|(){}\r\n]|&&|\|\|)\s*(?:&(?!&)|\.)\s)"
+    r"|(?P<dynamic_eval>\b(?:Invoke-Expression|iex|Invoke-Command|icm|New-Object|"
+    r"Add-Type|Set-Alias|New-Alias|sal|nal)\b)",
+    re.I,
+)
+# cmd.exe also resolves command text at runtime. Paired %...% expansion,
+# CALL/FOR double evaluation, and caret escaping can hide the literal command
+# from the scans above, so safe mode treats those constructs like shell
+# expansion. A lone % cannot expand on a command line (echo 100%,
+# git log --format=%h), and CALL/FOR only evaluate at command position
+# (echo call for help stays literal), so neither is gated.
+CMD_DYNAMIC_RE = re.compile(
+    r"(?P<expansion>%[^%\r\n]+%)"
+    r"|(?P<escape>\^)"
+    r"|(?P<dynamic_eval>(?:^|[&|()\r\n])\s*(?:call|for)\b)",
+    re.I,
+)
+CMD_DESTRUCTIVE_RE = re.compile(
+    r"(?:^|[&|()\r\n])\s*(?:(?:del|erase|rd|rmdir)\b"
+    r"(?=[^&|()\r\n]*\s/(?:s|s[q]?|q[s]))"
+    # format.com and diskpart are real executables, so a path spelling such as
+    # C:\Windows\System32\format.com invokes them just as well as the bare name.
+    r"|(?:[^\s&|()\r\n]*[\\/])?(?:format(?:\.com)?|diskpart)(?:\.exe)?(?=$|[\s&|()<>\r\n]))",
     re.I,
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
@@ -189,6 +253,13 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+_COMMAND_RECOVERY_HINT = (
+    "This command_id has expired or never existed; a finished command keeps its"
+    f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
+    f" {MAX_RETAINED_OUTPUT_COMMANDS} commands are retained. Retrying with the"
+    " same command_id cannot succeed. Start the work again with exec_command and"
+    " use the command_id it returns."
+)
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -564,23 +635,6 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         read_only=True,
         idempotent=True,
     ),
-    "get_default_cwd": ToolSpec(
-        title="Get default cwd",
-        description=(
-            "Return the current MCP transport session's default cwd. This value is session-local and may "
-            "reset after a reconnect."
-        ),
-        read_only=True,
-        idempotent=True,
-    ),
-    "set_default_cwd": ToolSpec(
-        title="Set default cwd",
-        description=(
-            "Set the default cwd only for the current MCP transport session. Prefer explicit path/workdir "
-            "arguments when calls must survive reconnects. Example: {\"path\":\"src\"}."
-        ),
-        idempotent=True,
-    ),
     "read_file": ToolSpec(
         title="Read file",
         description="Read a UTF-8 text file slice inside the configured workspace.",
@@ -618,7 +672,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
             "A still-running command returns command_id. Example: "
-            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}."
+            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
+            "Retained output is bounded per stream; for very large output redirect to a file "
+            "(cmd > out.log 2>&1) and page it with read_file or search_text."
         ),
         destructive=True,
         open_world=True,
@@ -643,6 +699,8 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Read output",
         description=(
             "Read retained command output using an output_ref returned by exec_command/write_stdin. "
+            "Each stream retains the earliest output (head) plus the most recent output (rolling tail); "
+            "bytes between them may be evicted and are reported via evicted_gap_bytes. "
             "Example: {\"output_ref\":\"command:abc:stdout\",\"offset\":0,\"limit\":4096}."
         ),
         read_only=True,
@@ -1104,12 +1162,8 @@ class Workspace:
         return pure
 
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        return self.resolve_existing_at(self.root, raw_path)
-
-    def resolve_existing_at(self, base: Path, raw_path: str = ".") -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path or ".")
-        base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self.root.joinpath(*pure.parts)
         try:
             resolved = candidate.resolve(strict=True)
         except FileNotFoundError as exc:
@@ -1120,14 +1174,10 @@ class Workspace:
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        return self.resolve_for_write_at(self.root, raw_path)
-
-    def resolve_for_write_at(self, base: Path, raw_path: str) -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path)
         if pure.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
-        base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self.root.joinpath(*pure.parts)
         if candidate.exists() or candidate.is_symlink():
             resolved = candidate.resolve(strict=True)
             if not is_relative_to(resolved, self.root):
@@ -1149,17 +1199,6 @@ class Workspace:
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
         return ResolvedPath(normalize_rel_display(target, self.root), target, False)
-
-    def _validate_base(self, base: Path) -> Path:
-        try:
-            resolved = base.resolve(strict=True)
-        except FileNotFoundError as exc:
-            raise ToolFailure("NOT_FOUND", "Default cwd path no longer exists.", category="not_found") from exc
-        if not resolved.is_dir():
-            raise ToolFailure("NOT_A_DIRECTORY", "Default cwd is not a directory.", category="validation")
-        if not is_relative_to(resolved, self.root):
-            raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Default cwd escapes the configured workspace.", category="security")
-        return resolved
 
     def reject_write_symlink(self, raw_path: str) -> None:
         pure = self._reject_unsafe_text(raw_path)
@@ -1235,6 +1274,31 @@ class WorkspaceCommandManager:
         self.lock = threading.Lock()
         self.starting_commands = 0
         self.closed = False
+        # Retention observability: how often output is evicted past the head
+        # segment and how often clients actually ask for evicted bytes. High
+        # hit rates are the signal to consider spilling output to disk.
+        self._retention_stats_lock = threading.Lock()
+        self._retention_stats = {
+            "evict_events": 0,
+            "evicted_bytes_total": 0,
+            "read_output_omitted_hits": 0,
+            "poll_omitted_hits": 0,
+        }
+
+    def record_output_eviction(self, stream: str, lost_bytes: int) -> None:
+        with self._retention_stats_lock:
+            self._retention_stats["evict_events"] += 1
+            self._retention_stats["evicted_bytes_total"] += lost_bytes
+
+    def record_omitted_read(self, kind: str) -> None:
+        key = f"{kind}_omitted_hits"
+        with self._retention_stats_lock:
+            if key in self._retention_stats:
+                self._retention_stats[key] += 1
+
+    def retention_stats_snapshot(self) -> dict[str, int]:
+        with self._retention_stats_lock:
+            return dict(self._retention_stats)
 
     def close(self) -> None:
         with self.lock:
@@ -1321,23 +1385,18 @@ class Runtime:
         self.server_instance_id = self.command_manager.server_instance_id
         self._set_runtime_dir(self.command_manager.runtime_dir)
         self.fallback_runtime_dir = self.command_manager.fallback_runtime_dir
-        self.default_cwd = self.workspace.root
+        self._runtime_dir_lock = threading.Lock()
+        self._runtime_dir_resolved = False
         self._closed = False
-        self.http_session_id = secrets.token_urlsafe(24)
-        self.protocol_version = PROTOCOL_VERSION
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
         # ProjectContext is frozen and derived only from the workspace tree, so
-        # per-session HTTP runtimes reuse the server's copy instead of re-running
-        # discovery (git ls-files / directory walk) on every connect.
+        # an embedder that builds several runtimes over one workspace can reuse
+        # the discovery (git ls-files / directory walk) result.
         self.project_context: ProjectContext = (
             project_context if project_context is not None else load_project_context(self.workspace.root)
         )
-        self.request_commands: dict[str | int, str] = {}
-        self.request_commands_lock = threading.Lock()
-        self.request_context = threading.local()
-        self.initialized = False
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
 
@@ -1353,7 +1412,7 @@ class Runtime:
         self._closed = True
         if self._owns_command_manager:
             self.command_manager.close()
-        self.telemetry.finish()
+        self.telemetry.finish(output_retention=self.command_manager.retention_stats_snapshot())
 
     @property
     def commands(self) -> dict[str, CommandRun]:
@@ -1375,36 +1434,57 @@ class Runtime:
     def starting_commands(self, value: int) -> None:
         self.command_manager.starting_commands = value
 
+    def _create_runtime_dirs(self, runtime_dir: Path) -> str | None:
+        """Create one runtime tree, reporting failure instead of raising."""
+
+        try:
+            for path in (
+                runtime_dir.parent,
+                runtime_dir,
+                runtime_dir / "home",
+                runtime_dir / "tmp",
+                runtime_dir / "cache",
+            ):
+                path.mkdir(parents=True, mode=0o700, exist_ok=True)
+                if os.name != "nt":
+                    try:
+                        path.chmod(0o700)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            return f"{runtime_dir}: {exc}"
+        return None
+
     def _ensure_runtime_dirs(self) -> None:
-        candidates = [self.runtime_dir]
-        if self.fallback_runtime_dir is not None and self.fallback_runtime_dir not in candidates:
-            candidates.append(self.fallback_runtime_dir)
-        errors: list[str] = []
-        for runtime_dir in candidates:
-            self._set_runtime_dir(runtime_dir)
-            try:
-                for path in (
-                    self.runtime_dir.parent,
-                    self.runtime_dir,
-                    self.home_dir,
-                    self.tmp_dir,
-                    self.cache_dir,
-                ):
-                    path.mkdir(parents=True, mode=0o700, exist_ok=True)
-                    if os.name != "nt":
-                        try:
-                            path.chmod(0o700)
-                        except OSError:
-                            pass
-                return
-            except OSError as exc:
-                errors.append(f"{runtime_dir}: {exc}")
-        raise ToolFailure(
-            "RUNTIME_DIR_UNWRITABLE",
-            "Runtime directory could not be created outside the workspace.",
-            category="runtime",
-            details={"attempted": errors},
-        )
+        """Create the runtime directories, choosing which tree to use only once.
+
+        The first call picks the primary directory or, if that one cannot be
+        created, the fallback. Every later call re-creates that same tree and
+        fails instead of switching: concurrent clients share one runtime, and
+        a command reading HOME or TMPDIR must never see them move to another
+        directory mid-flight.
+        """
+
+        with self._runtime_dir_lock:
+            resolved = self._runtime_dir_resolved
+            candidates = [self.runtime_dir]
+            if not resolved and self.fallback_runtime_dir is not None and self.fallback_runtime_dir not in candidates:
+                candidates.append(self.fallback_runtime_dir)
+            errors: list[str] = []
+            for runtime_dir in candidates:
+                error = self._create_runtime_dirs(runtime_dir)
+                if error is None:
+                    if not resolved:
+                        self._set_runtime_dir(runtime_dir)
+                        self._runtime_dir_resolved = True
+                    return
+                errors.append(error)
+            raise ToolFailure(
+                "RUNTIME_DIR_UNWRITABLE",
+                "Runtime directory could not be created outside the workspace.",
+                category="runtime",
+                details={"attempted": errors},
+            )
 
     def command_home_dir(self) -> Path:
         return self.home_dir
@@ -1439,17 +1519,57 @@ class Runtime:
             return False
         return is_relative_to(resolved, self.runtime_dir)
 
-    def initialize(self, client_info: dict[str, Any] | None = None) -> dict[str, Any]:
-        self.telemetry.record_session_start(client_info, self.protocol_version)
+    def initialize(
+        self,
+        client_info: dict[str, Any] | None = None,
+        protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION,
+    ) -> dict[str, Any]:
+        self.telemetry.record_session_start(client_info, protocol_version)
+        return self.initialize_result(protocol_version)
+
+    def initialize_result(self, protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION) -> dict[str, Any]:
+        """Build the handshake payload for one negotiated version.
+
+        The version is negotiated per request rather than stored: one runtime
+        serves every client of the workspace, and two of them may well have
+        handshaken on different versions.
+        """
+
         return {
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {
-                "name": SERVER_NAME,
-                "title": SERVER_TITLE,
-                "version": __version__,
-            },
+            "serverInfo": self.server_identity(),
             "instructions": self.project_context.server_instructions(),
+        }
+
+    def discover_payload(self) -> dict[str, Any]:
+        """Tell a client that never handshakes what this server can do.
+
+        The modern counterpart of the handshake result, minus everything the
+        handshake only needed because it was a handshake: no version is
+        negotiated here, so the versions this server speaks per request are
+        listed instead, and only those — a legacy version named here would
+        invite a client to put one in its ``_meta``. The encoder adds the
+        result envelope, so the fields returned are the answer itself.
+        """
+
+        return {
+            "supportedVersions": list(MODERN_PROTOCOL_VERSIONS),
+            "capabilities": {"tools": {"listChanged": False}},
+            "instructions": self.project_context.server_instructions(),
+        }
+
+    def server_identity(self) -> dict[str, Any]:
+        """Name this server for the handshake and for modern result metadata.
+
+        The protocol layer cannot import this module, so it reads the identity
+        through the runtime it is already dispatching against.
+        """
+
+        return {
+            "name": SERVER_NAME,
+            "title": SERVER_TITLE,
+            "version": __version__,
         }
 
     def list_tools(self) -> dict[str, Any]:
@@ -1469,22 +1589,19 @@ class Runtime:
     def oauth_enabled(self) -> bool:
         return self.oauth_config is not None
 
-    def default_cwd_display(self) -> str:
-        return normalize_rel_display(self.default_cwd, self.workspace.root)
-
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        return self.workspace.resolve_existing_at(self.default_cwd, raw_path)
+        return self.workspace.resolve_existing(raw_path)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        return self.workspace.resolve_for_write_at(self.default_cwd, raw_path)
+        return self.workspace.resolve_for_write(raw_path)
 
     def git_path_filter(self, raw_path: str) -> str:
         if raw_path == ".":
-            return self.default_cwd_display()
+            return "."
         return self.resolve_for_write(raw_path).display
 
-    def _exec_environment_summary(self) -> dict[str, Any]:
-        return {
+    def _exec_environment_summary(self, *, refresh_command_shell: bool = False) -> dict[str, Any]:
+        summary: dict[str, Any] = {
             "workspace": str(self.workspace.root),
             "permission_mode": self.permission_mode,
             "network_allowed": self.allow_network,
@@ -1493,6 +1610,18 @@ class Runtime:
             "tmpdir": str(self.command_tmp_dir()),
             "cache_dir": str(self.cache_dir),
         }
+        if os.name == "nt":
+            try:
+                summary["command_shell"] = windows_command_shell_payload(
+                    selected_windows_command_shell(refresh=refresh_command_shell)
+                )
+            except ToolFailure as exc:
+                summary["command_shell"] = {
+                    "available": False,
+                    "error_code": exc.code,
+                    "message": exc.message,
+                }
+        return summary
 
     def _landlock_enforced(self, landlock: dict[str, Any]) -> bool:
         return bool(landlock.get("available")) and self.landlock_enabled()
@@ -1505,9 +1634,8 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
-            "protocol_version": self.protocol_version,
+            "supported_protocol_versions": list(KNOWN_PROTOCOL_VERSIONS),
             **self._exec_environment_summary(),
-            "default_cwd": self.default_cwd_display(),
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
             "annotation_override": "fake_readonly" if self.fake_readonly_annotations else None,
@@ -1521,6 +1649,13 @@ class Runtime:
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
+            # The static budget only: how often it was actually hit is a
+            # runtime-wide counter and is reported in telemetry, not to
+            # whichever client happened to ask.
+            "output_retention": {
+                "buffer_bytes_per_stream": COMMAND_BUFFER_BYTES,
+                "head_bytes_per_stream": COMMAND_BUFFER_BYTES // COMMAND_HEAD_BUFFER_DIVISOR,
+            },
             "endpoint_path": MCP_ENDPOINT_PATH,
             "project_context": {
                 "root_instruction_files": [item.path for item in self.project_context.root_files],
@@ -1536,7 +1671,7 @@ class Runtime:
         name: str,
         arguments: dict[str, Any] | None,
         *,
-        request_id: str | int | None = None,
+        context: RequestContext | None = None,
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
@@ -1546,16 +1681,9 @@ class Runtime:
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
         try:
-            self.request_context.request_id = request_id
-            try:
-                payload = handler(args)
-            finally:
-                if request_id is not None:
-                    with self.request_commands_lock:
-                        self.request_commands.pop(request_id, None)
-                self.request_context.request_id = None
+            payload = handler(args)
             payload.setdefault("ok", True)
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
         except ToolFailure as exc:
@@ -1584,7 +1712,7 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
             payload = {
@@ -1599,7 +1727,7 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1607,6 +1735,10 @@ class Runtime:
 
     def check_exec_environment(self, args: dict[str, Any]) -> dict[str, Any]:
         landlock = landlock_status_payload()
+        # The explicit diagnostic re-resolves the pinned Windows shell so an
+        # operator who just installed pwsh sees (and activates) it here without
+        # restarting the server.
+        summary = self._exec_environment_summary(refresh_command_shell=True)
         warnings: list[str] = []
         if not landlock.get("available"):
             warnings.append("Linux Landlock filesystem confinement is unavailable")
@@ -1616,41 +1748,43 @@ class Runtime:
             warnings.append(
                 "tools/list annotations are faked as read-only; apply_patch and exec_command still mutate and execute"
             )
+        command_shell = summary.get("command_shell")
+        if isinstance(command_shell, dict):
+            shell_warning = command_shell.get("warning")
+            if isinstance(shell_warning, str):
+                warnings.append(shell_warning)
+            elif command_shell.get("available") is False:
+                warnings.append(str(command_shell.get("message") or "Windows command shell is unavailable"))
         return {
             "ok": True,
-            **self._exec_environment_summary(),
+            **summary,
             "landlock_enabled": self._landlock_enforced(landlock),
             "landlock_abi": landlock.get("abi_version"),
             "global_tmp_write": self.global_tmp_write_policy(),
             "warnings": warnings,
         }
 
-    def get_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "workspace": str(self.workspace.root),
-            "default_cwd": self.default_cwd_display(),
-        }
-
-    def set_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.workspace.resolve_existing(str(args.get("path", ".")))
-        if not resolved.path.is_dir():
-            raise ToolFailure("NOT_A_DIRECTORY", "Default cwd must be a directory.", category="validation")
-        self.default_cwd = resolved.path
-        return {
-            "workspace": str(self.workspace.root),
-            "default_cwd": resolved.display,
-        }
-
-    def emit_tool_trace(self, name: str, args: dict[str, Any], payload: dict[str, Any], started_at: float) -> None:
+    def emit_tool_trace(
+        self,
+        name: str,
+        args: dict[str, Any],
+        payload: dict[str, Any],
+        started_at: float,
+        *,
+        context: RequestContext | None = None,
+    ) -> None:
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
+        # `context` is passed on as the opaque per-request fact it is: the
+        # runtime neither reads the client identity in it nor branches on it.
         self.telemetry.record_tool_call(
             name,
             ok=bool(payload.get("ok")),
             error_code=error.get("code"),
             duration_ms=duration_ms,
             truncated=bool(payload.get("truncated")),
+            context=context,
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return
@@ -2301,11 +2435,12 @@ class Runtime:
         workdir = self.resolve_existing(str(workdir_arg))
         if not workdir.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
-        self._check_command_policy(cmd, args)
+        tty = bool(args.get("tty", False))
+        windows_shell = selected_windows_command_shell() if os.name == "nt" and not tty else None
+        self._check_command_policy(cmd, args, windows_shell=windows_shell)
         timeout_ms = int(args.get("timeout_ms", 30000))
         yield_ms = int(args.get("yield_time_ms", 10000))
         max_output_bytes = int(args.get("max_output_bytes", 65536))
-        tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
         env = self._command_env(args.get("env", {}))
         start = time.time()
@@ -2357,11 +2492,20 @@ class Runtime:
                 env=env,
                 tty=tty,
                 popen_kwargs=popen_extra,
+                windows_shell=windows_shell,
             )
+            command_warnings = [
+                warning
+                for warning in (
+                    landlock_warning,
+                    windows_shell.warning if windows_shell is not None else None,
+                )
+                if warning
+            ]
             command = self._make_command(
                 process,
                 timeout_at=deadline,
-                warnings=[landlock_warning] if landlock_warning else None,
+                warnings=command_warnings,
                 pty_master_fd=pty_master_fd,
             )
             with self.commands_lock:
@@ -2386,10 +2530,6 @@ class Runtime:
                 except OSError:
                     pass
         assert command is not None
-        request_id = getattr(self.request_context, "request_id", None)
-        if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
-            with self.request_commands_lock:
-                self.request_commands[request_id] = command.command_id
         start_reader_threads(command)
         start_command_watchdog(command)
         try:
@@ -2408,6 +2548,8 @@ class Runtime:
             # terminated/timeout) so exec, polling, and kill paths agree.
             payload = command.snapshot_since_cursor(max_output_bytes)
             payload["elapsed_ms"] = int((time.time() - start) * 1000)
+            if windows_shell is not None:
+                payload["command_shell"] = windows_command_shell_payload(windows_shell)
             self._add_exec_diagnostics(payload)
             return self._format_command_output(command, payload, args)
 
@@ -2432,10 +2574,30 @@ class Runtime:
                 return finish()
             time.sleep(0.02)
 
-    def _check_command_policy(self, cmd: str, args: dict[str, Any]) -> None:
+    def _check_command_policy(
+        self,
+        cmd: str,
+        args: dict[str, Any],
+        *,
+        windows_shell: WindowsCommandShell | None = None,
+    ) -> None:
         if self.dangerously_skip_all_permissions:
             return
-        self._check_command_paths(cmd)
+        compact = " ".join(cmd.split()).lower()
+        # POSIX shlex treats backslash as an escape and silently eats it, which
+        # blinds every token-based check to unquoted Windows paths such as
+        # C:\Windows\System32\...\powershell.exe. Backslash is a path separator
+        # on both Windows shells (their escapes are backtick and caret), so the
+        # token scans run on a slash-normalized copy there.
+        scan_cmd = cmd.replace("\\", "/") if windows_shell is not None else cmd
+        if windows_shell is not None and windows_shell.kind == "cmd" and CMD_DESTRUCTIVE_RE.search(cmd):
+            raise ToolFailure(
+                "PERMISSION_REQUIRED",
+                "Destructive commands are blocked without explicit permission.",
+                category="permission",
+                details={"permission": "destructive_command", "command": compact},
+            )
+        self._check_command_paths(scan_cmd)
         env = args.get("env", {})
         if isinstance(env, dict) and any(
             is_filtered_env_var(str(key), str(value)) for key, value in env.items()
@@ -2447,7 +2609,7 @@ class Runtime:
                 details={"permission": "sensitive_env", "env_keys": sorted(str(key) for key in env)},
             )
         if not self.capabilities.inline_script:
-            inline_script = inline_script_command(cmd)
+            inline_script = inline_script_command(scan_cmd)
             if inline_script is not None:
                 raise ToolFailure(
                     "PERMISSION_REQUIRED",
@@ -2455,7 +2617,12 @@ class Runtime:
                     category="permission",
                     details={"permission": INLINE_SCRIPT_PERMISSION, **inline_script},
                 )
-        compact = " ".join(cmd.split()).lower()
+        uses_powershell = powershell_executes_string_commands(windows_shell)
+        uses_cmd = windows_shell is not None and windows_shell.kind == "cmd"
+        # The PowerShell scans model PowerShell semantics; running them against
+        # a POSIX shell or cmd.exe command would gate rm -r and ping on hosts
+        # where those regexes were never the contract.
+        scan_powershell = uses_powershell
         if not self.capabilities.shell_expansion and SHELL_EXPANSION_RE.search(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
@@ -2470,20 +2637,58 @@ class Runtime:
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if DESTRUCTIVE_RE.search(cmd):
+        if (
+            DESTRUCTIVE_RE.search(cmd)
+            or (scan_powershell and POWERSHELL_DESTRUCTIVE_RE.search(cmd))
+        ):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Destructive commands are blocked without explicit permission.",
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if not self.allow_network and NETWORK_RE.search(cmd) and not is_literal_network_reference_command(cmd):
+        network_command = NETWORK_RE.search(cmd) or (
+            scan_powershell and POWERSHELL_NETWORK_RE.search(cmd)
+        )
+        if not self.allow_network and network_command and not is_literal_network_reference_command(scan_cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Network access is denied by default.",
                 category="permission",
                 details={"permission": "network", "command": compact},
             )
+        # Runs last so a command the scans above already recognized keeps its
+        # precise permission label; this is the catch-all for the PowerShell
+        # syntax that makes those scans unsound in the first place.
+        if not self.capabilities.shell_expansion and uses_powershell:
+            construct = powershell_dynamic_construct(cmd)
+            if construct is not None:
+                raise ToolFailure(
+                    "PERMISSION_REQUIRED",
+                    "PowerShell dynamic syntax requires explicit permission because the command "
+                    "a variable, splat, alias, or .NET member resolves to cannot be verified "
+                    "statically.",
+                    category="permission",
+                    details={
+                        "permission": "shell_expansion",
+                        "construct": construct,
+                        "command": compact,
+                    },
+                )
+        if not self.capabilities.shell_expansion and uses_cmd:
+            construct = cmd_dynamic_construct(cmd)
+            if construct is not None:
+                raise ToolFailure(
+                    "PERMISSION_REQUIRED",
+                    "cmd.exe dynamic syntax requires explicit permission because expansion, "
+                    "double evaluation, and escaping can hide the command from policy scans.",
+                    category="permission",
+                    details={
+                        "permission": "shell_expansion",
+                        "construct": construct,
+                        "command": compact,
+                    },
+                )
 
     def _add_exec_diagnostics(self, payload: dict[str, Any]) -> None:
         diagnostics = exec_output_diagnostics(payload)
@@ -2680,6 +2885,7 @@ class Runtime:
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
+            on_evict=self.command_manager.record_output_eviction,
         )
 
     def _remember_output_command(self, command: CommandRun) -> None:
@@ -2734,7 +2940,12 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
-            raise ToolFailure("COMMAND_NOT_FOUND", "Output command not found.", category="runtime")
+            raise ToolFailure(
+                "COMMAND_NOT_FOUND",
+                "Output command not found.",
+                category="runtime",
+                details={"retry_hint": _COMMAND_RECOVERY_HINT},
+            )
         return command
 
     def _format_command_output(self, command: CommandRun, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -2755,12 +2966,17 @@ class Runtime:
             "stderr": f"command:{command.command_id}:stderr",
         }
         truncated_streams: list[str] = []
+        cursor_skipped_drop = False
         for stream in ("stdout", "stderr"):
             omitted = payload.get(f"{stream}_omitted_bytes")
+            if isinstance(omitted, int) and omitted > 0:
+                cursor_skipped_drop = True
             if payload.get(f"{stream}_truncated") or (
                 isinstance(omitted, int) and omitted > 0
             ):
                 truncated_streams.append(stream)
+        if cursor_skipped_drop:
+            self.command_manager.record_omitted_read("poll")
         output_stream = (
             truncated_streams[0]
             if truncated_streams
@@ -2830,7 +3046,7 @@ class Runtime:
                 preview_streams = [
                     stream
                     for stream in ("stdout", "stderr")
-                    if command.retained_stream_bytes(stream)[2] > 0
+                    if command.retained_stream_segments(stream)[3] > 0
                 ]
                 compact["truncated_output_streams"] = preview_streams
                 preview_actions = [read_output_action(output_refs[stream]) for stream in preview_streams]
@@ -2855,7 +3071,7 @@ class Runtime:
 
     def read_output(self, args: dict[str, Any]) -> dict[str, Any]:
         output_ref = str(args.get("output_ref", ""))
-        match = re.fullmatch(r"command:([^:]+):(full|stdout|stderr)", output_ref)
+        match = re.fullmatch(r"command:([^:]+):(stdout|stderr)", output_ref)
         if not match:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -2864,28 +3080,43 @@ class Runtime:
             )
         command = self._get_output_command(match.group(1))
         command.refresh_status()
-        ref_stream = match.group(2)
+        stream = match.group(2)
         requested_stream = str(args.get("stream", "") or "")
         if requested_stream and requested_stream not in {"stdout", "stderr"}:
             raise ToolFailure("INVALID_ARGUMENT", "stream must be stdout or stderr.", category="validation")
-        if ref_stream in {"stdout", "stderr"} and requested_stream and requested_stream != ref_stream:
+        if requested_stream and requested_stream != stream:
             raise ToolFailure("INVALID_ARGUMENT", "stream does not match output_ref.", category="validation")
-        stream = ref_stream if ref_stream in {"stdout", "stderr"} else requested_stream or "stdout"
-        data, retained_start_offset, total_stream_bytes, dropped_bytes = command.retained_stream_bytes(stream)
+        head, tail, tail_start_offset, total_stream_bytes, dropped_bytes = command.retained_stream_segments(stream)
         requested_offset = max(0, int(args.get("offset", 0)))
-        offset = max(requested_offset, retained_start_offset)
         limit = max(1, min(int(args.get("limit", EXEC_PREVIEW_BYTES)), COMMAND_BUFFER_BYTES))
-        buffer_offset = max(0, offset - retained_start_offset)
-        chunk = data[buffer_offset : buffer_offset + limit]
+        head_len = len(head)
+        evicted_gap_bytes = max(0, tail_start_offset - head_len)
+        # The retained set is the frozen head [0, head_len) plus the rolling
+        # tail [tail_start_offset, total). Serve from whichever segment holds
+        # the requested offset; offsets inside the evicted gap clamp forward
+        # to the tail. Chunks never span the gap so offsets stay stable.
+        if requested_offset >= tail_start_offset:
+            offset = requested_offset
+            buffer_offset = offset - tail_start_offset
+            chunk = tail[buffer_offset : buffer_offset + limit]
+        elif requested_offset < head_len:
+            offset = requested_offset
+            chunk = head[offset : min(head_len, offset + limit)]
+        else:
+            offset = tail_start_offset
+            chunk = tail[:limit]
         next_offset = offset + len(chunk) if offset + len(chunk) < total_stream_bytes else None
-        omitted_bytes = max(0, retained_start_offset - requested_offset)
+        omitted_bytes = offset - requested_offset
         warnings: list[str] = []
         if omitted_bytes:
             warnings.append(f"{stream} offset skipped dropped bytes")
-        if dropped_bytes:
-            warnings.append(f"older {stream} output was dropped from the rolling command buffer")
-        if ref_stream == "full":
-            warnings.append("legacy full output_ref defaults to stdout; use output_refs for stable stream paging")
+        if evicted_gap_bytes:
+            warnings.append(
+                f"{stream} output between the retained head and the rolling tail was evicted; "
+                "redirect large output to a file (cmd > out.log 2>&1) to keep everything"
+            )
+        if omitted_bytes:
+            self.command_manager.record_omitted_read("read_output")
         result = {
             "output_ref": output_ref,
             "stream_output_ref": f"command:{command.command_id}:{stream}",
@@ -2895,8 +3126,10 @@ class Runtime:
             "limit": limit,
             "content": chunk.decode("utf-8", errors="replace"),
             "next_offset": next_offset,
-            "total_retained_bytes": len(data),
-            "retained_start_offset": retained_start_offset,
+            "total_retained_bytes": len(tail) + min(head_len, tail_start_offset),
+            "head_retained_bytes": head_len,
+            "evicted_gap_bytes": evicted_gap_bytes,
+            "retained_start_offset": tail_start_offset,
             "total_stream_bytes": total_stream_bytes,
             "stdout_dropped_bytes": command.stdout_dropped_bytes,
             "stderr_dropped_bytes": command.stderr_dropped_bytes,
@@ -2991,27 +3224,17 @@ class Runtime:
                 self.commands.pop(command_id, None)
         return payload
 
-    def cancel_command(self, command_id: str) -> None:
-        with self.commands_lock:
-            command = self.commands.pop(command_id, None)
-        if command is None:
-            return
-        command.refresh_status()
-        if command.process.poll() is None:
-            terminate_process_group(command.process, signal.SIGTERM)
-
-    def cancel_request(self, request_id: str | int) -> None:
-        with self.request_commands_lock:
-            command_id = self.request_commands.get(request_id)
-        if command_id is not None:
-            self.cancel_command(command_id)
-
     def _get_command(self, command_id: str) -> CommandRun:
         self._prune_commands()
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
-            raise ToolFailure("COMMAND_NOT_FOUND", "Command not found; stdin access denied.", category="not_found")
+            raise ToolFailure(
+                "COMMAND_NOT_FOUND",
+                "Command not found; stdin access denied.",
+                category="not_found",
+                details={"retry_hint": _COMMAND_RECOVERY_HINT},
+            )
         return command
 
     def git_status(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -3117,7 +3340,9 @@ class Runtime:
         selected = set(path_filters)
         chunks: list[str] = []
         files: list[dict[str, Any]] = []
-        for rel, before in sorted(self.patch_baselines.items()):
+        with self.patch_lock:
+            baselines = sorted(self.patch_baselines.items())
+        for rel, before in baselines:
             if selected and rel not in selected:
                 continue
             current_path = self.workspace.resolve_for_write(rel).path
@@ -3694,6 +3919,20 @@ def inline_script_segment(command: str | None, args: list[str]) -> dict[str, str
                 return {"command": name, "option": option}
     if name in {"ruby", "perl"} and "-e" in args:
         return {"command": name, "option": "-e"}
+    if name in {"pwsh", "pwsh.exe", "powershell", "powershell.exe"}:
+        for arg in args:
+            if not arg.startswith("-"):
+                continue
+            option = arg.lstrip("-").lower()
+            # PowerShell accepts any unambiguous prefix, so -e, -enc, and
+            # -EncodedCommand all smuggle a base64 script past text scanning.
+            if option and ("command".startswith(option) or "encodedcommand".startswith(option)):
+                return {"command": name, "option": arg}
+        return None
+    if name in {"cmd", "cmd.exe"}:
+        for arg in args:
+            if arg.lstrip("-/").lower() in {"c", "k"}:
+                return {"command": name, "option": arg}
     return None
 
 
@@ -3846,6 +4085,50 @@ def is_inspectable_path_argument(token: str) -> bool:
     if "/" in normalized:
         return True
     return "." in PurePosixPath(normalized).name
+
+
+def windows_command_shell_payload(shell: WindowsCommandShell) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "available": True,
+        "kind": shell.kind,
+        "executable": shell.executable,
+        "fallback": shell.fallback,
+    }
+    if shell.fallback_reason is not None:
+        payload["fallback_reason"] = shell.fallback_reason
+    if shell.warning is not None:
+        payload["warning"] = shell.warning
+    return payload
+
+
+def powershell_executes_string_commands(
+    windows_shell: WindowsCommandShell | None = None,
+) -> bool:
+    """True when the selected Windows string-command shell is PowerShell 7.
+
+    Command policy has to mirror the selection passed to processes.spawn_process:
+    PowerShell syntax is only worth gating where PowerShell is the interpreter.
+    The host fallback keeps direct policy-helper tests backward compatible.
+    """
+
+    if windows_shell is not None:
+        return windows_shell.kind == "pwsh"
+    return os.name == "nt"
+
+
+def powershell_dynamic_construct(command: str) -> str | None:
+    scannable = POWERSHELL_SINGLE_QUOTED_RE.sub("''", command)
+    match = POWERSHELL_DYNAMIC_RE.search(scannable)
+    if match is None:
+        return None
+    return match.lastgroup
+
+
+def cmd_dynamic_construct(command: str) -> str | None:
+    match = CMD_DYNAMIC_RE.search(command)
+    if match is None:
+        return None
+    return match.lastgroup
 
 
 def is_literal_network_reference_command(command: str) -> bool:
@@ -4514,12 +4797,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
     return {
         "server_info": object_schema(),
         "check_exec_environment": object_schema(),
-        "get_default_cwd": object_schema(),
-        "set_default_cwd": object_schema(
-            {
-                "path": {**string, "default": "."},
-            }
-        ),
         "read_file": object_schema(
             {
                 "path": {**string, "minLength": 1},
@@ -4602,6 +4879,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "command_id": {**string, "minLength": 1},
                 "signal": {**string, "enum": ["TERM", "KILL", "INT"], "default": "TERM"},
                 "wait_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 5000},
+                "kill_wait_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 2000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
@@ -4723,7 +5001,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     read_only = [name for name in names if annotations[name].get("readOnlyHint") is True]
     mutating = [name for name in names if annotations[name].get("readOnlyHint") is not True]
     payload = {
-        "protocolVersion": PROTOCOL_VERSION,
+        "supportedProtocolVersions": list(KNOWN_PROTOCOL_VERSIONS),
         "server": {
             "name": SERVER_NAME,
             "title": SERVER_TITLE,
@@ -4732,7 +5010,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         "transport": {
             "type": "streamable_http",
             "endpoint": MCP_ENDPOINT_PATH,
-            "methods": ["POST", "DELETE", "OPTIONS"],
+            "methods": ["POST", "OPTIONS"],
         },
         "auth": _server_card_auth(runtime, oauth_base_url=oauth_base_url),
         "tools": {
@@ -4749,12 +5027,37 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     return payload
 
 
+# The headers a modern request mirrors its body in, each of which may appear
+# exactly once.
+MIRROR_HEADERS = ("MCP-Protocol-Version", "Mcp-Method", "Mcp-Name")
+
+# A modern client reads the HTTP status as well as the JSON-RPC error, so the
+# protocol errors that name a fault in the request are reported as such. Every
+# other code — including -32603, which says the request was fine and we were
+# not — stays a 200 carrying a JSON-RPC error, as the legacy era always does.
+MODERN_ERROR_STATUSES = {
+    -32601: 404,
+    -32602: 400,
+    HEADER_MISMATCH: 400,
+    UNSUPPORTED_PROTOCOL_VERSION: 400,
+}
+
+
+def rpc_response_status(era: str, response: dict[str, Any]) -> int:
+    if era != MODERN_ERA:
+        return 200
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return 200
+    return MODERN_ERROR_STATUSES.get(error.get("code"), 200)
+
+
 class MCPHandler(http.server.BaseHTTPRequestHandler):
     server_version = f"CodingToolsMCP/{__version__}"
 
     @property
     def runtime(self) -> Runtime:
-        return cast(Runtime, getattr(self, "_runtime", self.server.control_runtime))  # type: ignore[attr-defined]
+        return cast(Runtime, self.server.runtime)  # type: ignore[attr-defined]
 
     def log_message(self, format: str, *args: Any) -> None:
         print(format % args, file=sys.stderr)
@@ -4791,14 +5094,14 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if not self.is_authorized():
             self.send_unauthorized()
             return
-        session_id = self.headers.get("Mcp-Session-Id")
-        if not session_id or not self.server.sessions.delete(session_id):  # type: ignore[attr-defined]
-            self.send_rpc_error(-32001, "Unknown MCP session", status=404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.send_cors_headers()
-        self.end_headers()
+        # There is no session to terminate: every request is served by the one
+        # workspace runtime, which outlives any single client.
+        self.send_rpc_error(
+            -32601,
+            "DELETE is not supported: this endpoint has no sessions to terminate",
+            status=405,
+            extra_headers={"Allow": "POST"},
+        )
 
     def do_OPTIONS(self) -> None:
         request_path = self.path.split("?", 1)[0]
@@ -4819,7 +5122,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "Origin denied"}, status=403)
             return
         self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
+        self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
         self.send_cors_headers()
         self.end_headers()
 
@@ -4847,7 +5150,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 -32000,
                 "SSE GET stream is not supported",
                 status=405,
-                extra_headers={"Allow": "POST, DELETE"},
+                extra_headers={"Allow": "POST"},
                 head_only=head_only,
             )
             return
@@ -4882,13 +5185,6 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_rpc_error(-32600, "Content-Type must be application/json", status=415)
             return
         protocol_version = self.headers.get("MCP-Protocol-Version")
-        if protocol_version and not protocol_version_is_supported(protocol_version):
-            self.send_rpc_error(
-                -32600,
-                "Unsupported MCP protocol version",
-                data={"supported": list(SUPPORTED_PROTOCOL_VERSIONS), "received": protocol_version},
-            )
-            return
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             self.send_rpc_error(-32600, "Content-Length is required", status=411)
@@ -4913,7 +5209,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             request = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            # RecursionError included: a deeply nested document is a document
+            # this server cannot parse, not a reason to unwind the handler.
             self.send_rpc_error(-32700, "Parse error")
             return
         if isinstance(request, list):
@@ -4929,60 +5227,99 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 exc.code, exc.message, status=200, request_id=response_id(request), data=exc.data
             )
             return
-        method = request.get("method")
-        session_id = self.headers.get("Mcp-Session-Id")
-        created_session = False
-        if method == "initialize":
-            if session_id:
+        # Every request is served by the one workspace runtime, and a client
+        # that still echoes an ``Mcp-Session-Id`` from an older server is
+        # served like any other rather than rejected. What the request must
+        # carry beyond that depends on its era, which only its body can decide.
+        method = str(request["method"])
+        raw_params = request.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        era = request_era(method, params)
+        if era == MODERN_ERA:
+            duplicate = self.duplicated_mirror_header()
+            if duplicate is not None:
                 self.send_rpc_error(
-                    -32600, "initialize must not include Mcp-Session-Id", request_id=request.get("id")
+                    HEADER_MISMATCH,
+                    f"{duplicate} must appear exactly once",
+                    request_id=response_id(request),
+                    data={"header": duplicate, "reason": "duplicate"},
                 )
                 return
-            try:
-                self._runtime = self.server.sessions.create()  # type: ignore[attr-defined]
-            except RuntimeError as exc:
-                self.send_rpc_error(-32000, str(exc), status=503, request_id=request.get("id"))
-                return
-            self._send_session_header = True
-            created_session = True
-        elif session_id:
-            runtime = self.server.sessions.get(session_id)  # type: ignore[attr-defined]
-            if runtime is None:
-                self.send_rpc_error(
-                    -32001, "Unknown MCP session", status=404, request_id=response_id(request)
-                )
-                return
-            self._runtime = runtime
-            self._send_session_header = True
-            if protocol_version != runtime.protocol_version:
-                self.send_rpc_error(
-                    -32600,
-                    "MCP-Protocol-Version does not match the initialized session",
-                    request_id=request.get("id"),
-                    data={"expected": runtime.protocol_version, "received": protocol_version},
-                )
-                return
-        elif method == "ping":
-            self._runtime = self.server.control_runtime  # type: ignore[attr-defined]
-        else:
-            self.send_rpc_error(-32002, "Server not initialized", request_id=request.get("id"))
+            # The body's own contract comes first: a version this server does
+            # not speak, or a mistyped ``_meta`` field, is the same fault here
+            # as it is over stdio, and mirror headers that faithfully repeat a
+            # wrong body must not answer for it instead. A notification is
+            # exempt — nothing may be sent back for one — and is left to the
+            # dispatcher, which stays silent.
+            if "id" in request:
+                try:
+                    validate_modern_meta(params)
+                except JsonRpcError as exc:
+                    self.send_rpc_error(
+                        exc.code,
+                        exc.message,
+                        status=MODERN_ERROR_STATUSES.get(exc.code, 200),
+                        request_id=response_id(request),
+                        data=exc.data,
+                    )
+                    return
+        elif protocol_version and not protocol_version_is_known(protocol_version):
+            # A handshake-era request naming a version from neither era: the
+            # body cannot decide it, so the transport refuses it and offers
+            # everything this server speaks.
+            self.send_rpc_error(
+                -32600,
+                "Unsupported MCP protocol version",
+                data={"supported": list(KNOWN_PROTOCOL_VERSIONS), "received": protocol_version},
+            )
             return
-        response = self.handle_rpc(request)
-        if created_session and response is not None and "error" in response:
-            self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
-            self._send_session_header = False
+        try:
+            validate_mirror_headers(
+                era,
+                method,
+                params,
+                version_header=protocol_version,
+                method_header=self.headers.get("Mcp-Method"),
+                name_header=self.headers.get("Mcp-Name"),
+            )
+        except JsonRpcError as exc:
+            self.send_rpc_error(exc.code, exc.message, request_id=response_id(request), data=exc.data)
+            return
+        response = self.handle_rpc(request, transport_protocol_version=protocol_version)
         if response is None:
             self.send_response(202)
-            if getattr(self, "_send_session_header", False):
-                self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
             self.send_cors_headers()
             self.end_headers()
             return
-        self.send_json(response)
+        self.send_json(response, status=rpc_response_status(era, response))
 
-    def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
+    def duplicated_mirror_header(self) -> str | None:
+        """Name the first mirror header that was sent more than once, if any.
+
+        A gateway routes on these headers alone, and which of two values it
+        reads is its own business, so a request that states its version,
+        method, or subject twice has no single mirror to check the body
+        against and is refused rather than resolved.
+        """
+
+        for header in MIRROR_HEADERS:
+            if len(self.headers.get_all(header) or ()) > 1:
+                return header
+        return None
+
+    def handle_rpc(
+        self,
+        request: dict[str, Any],
+        *,
+        transport_protocol_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        legacy_version = (
+            transport_protocol_version
+            if legacy_protocol_version_is_supported(transport_protocol_version)
+            else None
+        )
         try:
-            return dispatch_rpc(self.runtime, request)
+            return dispatch_rpc(self.runtime, request, transport_protocol_version=legacy_version)
         except Exception as exc:  # noqa: BLE001 - HTTP must always answer with JSON-RPC
             return jsonrpc_error(response_id(request), -32603, str(exc))
 
@@ -5346,10 +5683,10 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if origin and is_allowed_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
             self.send_header(
                 "Access-Control-Allow-Headers",
-                "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id",
+                "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Method, Mcp-Name",
             )
 
     def send_json(
@@ -5365,8 +5702,6 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        if getattr(self, "_send_session_header", False):
-            self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
         self.send_cors_headers()
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
@@ -5382,16 +5717,13 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
         self,
         address: tuple[str, int],
         handler: type[MCPHandler],
-        control_runtime: Runtime,
-        runtime_factory: Any,
+        runtime: Runtime,
     ) -> None:
         super().__init__(address, handler)
-        self.control_runtime = control_runtime
-        self.sessions = HTTPSessionManager(runtime_factory)
+        self.runtime = runtime
 
     def server_close(self) -> None:
-        self.sessions.close()
-        self.control_runtime.close()
+        self.runtime.close()
         super().server_close()
 
 
@@ -5546,20 +5878,7 @@ def run_http(args: argparse.Namespace) -> int:
         return 2
 
     runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
-
-    def runtime_factory() -> Runtime:
-        return build_runtime(
-            args,
-            runtime_policy,
-            auth_token=auth_token,
-            oauth_config=oauth_config,
-            emit_warning=False,
-            project_context=runtime.project_context,
-            transport="http",
-            command_manager=runtime.command_manager,
-        )
-
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)
+    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
         suffix = " + bearer" if runtime.auth_token else ""

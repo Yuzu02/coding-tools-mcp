@@ -2,15 +2,45 @@
 
 ## Protocol Version Errors
 
-HTTP clients should send the version negotiated at initialization, normally
-`MCP-Protocol-Version: 2025-11-25`. Compatibility clients may negotiate
-`2025-06-18`; unsupported versions return a JSON-RPC error.
+Send `MCP-Protocol-Version` on every HTTP request. A `2026-07-28` client sends
+`MCP-Protocol-Version: 2026-07-28`, repeating the version in its
+`params._meta`; a header that disagrees with the body, or is missing from such
+a request, returns `400` with `-32020`. A handshake client sends the version it
+negotiated at initialization, normally `MCP-Protocol-Version: 2025-11-25`, or
+`2025-06-18` for compatibility. A header naming a version this server does not
+know returns `400` with `-32600` and lists the ones it does; a request with no
+header at all is read as `2025-11-25`.
+
+Asking to handshake with a version this server does not speak is no longer an
+error: `initialize` answers with the newest version it does speak. If a client
+seems to be on an older protocol than expected, read the `protocolVersion` in
+the `InitializeResult` rather than assuming the one that was requested.
 
 ## SANDBOX_UNAVAILABLE
 
 If `exec_command` returns a warning about Linux Landlock being unavailable, the command still ran under server-side policy checks, but without kernel filesystem confinement. This is expected on Windows, macOS, and Linux hosts without Landlock support. Put the server inside an external sandbox before running untrusted commands or untrusted project code.
 
 If an older client or server reports `SANDBOX_UNAVAILABLE` as an error, upgrade to the current behavior or run on a Landlock-capable Linux kernel.
+
+## Windows Command Shell
+
+Windows string commands prefer PowerShell 7 (`pwsh`). If it is not installed or
+an unpinned copy cannot be verified, the server automatically uses the trusted
+Windows `cmd.exe` compatibility fallback. The selected interpreter appears as
+`command_shell` in `server_info`, `check_exec_environment`, and
+`exec_command`; fallback results also include a warning so the agent can switch
+to cmd syntax.
+
+The selection is resolved once and pinned for the server process, so concurrent
+commands always agree on one interpreter. `check_exec_environment` re-resolves
+the pin: after installing PowerShell 7, run that tool (or restart the server) to
+leave the `cmd.exe` fallback.
+
+To require a specific PowerShell installation, set
+`CODING_TOOLS_MCP_PWSH_PATH` to its absolute `pwsh.exe` path. A bad explicit pin
+returns `SHELL_NOT_FOUND` or `SHELL_VERSION_UNSUPPORTED` instead of falling back.
+If neither interpreter can be resolved, restore `cmd.exe` or install PowerShell
+7.
 
 ## Command Hangs Or Times Out
 
