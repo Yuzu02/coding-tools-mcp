@@ -188,6 +188,23 @@
   read before the first one committed and overwrite it silently. One runtime
   now owns the workspace, so its lock covers every client: the later patch is
   answered with a retryable conflict.
+- `apply_patch` no longer silently rewrites lines it was not asked to touch. It
+  split both the file and the patch with `str.splitlines()`, which breaks on
+  `\x0b`, `\x0c`, `\x1c`, `\x1d`, `\x1e`, `\x85`, `\u2028`, and `\u2029` as well
+  as on `\n`, and then rejoined with `\n`. Any file containing one of those
+  characters had it replaced by a newline by any patch, including a patch that
+  changed an unrelated line, and a context line containing one could never
+  match.
+- The number of newlines at the end of a file is now whatever the hunk says it
+  is. The trailing newline was captured from the file before applying and put
+  back unconditionally, so a hunk that added a final blank line had it removed
+  again and a hunk that removed the final newline had it restored. A file's
+  last line is now addressable like any other.
+- A context line that is empty is accepted as the empty context line it stands
+  for, instead of failing the patch with `Invalid empty patch line`. V4A writes
+  such a line as a single space, and model output and intermediate layers
+  routinely strip that trailing space. Patch text ending in more than one
+  newline is likewise accepted.
 
 ## 0.2.3 - 2026-08-12
 

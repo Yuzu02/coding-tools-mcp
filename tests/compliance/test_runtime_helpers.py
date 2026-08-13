@@ -19,7 +19,13 @@ from unittest.mock import patch
 from coding_tools_mcp import server as server_module
 from coding_tools_mcp import processes as processes_module
 from coding_tools_mcp import telemetry as telemetry_module
-from coding_tools_mcp.patching import AtomicPatchCommitter, FileBaseline, StagedFile
+from coding_tools_mcp.patching import (
+    AtomicPatchCommitter,
+    FileBaseline,
+    StagedFile,
+    apply_update_hunks,
+    parse_patch,
+)
 from coding_tools_mcp.server import (
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
     LANDLOCK_ACCESS_FS_TRUNCATE,
@@ -1617,6 +1623,134 @@ Maven home: /usr/share/maven
             log = runtime.git_log({"max_count": 1})
             self.assertTrue(log.get("is_repo"))
             self.assertEqual(log.get("commits", [])[0].get("subject"), "baseline fixture")
+
+
+class PatchLineFidelityTests(unittest.TestCase):
+    """A patch may only change the lines it names.
+
+    The unit of a V4A patch is a line, and the file's line structure is exactly
+    what `split("\\n")` yields: the trailing empty element is the final newline.
+    Anything that re-derives that structure differently (splitlines(), a
+    remembered trailing-newline flag) either rewrites bytes no hunk touched or
+    makes the end of the file unaddressable.
+    """
+
+    def apply_via_runtime(self, name: str, original: bytes, patch: str) -> bytes:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / name).write_bytes(original)
+            Runtime(workspace, permission_mode="dangerous").apply_patch({"patch": patch})
+            return (workspace / name).read_bytes()
+
+    def test_hunks_can_express_any_number_of_trailing_newlines(self) -> None:
+        for source_newlines in range(3):
+            for target_newlines in range(3):
+                with self.subTest(source=source_newlines, target=target_newlines):
+                    content = "alpha" + "\n" * source_newlines
+                    # Replacing the whole file means consuming every line it
+                    # has, the trailing empty one included.
+                    hunk = (
+                        ["-alpha"]
+                        + ["-"] * source_newlines
+                        + ["+beta"]
+                        + ["+"] * target_newlines
+                    )
+                    self.assertEqual(
+                        apply_update_hunks(content, [hunk]),
+                        "beta" + "\n" * target_newlines,
+                    )
+
+    def test_runtime_writes_the_exact_bytes_the_hunk_describes(self) -> None:
+        stripped = self.apply_via_runtime(
+            "eof.txt",
+            b"alpha\n",
+            "*** Begin Patch\n*** Update File: eof.txt\n@@\n-alpha\n-\n+beta\n*** End Patch\n",
+        )
+        self.assertEqual(stripped, b"beta")
+
+        appended = self.apply_via_runtime(
+            "eof.txt",
+            b"alpha\n",
+            "*** Begin Patch\n*** Update File: eof.txt\n@@\n-alpha\n-\n+alpha\n+\n+\n*** End Patch\n",
+        )
+        self.assertEqual(appended, b"alpha\n\n")
+
+    def test_unicode_line_boundaries_survive_an_edit_to_another_line(self) -> None:
+        # str.splitlines() breaks on all of these and "\n".join would rewrite
+        # them to \n, corrupting lines the patch never mentioned.
+        for label, boundary in (
+            ("vertical tab", "\x0b"),
+            ("form feed", "\x0c"),
+            ("file separator", "\x1c"),
+            ("group separator", "\x1d"),
+            ("record separator", "\x1e"),
+            ("next line", "\x85"),
+            ("line separator", "\u2028"),
+            ("paragraph separator", "\u2029"),
+        ):
+            with self.subTest(boundary=label):
+                untouched = f"first{boundary}still-the-first-line"
+                written = self.apply_via_runtime(
+                    "boundary.txt",
+                    f"{untouched}\nsecond\n".encode("utf-8"),
+                    "*** Begin Patch\n*** Update File: boundary.txt\n@@\n-second\n+SECOND\n*** End Patch\n",
+                )
+                self.assertEqual(written, f"{untouched}\nSECOND\n".encode("utf-8"))
+
+    def test_context_lines_carrying_a_line_boundary_still_match(self) -> None:
+        written = self.apply_via_runtime(
+            "boundary.txt",
+            "keep\x0csame\nold\n".encode("utf-8"),
+            "*** Begin Patch\n*** Update File: boundary.txt\n@@\n keep\x0csame\n-old\n+new\n*** End Patch\n",
+        )
+        self.assertEqual(written, "keep\x0csame\nnew\n".encode("utf-8"))
+
+    def test_empty_context_line_is_read_as_a_stripped_space(self) -> None:
+        # V4A writes an empty context line as " "; model output and transports
+        # routinely strip that trailing space away.
+        self.assertEqual(
+            apply_update_hunks("alpha\n\nomega\n", [[" alpha", "", "-omega", "+OMEGA"]]),
+            "alpha\n\nOMEGA\n",
+        )
+        written = self.apply_via_runtime(
+            "blank.txt",
+            b"alpha\n\nomega\n",
+            "*** Begin Patch\n*** Update File: blank.txt\n@@\n alpha\n\n-omega\n+OMEGA\n*** End Patch\n",
+        )
+        self.assertEqual(written, b"alpha\n\nOMEGA\n")
+
+    def test_envelope_tolerates_extra_trailing_newlines(self) -> None:
+        for trailing in range(3):
+            with self.subTest(trailing=trailing):
+                patch_text = (
+                    "*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch" + "\n" * trailing
+                )
+                operations = parse_patch(patch_text)
+                self.assertEqual([(op.kind, op.path) for op in operations], [("delete", "gone.txt")])
+
+    def test_empty_patch_text_is_still_rejected(self) -> None:
+        for patch_text in ("", "\n", "\n\n"):
+            with self.subTest(patch=patch_text):
+                with self.assertRaises(ToolFailure) as raised:
+                    parse_patch(patch_text)
+                self.assertEqual(raised.exception.code, "PATCH_FAILED")
+
+    def test_crlf_and_bom_files_keep_their_encoding(self) -> None:
+        written = self.apply_via_runtime(
+            "crlf.txt",
+            "\ufeffalpha\r\nold\r\nomega\r\n".encode("utf-8"),
+            "*** Begin Patch\n*** Update File: crlf.txt\n@@\n-old\n+new\n*** End Patch\n",
+        )
+        self.assertEqual(written, "\ufeffalpha\r\nnew\r\nomega\r\n".encode("utf-8"))
+
+    def test_insertion_into_an_empty_file_ends_with_a_newline(self) -> None:
+        self.assertEqual(apply_update_hunks("", [["+alpha"]]), "alpha\n")
+
+    def test_appending_after_the_last_line_keeps_one_trailing_newline(self) -> None:
+        self.assertEqual(
+            apply_update_hunks("alpha\nomega\n", [[" omega", "+tail"]]),
+            "alpha\nomega\ntail\n",
+        )
 
 
 class FakeReadonlyAnnotationTests(unittest.TestCase):
