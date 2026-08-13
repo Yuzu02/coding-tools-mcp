@@ -15,7 +15,7 @@ Coding Tools MCP 是一个**模型中立的编程运行时**，通过
 [Model Context Protocol](https://modelcontextprotocol.io) 对外提供服务：
 文件读取与搜索、结构化多文件补丁、命令执行、交互式命令、git 操作——
 一个服务器，任何 MCP 客户端都能驱动。Claude Desktop、Claude Code、Cursor、
-Cline，或你自己写的 agent，拿到的都是同一套久经考验的 20 个工具：
+Cline，或你自己写的 agent，拿到的都是同一套久经考验的 18 个工具：
 限定在单一工作区内，由权限模式层层把关。
 
 [![观看演示](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
@@ -60,8 +60,10 @@ npx coding-tools-mcp --stdio --workspace /path/to/repo   # Node 工具链
 然后对你的客户端说一句：*"跑一下测试，把第一个失败修了。"*
 
 想用 HTTP？去掉 `--stdio`，服务器就在
-`http://127.0.0.1:8765/mcp` 上讲 Streamable HTTP（MCP `2025-11-25`，
-兼容 `2025-06-18`）。一行安装脚本、各客户端的完整接入指南和排障见
+`http://127.0.0.1:8765/mcp` 上讲 Streamable HTTP。两代协议在两种 transport
+上同时提供：完整支持 MCP `2026-07-28`（对外声明的 capability 只有 `tools`），
+同时继续支持握手时代的 `2025-11-25` 与 `2025-06-18`；两代都没有会话。
+一行安装脚本、各客户端的完整接入指南和排障见
 [docs/quickstart.md](docs/quickstart.md) 与
 [docs/mcp-client-config.md](docs/mcp-client-config.md)。
 
@@ -126,13 +128,14 @@ coding-tools-mcp-desktop
 | 文件与搜索 | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
 | 执行 | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
-| 运行时 | `server_info` · `check_exec_environment` · `get_default_cwd` · `set_default_cwd` |
+| 运行时 | `server_info` · `check_exec_environment` |
 
-仓库根部的 `AGENTS.md`/`CLAUDE.md` 会自动载入 initialize 上下文。工具的
-`content` 是给 agent 看的精炼文本，`structuredContent` 则是完整稳定的机器
-结果。Schema 与结果封装：
+仓库根部的 `AGENTS.md`/`CLAUDE.md` 会自动载入，并随 `initialize` 的
+`instructions` 下发；不握手的客户端则通过 `server/discover` 拿到同一份内容。
+工具的 `content` 是给 agent 看的精炼文本，`structuredContent` 则是完整稳定的
+机器结果。Schema 与结果封装：
 [docs/tools-and-schemas.md](docs/tools-and-schemas.md) ·
-[docs/runtime-contract-v0.2.md](docs/runtime-contract-v0.2.md)
+[docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md)
 
 ## 安全边界
 
@@ -174,7 +177,7 @@ SWE-bench 榜单成绩——[docs/swe-bench.md](docs/swe-bench.md) 写明了测�
 | --- | --- |
 | 上手 | [快速开始](docs/quickstart.md) · [客户端配置](docs/mcp-client-config.md) · [排障](docs/troubleshooting.md) |
 | 远程与沙箱 | [Remote MCP](docs/remote-mcp.md) · [Docker 沙箱](docs/docker.md) · [云沙箱 Worker](cloudflare/sandbox-control/README.md) |
-| 工具与契约 | [工具与 Schema](docs/tools-and-schemas.md) · [运行时契约](docs/runtime-contract-v0.2.md) · [权限模式](docs/permission-modes.md) |
+| 工具与契约 | [工具与 Schema](docs/tools-and-schemas.md) · [运行时契约](docs/runtime-contract-v0.3.md) · [迁移到 0.3](docs/migration-0.3.md) · [权限模式](docs/permission-modes.md) |
 | 命令执行 | [Exec 配方](docs/exec-command-recipes.md) · [Exec 排障](docs/troubleshooting-exec.md) |
 | 集成 | [嵌入指南](docs/embedding.md) · [npm 启动器](npm/coding-tools-mcp/README.md) |
 | 安全与质量 | [安全策略](SECURITY.md) · [安全边界](docs/security-boundary.md) · [CI 与测试](docs/ci-and-tests.md) · [已知限制](docs/limitations.md) · [竞品分析](docs/competitive-analysis.md) |

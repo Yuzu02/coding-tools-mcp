@@ -1,6 +1,8 @@
 # Coding Tools MCP Runtime Contract v0.2
 
-Status: implemented contract for `coding-tools-mcp` 0.2.x.
+Status: frozen. This is the implemented contract for `coding-tools-mcp` 0.2.x
+and is kept as it was; the current one is
+[runtime-contract-v0.3.md](runtime-contract-v0.3.md).
 
 Protocol target: MCP `2025-11-25`, with explicit compatibility for `2025-06-18`.
 

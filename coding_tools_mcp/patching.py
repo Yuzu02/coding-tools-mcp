@@ -274,7 +274,13 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def parse_patch(patch: str) -> list[PatchOperation]:
-    lines = patch.splitlines()
+    # split("\n") rather than splitlines(): a context line carrying a form feed
+    # or U+2028 must stay one patch line so it can match the file line it came
+    # from. The envelope closes on the last non-empty line because the patch
+    # text's own trailing newline(s) become trailing empty elements here.
+    lines = normalize_to_lf(patch).split("\n")
+    while lines and not lines[-1]:
+        lines.pop()
     if not lines or lines[0].strip() != "*** Begin Patch" or lines[-1].strip() != "*** End Patch":
         raise ToolFailure("PATCH_FAILED", "Patch must use *** Begin Patch / *** End Patch envelope.", category="validation")
     operations: list[PatchOperation] = []
@@ -331,8 +337,12 @@ def apply_update_hunks(content: str, hunks: list[list[str]], path: str = "<patch
     bom, text = strip_bom(content)
     line_ending = detect_line_ending(text)
     normalized = normalize_to_lf(text)
-    had_trailing_newline = normalized.endswith("\n")
-    lines = normalized.splitlines()
+    # split("\n") is a bijection with the text: "a\nb\n" becomes
+    # ["a", "b", ""], where the final empty element *is* the trailing newline.
+    # splitlines() would additionally break on \x0b \x0c \x1c \x1d \x1e \x85
+    # \u2028 \u2029 and silently rewrite those to \n on rejoin, and it would
+    # need a trailing-newline correction that no hunk could ever override.
+    lines = normalized.split("\n")
     parsed = [parse_update_hunk(hunk) for hunk in hunks]
     matched: list[MatchedHunk] = []
     for index, hunk in enumerate(parsed):
@@ -384,10 +394,6 @@ def apply_update_hunks(content: str, hunks: list[list[str]], path: str = "<patch
     for matched_hunk in sorted(matched, key=lambda item: item.start, reverse=True):
         updated_lines = updated_lines[: matched_hunk.start] + matched_hunk.new + updated_lines[matched_hunk.end :]
     updated = "\n".join(updated_lines)
-    if had_trailing_newline and (updated_lines or updated == ""):
-        updated += "\n"
-    elif not text and updated_lines:
-        updated += "\n"
     return bom + restore_line_endings(updated, line_ending)
 
 
@@ -398,7 +404,11 @@ def parse_update_hunk(hunk: list[str]) -> ParsedHunk:
         if raw == "*** End of File":
             continue
         if not raw:
-            raise ToolFailure("PATCH_FAILED", "Invalid empty patch line.", category="validation")
+            # V4A spells an empty context line as a single space, which model
+            # output and intermediate layers routinely strip to "".
+            old.append("")
+            new.append("")
+            continue
         marker = raw[0]
         value = raw[1:] if marker in {" ", "-", "+"} else raw
         if marker == " ":

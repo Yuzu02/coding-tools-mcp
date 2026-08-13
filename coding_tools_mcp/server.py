@@ -68,19 +68,27 @@ from .processes import (
     terminate_process_group,
 )
 from .protocol import (
-    PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    HEADER_MISMATCH,
+    KNOWN_PROTOCOL_VERSIONS,
+    LATEST_LEGACY_PROTOCOL_VERSION,
+    MODERN_ERA,
+    MODERN_PROTOCOL_VERSIONS,
+    UNSUPPORTED_PROTOCOL_VERSION,
+    RequestContext,
     dispatch_rpc,
     jsonrpc_error,
-    protocol_version_is_supported,
+    legacy_protocol_version_is_supported,
+    protocol_version_is_known,
+    request_era,
     response_id,
+    validate_mirror_headers,
+    validate_modern_meta,
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
-from .transport_http import HTTPSessionManager
 from .transport_stdio import serve_stdio
 
 
@@ -190,6 +198,13 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+_COMMAND_RECOVERY_HINT = (
+    "This command_id has expired or never existed; a finished command keeps its"
+    f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
+    f" {MAX_RETAINED_OUTPUT_COMMANDS} commands are retained. Retrying with the"
+    " same command_id cannot succeed. Start the work again with exec_command and"
+    " use the command_id it returns."
+)
 SHELL_CONTROL_TOKENS = {"|", "||", "&", "&&", ";", "(", ")"}
 REDIRECTION_TOKENS = {">", ">>", "<", "<>", ">&", "<&", "&>", "&>>"}
 HEREDOC_TOKENS = {"<<", "<<<"}
@@ -563,23 +578,6 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Check exec environment",
         description="Return lightweight exec_command sandbox and environment status known to the server.",
         read_only=True,
-        idempotent=True,
-    ),
-    "get_default_cwd": ToolSpec(
-        title="Get default cwd",
-        description=(
-            "Return the current MCP transport session's default cwd. This value is session-local and may "
-            "reset after a reconnect."
-        ),
-        read_only=True,
-        idempotent=True,
-    ),
-    "set_default_cwd": ToolSpec(
-        title="Set default cwd",
-        description=(
-            "Set the default cwd only for the current MCP transport session. Prefer explicit path/workdir "
-            "arguments when calls must survive reconnects. Example: {\"path\":\"src\"}."
-        ),
         idempotent=True,
     ),
     "read_file": ToolSpec(
@@ -1109,12 +1107,8 @@ class Workspace:
         return pure
 
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        return self.resolve_existing_at(self.root, raw_path)
-
-    def resolve_existing_at(self, base: Path, raw_path: str = ".") -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path or ".")
-        base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self.root.joinpath(*pure.parts)
         try:
             resolved = candidate.resolve(strict=True)
         except FileNotFoundError as exc:
@@ -1125,14 +1119,10 @@ class Workspace:
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        return self.resolve_for_write_at(self.root, raw_path)
-
-    def resolve_for_write_at(self, base: Path, raw_path: str) -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path)
         if pure.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
-        base = self._validate_base(base)
-        candidate = base.joinpath(*pure.parts)
+        candidate = self.root.joinpath(*pure.parts)
         if candidate.exists() or candidate.is_symlink():
             resolved = candidate.resolve(strict=True)
             if not is_relative_to(resolved, self.root):
@@ -1154,17 +1144,6 @@ class Workspace:
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
         return ResolvedPath(normalize_rel_display(target, self.root), target, False)
-
-    def _validate_base(self, base: Path) -> Path:
-        try:
-            resolved = base.resolve(strict=True)
-        except FileNotFoundError as exc:
-            raise ToolFailure("NOT_FOUND", "Default cwd path no longer exists.", category="not_found") from exc
-        if not resolved.is_dir():
-            raise ToolFailure("NOT_A_DIRECTORY", "Default cwd is not a directory.", category="validation")
-        if not is_relative_to(resolved, self.root):
-            raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Default cwd escapes the configured workspace.", category="security")
-        return resolved
 
     def reject_write_symlink(self, raw_path: str) -> None:
         pure = self._reject_unsafe_text(raw_path)
@@ -1351,23 +1330,18 @@ class Runtime:
         self.server_instance_id = self.command_manager.server_instance_id
         self._set_runtime_dir(self.command_manager.runtime_dir)
         self.fallback_runtime_dir = self.command_manager.fallback_runtime_dir
-        self.default_cwd = self.workspace.root
+        self._runtime_dir_lock = threading.Lock()
+        self._runtime_dir_resolved = False
         self._closed = False
-        self.http_session_id = secrets.token_urlsafe(24)
-        self.protocol_version = PROTOCOL_VERSION
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
         # ProjectContext is frozen and derived only from the workspace tree, so
-        # per-session HTTP runtimes reuse the server's copy instead of re-running
-        # discovery (git ls-files / directory walk) on every connect.
+        # an embedder that builds several runtimes over one workspace can reuse
+        # the discovery (git ls-files / directory walk) result.
         self.project_context: ProjectContext = (
             project_context if project_context is not None else load_project_context(self.workspace.root)
         )
-        self.request_commands: dict[str | int, str] = {}
-        self.request_commands_lock = threading.Lock()
-        self.request_context = threading.local()
-        self.initialized = False
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
 
@@ -1383,7 +1357,7 @@ class Runtime:
         self._closed = True
         if self._owns_command_manager:
             self.command_manager.close()
-        self.telemetry.finish()
+        self.telemetry.finish(output_retention=self.command_manager.retention_stats_snapshot())
 
     @property
     def commands(self) -> dict[str, CommandRun]:
@@ -1405,36 +1379,57 @@ class Runtime:
     def starting_commands(self, value: int) -> None:
         self.command_manager.starting_commands = value
 
+    def _create_runtime_dirs(self, runtime_dir: Path) -> str | None:
+        """Create one runtime tree, reporting failure instead of raising."""
+
+        try:
+            for path in (
+                runtime_dir.parent,
+                runtime_dir,
+                runtime_dir / "home",
+                runtime_dir / "tmp",
+                runtime_dir / "cache",
+            ):
+                path.mkdir(parents=True, mode=0o700, exist_ok=True)
+                if os.name != "nt":
+                    try:
+                        path.chmod(0o700)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            return f"{runtime_dir}: {exc}"
+        return None
+
     def _ensure_runtime_dirs(self) -> None:
-        candidates = [self.runtime_dir]
-        if self.fallback_runtime_dir is not None and self.fallback_runtime_dir not in candidates:
-            candidates.append(self.fallback_runtime_dir)
-        errors: list[str] = []
-        for runtime_dir in candidates:
-            self._set_runtime_dir(runtime_dir)
-            try:
-                for path in (
-                    self.runtime_dir.parent,
-                    self.runtime_dir,
-                    self.home_dir,
-                    self.tmp_dir,
-                    self.cache_dir,
-                ):
-                    path.mkdir(parents=True, mode=0o700, exist_ok=True)
-                    if os.name != "nt":
-                        try:
-                            path.chmod(0o700)
-                        except OSError:
-                            pass
-                return
-            except OSError as exc:
-                errors.append(f"{runtime_dir}: {exc}")
-        raise ToolFailure(
-            "RUNTIME_DIR_UNWRITABLE",
-            "Runtime directory could not be created outside the workspace.",
-            category="runtime",
-            details={"attempted": errors},
-        )
+        """Create the runtime directories, choosing which tree to use only once.
+
+        The first call picks the primary directory or, if that one cannot be
+        created, the fallback. Every later call re-creates that same tree and
+        fails instead of switching: concurrent clients share one runtime, and
+        a command reading HOME or TMPDIR must never see them move to another
+        directory mid-flight.
+        """
+
+        with self._runtime_dir_lock:
+            resolved = self._runtime_dir_resolved
+            candidates = [self.runtime_dir]
+            if not resolved and self.fallback_runtime_dir is not None and self.fallback_runtime_dir not in candidates:
+                candidates.append(self.fallback_runtime_dir)
+            errors: list[str] = []
+            for runtime_dir in candidates:
+                error = self._create_runtime_dirs(runtime_dir)
+                if error is None:
+                    if not resolved:
+                        self._set_runtime_dir(runtime_dir)
+                        self._runtime_dir_resolved = True
+                    return
+                errors.append(error)
+            raise ToolFailure(
+                "RUNTIME_DIR_UNWRITABLE",
+                "Runtime directory could not be created outside the workspace.",
+                category="runtime",
+                details={"attempted": errors},
+            )
 
     def command_home_dir(self) -> Path:
         return self.home_dir
@@ -1469,17 +1464,57 @@ class Runtime:
             return False
         return is_relative_to(resolved, self.runtime_dir)
 
-    def initialize(self, client_info: dict[str, Any] | None = None) -> dict[str, Any]:
-        self.telemetry.record_session_start(client_info, self.protocol_version)
+    def initialize(
+        self,
+        client_info: dict[str, Any] | None = None,
+        protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION,
+    ) -> dict[str, Any]:
+        self.telemetry.record_session_start(client_info, protocol_version)
+        return self.initialize_result(protocol_version)
+
+    def initialize_result(self, protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION) -> dict[str, Any]:
+        """Build the handshake payload for one negotiated version.
+
+        The version is negotiated per request rather than stored: one runtime
+        serves every client of the workspace, and two of them may well have
+        handshaken on different versions.
+        """
+
         return {
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {
-                "name": SERVER_NAME,
-                "title": SERVER_TITLE,
-                "version": __version__,
-            },
+            "serverInfo": self.server_identity(),
             "instructions": self.project_context.server_instructions(),
+        }
+
+    def discover_payload(self) -> dict[str, Any]:
+        """Tell a client that never handshakes what this server can do.
+
+        The modern counterpart of the handshake result, minus everything the
+        handshake only needed because it was a handshake: no version is
+        negotiated here, so the versions this server speaks per request are
+        listed instead, and only those — a legacy version named here would
+        invite a client to put one in its ``_meta``. The encoder adds the
+        result envelope, so the fields returned are the answer itself.
+        """
+
+        return {
+            "supportedVersions": list(MODERN_PROTOCOL_VERSIONS),
+            "capabilities": {"tools": {"listChanged": False}},
+            "instructions": self.project_context.server_instructions(),
+        }
+
+    def server_identity(self) -> dict[str, Any]:
+        """Name this server for the handshake and for modern result metadata.
+
+        The protocol layer cannot import this module, so it reads the identity
+        through the runtime it is already dispatching against.
+        """
+
+        return {
+            "name": SERVER_NAME,
+            "title": SERVER_TITLE,
+            "version": __version__,
         }
 
     def list_tools(self) -> dict[str, Any]:
@@ -1499,18 +1534,15 @@ class Runtime:
     def oauth_enabled(self) -> bool:
         return self.oauth_config is not None
 
-    def default_cwd_display(self) -> str:
-        return normalize_rel_display(self.default_cwd, self.workspace.root)
-
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
-        return self.workspace.resolve_existing_at(self.default_cwd, raw_path)
+        return self.workspace.resolve_existing(raw_path)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
-        return self.workspace.resolve_for_write_at(self.default_cwd, raw_path)
+        return self.workspace.resolve_for_write(raw_path)
 
     def git_path_filter(self, raw_path: str) -> str:
         if raw_path == ".":
-            return self.default_cwd_display()
+            return "."
         return self.resolve_for_write(raw_path).display
 
     def _exec_environment_summary(self) -> dict[str, Any]:
@@ -1535,9 +1567,8 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
-            "protocol_version": self.protocol_version,
+            "supported_protocol_versions": list(KNOWN_PROTOCOL_VERSIONS),
             **self._exec_environment_summary(),
-            "default_cwd": self.default_cwd_display(),
             "auth_enabled": self.auth_enabled(),
             "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
             "annotation_override": "fake_readonly" if self.fake_readonly_annotations else None,
@@ -1551,10 +1582,12 @@ class Runtime:
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
+            # The static budget only: how often it was actually hit is a
+            # runtime-wide counter and is reported in telemetry, not to
+            # whichever client happened to ask.
             "output_retention": {
                 "buffer_bytes_per_stream": COMMAND_BUFFER_BYTES,
                 "head_bytes_per_stream": COMMAND_BUFFER_BYTES // COMMAND_HEAD_BUFFER_DIVISOR,
-                **self.command_manager.retention_stats_snapshot(),
             },
             "endpoint_path": MCP_ENDPOINT_PATH,
             "project_context": {
@@ -1571,7 +1604,7 @@ class Runtime:
         name: str,
         arguments: dict[str, Any] | None,
         *,
-        request_id: str | int | None = None,
+        context: RequestContext | None = None,
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
@@ -1581,16 +1614,9 @@ class Runtime:
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
         try:
-            self.request_context.request_id = request_id
-            try:
-                payload = handler(args)
-            finally:
-                if request_id is not None:
-                    with self.request_commands_lock:
-                        self.request_commands.pop(request_id, None)
-                self.request_context.request_id = None
+            payload = handler(args)
             payload.setdefault("ok", True)
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
         except ToolFailure as exc:
@@ -1619,7 +1645,7 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
             payload = {
@@ -1634,7 +1660,7 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
-            self.emit_tool_trace(name, args, payload, started_at)
+            self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1660,32 +1686,27 @@ class Runtime:
             "warnings": warnings,
         }
 
-    def get_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "workspace": str(self.workspace.root),
-            "default_cwd": self.default_cwd_display(),
-        }
-
-    def set_default_cwd(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.workspace.resolve_existing(str(args.get("path", ".")))
-        if not resolved.path.is_dir():
-            raise ToolFailure("NOT_A_DIRECTORY", "Default cwd must be a directory.", category="validation")
-        self.default_cwd = resolved.path
-        return {
-            "workspace": str(self.workspace.root),
-            "default_cwd": resolved.display,
-        }
-
-    def emit_tool_trace(self, name: str, args: dict[str, Any], payload: dict[str, Any], started_at: float) -> None:
+    def emit_tool_trace(
+        self,
+        name: str,
+        args: dict[str, Any],
+        payload: dict[str, Any],
+        started_at: float,
+        *,
+        context: RequestContext | None = None,
+    ) -> None:
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
+        # `context` is passed on as the opaque per-request fact it is: the
+        # runtime neither reads the client identity in it nor branches on it.
         self.telemetry.record_tool_call(
             name,
             ok=bool(payload.get("ok")),
             error_code=error.get("code"),
             duration_ms=duration_ms,
             truncated=bool(payload.get("truncated")),
+            context=context,
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return
@@ -2421,10 +2442,6 @@ class Runtime:
                 except OSError:
                     pass
         assert command is not None
-        request_id = getattr(self.request_context, "request_id", None)
-        if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
-            with self.request_commands_lock:
-                self.request_commands[request_id] = command.command_id
         start_reader_threads(command)
         start_command_watchdog(command)
         try:
@@ -2770,7 +2787,12 @@ class Runtime:
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
-            raise ToolFailure("COMMAND_NOT_FOUND", "Output command not found.", category="runtime")
+            raise ToolFailure(
+                "COMMAND_NOT_FOUND",
+                "Output command not found.",
+                category="runtime",
+                details={"retry_hint": _COMMAND_RECOVERY_HINT},
+            )
         return command
 
     def _format_command_output(self, command: CommandRun, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -3049,27 +3071,17 @@ class Runtime:
                 self.commands.pop(command_id, None)
         return payload
 
-    def cancel_command(self, command_id: str) -> None:
-        with self.commands_lock:
-            command = self.commands.pop(command_id, None)
-        if command is None:
-            return
-        command.refresh_status()
-        if command.process.poll() is None:
-            terminate_process_group(command.process, signal.SIGTERM)
-
-    def cancel_request(self, request_id: str | int) -> None:
-        with self.request_commands_lock:
-            command_id = self.request_commands.get(request_id)
-        if command_id is not None:
-            self.cancel_command(command_id)
-
     def _get_command(self, command_id: str) -> CommandRun:
         self._prune_commands()
         with self.commands_lock:
             command = self.commands.get(command_id) or self.output_commands.get(command_id)
         if command is None:
-            raise ToolFailure("COMMAND_NOT_FOUND", "Command not found; stdin access denied.", category="not_found")
+            raise ToolFailure(
+                "COMMAND_NOT_FOUND",
+                "Command not found; stdin access denied.",
+                category="not_found",
+                details={"retry_hint": _COMMAND_RECOVERY_HINT},
+            )
         return command
 
     def git_status(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -3175,7 +3187,9 @@ class Runtime:
         selected = set(path_filters)
         chunks: list[str] = []
         files: list[dict[str, Any]] = []
-        for rel, before in sorted(self.patch_baselines.items()):
+        with self.patch_lock:
+            baselines = sorted(self.patch_baselines.items())
+        for rel, before in baselines:
             if selected and rel not in selected:
                 continue
             current_path = self.workspace.resolve_for_write(rel).path
@@ -4572,12 +4586,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
     return {
         "server_info": object_schema(),
         "check_exec_environment": object_schema(),
-        "get_default_cwd": object_schema(),
-        "set_default_cwd": object_schema(
-            {
-                "path": {**string, "default": "."},
-            }
-        ),
         "read_file": object_schema(
             {
                 "path": {**string, "minLength": 1},
@@ -4782,7 +4790,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     read_only = [name for name in names if annotations[name].get("readOnlyHint") is True]
     mutating = [name for name in names if annotations[name].get("readOnlyHint") is not True]
     payload = {
-        "protocolVersion": PROTOCOL_VERSION,
+        "supportedProtocolVersions": list(KNOWN_PROTOCOL_VERSIONS),
         "server": {
             "name": SERVER_NAME,
             "title": SERVER_TITLE,
@@ -4791,7 +4799,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
         "transport": {
             "type": "streamable_http",
             "endpoint": MCP_ENDPOINT_PATH,
-            "methods": ["POST", "DELETE", "OPTIONS"],
+            "methods": ["POST", "OPTIONS"],
         },
         "auth": _server_card_auth(runtime, oauth_base_url=oauth_base_url),
         "tools": {
@@ -4808,12 +4816,37 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     return payload
 
 
+# The headers a modern request mirrors its body in, each of which may appear
+# exactly once.
+MIRROR_HEADERS = ("MCP-Protocol-Version", "Mcp-Method", "Mcp-Name")
+
+# A modern client reads the HTTP status as well as the JSON-RPC error, so the
+# protocol errors that name a fault in the request are reported as such. Every
+# other code — including -32603, which says the request was fine and we were
+# not — stays a 200 carrying a JSON-RPC error, as the legacy era always does.
+MODERN_ERROR_STATUSES = {
+    -32601: 404,
+    -32602: 400,
+    HEADER_MISMATCH: 400,
+    UNSUPPORTED_PROTOCOL_VERSION: 400,
+}
+
+
+def rpc_response_status(era: str, response: dict[str, Any]) -> int:
+    if era != MODERN_ERA:
+        return 200
+    error = response.get("error")
+    if not isinstance(error, dict):
+        return 200
+    return MODERN_ERROR_STATUSES.get(error.get("code"), 200)
+
+
 class MCPHandler(http.server.BaseHTTPRequestHandler):
     server_version = f"CodingToolsMCP/{__version__}"
 
     @property
     def runtime(self) -> Runtime:
-        return cast(Runtime, getattr(self, "_runtime", self.server.control_runtime))  # type: ignore[attr-defined]
+        return cast(Runtime, self.server.runtime)  # type: ignore[attr-defined]
 
     def log_message(self, format: str, *args: Any) -> None:
         print(format % args, file=sys.stderr)
@@ -4850,14 +4883,14 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if not self.is_authorized():
             self.send_unauthorized()
             return
-        session_id = self.headers.get("Mcp-Session-Id")
-        if not session_id or not self.server.sessions.delete(session_id):  # type: ignore[attr-defined]
-            self.send_rpc_error(-32001, "Unknown MCP session", status=404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.send_cors_headers()
-        self.end_headers()
+        # There is no session to terminate: every request is served by the one
+        # workspace runtime, which outlives any single client.
+        self.send_rpc_error(
+            -32601,
+            "DELETE is not supported: this endpoint has no sessions to terminate",
+            status=405,
+            extra_headers={"Allow": "POST"},
+        )
 
     def do_OPTIONS(self) -> None:
         request_path = self.path.split("?", 1)[0]
@@ -4878,7 +4911,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "Origin denied"}, status=403)
             return
         self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
+        self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
         self.send_cors_headers()
         self.end_headers()
 
@@ -4906,7 +4939,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 -32000,
                 "SSE GET stream is not supported",
                 status=405,
-                extra_headers={"Allow": "POST, DELETE"},
+                extra_headers={"Allow": "POST"},
                 head_only=head_only,
             )
             return
@@ -4941,13 +4974,6 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             self.send_rpc_error(-32600, "Content-Type must be application/json", status=415)
             return
         protocol_version = self.headers.get("MCP-Protocol-Version")
-        if protocol_version and not protocol_version_is_supported(protocol_version):
-            self.send_rpc_error(
-                -32600,
-                "Unsupported MCP protocol version",
-                data={"supported": list(SUPPORTED_PROTOCOL_VERSIONS), "received": protocol_version},
-            )
-            return
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             self.send_rpc_error(-32600, "Content-Length is required", status=411)
@@ -4972,7 +4998,9 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             request = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            # RecursionError included: a deeply nested document is a document
+            # this server cannot parse, not a reason to unwind the handler.
             self.send_rpc_error(-32700, "Parse error")
             return
         if isinstance(request, list):
@@ -4988,60 +5016,99 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 exc.code, exc.message, status=200, request_id=response_id(request), data=exc.data
             )
             return
-        method = request.get("method")
-        session_id = self.headers.get("Mcp-Session-Id")
-        created_session = False
-        if method == "initialize":
-            if session_id:
+        # Every request is served by the one workspace runtime, and a client
+        # that still echoes an ``Mcp-Session-Id`` from an older server is
+        # served like any other rather than rejected. What the request must
+        # carry beyond that depends on its era, which only its body can decide.
+        method = str(request["method"])
+        raw_params = request.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        era = request_era(method, params)
+        if era == MODERN_ERA:
+            duplicate = self.duplicated_mirror_header()
+            if duplicate is not None:
                 self.send_rpc_error(
-                    -32600, "initialize must not include Mcp-Session-Id", request_id=request.get("id")
+                    HEADER_MISMATCH,
+                    f"{duplicate} must appear exactly once",
+                    request_id=response_id(request),
+                    data={"header": duplicate, "reason": "duplicate"},
                 )
                 return
-            try:
-                self._runtime = self.server.sessions.create()  # type: ignore[attr-defined]
-            except RuntimeError as exc:
-                self.send_rpc_error(-32000, str(exc), status=503, request_id=request.get("id"))
-                return
-            self._send_session_header = True
-            created_session = True
-        elif session_id:
-            runtime = self.server.sessions.get(session_id)  # type: ignore[attr-defined]
-            if runtime is None:
-                self.send_rpc_error(
-                    -32001, "Unknown MCP session", status=404, request_id=response_id(request)
-                )
-                return
-            self._runtime = runtime
-            self._send_session_header = True
-            if protocol_version != runtime.protocol_version:
-                self.send_rpc_error(
-                    -32600,
-                    "MCP-Protocol-Version does not match the initialized session",
-                    request_id=request.get("id"),
-                    data={"expected": runtime.protocol_version, "received": protocol_version},
-                )
-                return
-        elif method == "ping":
-            self._runtime = self.server.control_runtime  # type: ignore[attr-defined]
-        else:
-            self.send_rpc_error(-32002, "Server not initialized", request_id=request.get("id"))
+            # The body's own contract comes first: a version this server does
+            # not speak, or a mistyped ``_meta`` field, is the same fault here
+            # as it is over stdio, and mirror headers that faithfully repeat a
+            # wrong body must not answer for it instead. A notification is
+            # exempt — nothing may be sent back for one — and is left to the
+            # dispatcher, which stays silent.
+            if "id" in request:
+                try:
+                    validate_modern_meta(params)
+                except JsonRpcError as exc:
+                    self.send_rpc_error(
+                        exc.code,
+                        exc.message,
+                        status=MODERN_ERROR_STATUSES.get(exc.code, 200),
+                        request_id=response_id(request),
+                        data=exc.data,
+                    )
+                    return
+        elif protocol_version and not protocol_version_is_known(protocol_version):
+            # A handshake-era request naming a version from neither era: the
+            # body cannot decide it, so the transport refuses it and offers
+            # everything this server speaks.
+            self.send_rpc_error(
+                -32600,
+                "Unsupported MCP protocol version",
+                data={"supported": list(KNOWN_PROTOCOL_VERSIONS), "received": protocol_version},
+            )
             return
-        response = self.handle_rpc(request)
-        if created_session and response is not None and "error" in response:
-            self.server.sessions.delete(self.runtime.http_session_id)  # type: ignore[attr-defined]
-            self._send_session_header = False
+        try:
+            validate_mirror_headers(
+                era,
+                method,
+                params,
+                version_header=protocol_version,
+                method_header=self.headers.get("Mcp-Method"),
+                name_header=self.headers.get("Mcp-Name"),
+            )
+        except JsonRpcError as exc:
+            self.send_rpc_error(exc.code, exc.message, request_id=response_id(request), data=exc.data)
+            return
+        response = self.handle_rpc(request, transport_protocol_version=protocol_version)
         if response is None:
             self.send_response(202)
-            if getattr(self, "_send_session_header", False):
-                self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
             self.send_cors_headers()
             self.end_headers()
             return
-        self.send_json(response)
+        self.send_json(response, status=rpc_response_status(era, response))
 
-    def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
+    def duplicated_mirror_header(self) -> str | None:
+        """Name the first mirror header that was sent more than once, if any.
+
+        A gateway routes on these headers alone, and which of two values it
+        reads is its own business, so a request that states its version,
+        method, or subject twice has no single mirror to check the body
+        against and is refused rather than resolved.
+        """
+
+        for header in MIRROR_HEADERS:
+            if len(self.headers.get_all(header) or ()) > 1:
+                return header
+        return None
+
+    def handle_rpc(
+        self,
+        request: dict[str, Any],
+        *,
+        transport_protocol_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        legacy_version = (
+            transport_protocol_version
+            if legacy_protocol_version_is_supported(transport_protocol_version)
+            else None
+        )
         try:
-            return dispatch_rpc(self.runtime, request)
+            return dispatch_rpc(self.runtime, request, transport_protocol_version=legacy_version)
         except Exception as exc:  # noqa: BLE001 - HTTP must always answer with JSON-RPC
             return jsonrpc_error(response_id(request), -32603, str(exc))
 
@@ -5405,10 +5472,10 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         if origin and is_allowed_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
             self.send_header(
                 "Access-Control-Allow-Headers",
-                "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id",
+                "Accept, Authorization, Content-Type, MCP-Protocol-Version, Mcp-Method, Mcp-Name",
             )
 
     def send_json(
@@ -5424,8 +5491,6 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        if getattr(self, "_send_session_header", False):
-            self.send_header("Mcp-Session-Id", self.runtime.http_session_id)
         self.send_cors_headers()
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
@@ -5441,16 +5506,13 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
         self,
         address: tuple[str, int],
         handler: type[MCPHandler],
-        control_runtime: Runtime,
-        runtime_factory: Any,
+        runtime: Runtime,
     ) -> None:
         super().__init__(address, handler)
-        self.control_runtime = control_runtime
-        self.sessions = HTTPSessionManager(runtime_factory)
+        self.runtime = runtime
 
     def server_close(self) -> None:
-        self.sessions.close()
-        self.control_runtime.close()
+        self.runtime.close()
         super().server_close()
 
 
@@ -5605,20 +5667,7 @@ def run_http(args: argparse.Namespace) -> int:
         return 2
 
     runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
-
-    def runtime_factory() -> Runtime:
-        return build_runtime(
-            args,
-            runtime_policy,
-            auth_token=auth_token,
-            oauth_config=oauth_config,
-            emit_warning=False,
-            project_context=runtime.project_context,
-            transport="http",
-            command_manager=runtime.command_manager,
-        )
-
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime, runtime_factory)
+    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
         suffix = " + bearer" if runtime.auth_token else ""

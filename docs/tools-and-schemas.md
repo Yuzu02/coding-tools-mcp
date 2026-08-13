@@ -1,19 +1,16 @@
 # Tools And Schemas
 
-The normative behavior is [runtime-contract-v0.2.md](runtime-contract-v0.2.md).
+The normative behavior is [runtime-contract-v0.3.md](runtime-contract-v0.3.md).
 Live JSON Schemas come from `tools/list`; CI compares their names, input
 properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The default catalog contains exactly 20 tools:
+The default catalog contains exactly 18 tools:
 
 - `server_info`: server, workspace, automatic project context, policy, runtime,
   auth, protocol, and fixed-catalog metadata.
 - `check_exec_environment`: lightweight execution policy and Landlock status.
-- `get_default_cwd`: inspect this MCP transport session's relative-path base.
-- `set_default_cwd`: change this MCP transport session's relative-path base;
-  prefer explicit `path`/`workdir` when reconnects are possible.
 - `read_file`: stream a bounded UTF-8 range without loading the whole file.
 - `list_dir`: list immediate or bounded-recursive directory entries.
 - `list_files`: iterate files with glob, ignore, hidden-file, sort, and cap
@@ -33,7 +30,7 @@ The default catalog contains exactly 20 tools:
 - `view_image`: one MCP image content block plus structured metadata.
 
 `view_image` may be disabled when an installation cannot accept binary image
-content. That capability gate is not a tool profile. The other 19 tools are
+content. That capability gate is not a tool profile. The other 17 tools are
 always advertised, and `listChanged` is `false`.
 
 ## Result envelope
@@ -80,10 +77,14 @@ All operations are parsed and matched before writes. Context must be unique.
 Files are prepared in their destination directories, fsynced, baseline-checked,
 and installed with atomic replacement. Multi-file failure restores prior files.
 Mode bits, BOM, and newline style are preserved; moves inherit source mode.
+Lines are split on `\n` only, so a line containing another Unicode line
+boundary (`\x0c`, `\u2028`, `\x85`, …) is one line to both the file and the
+patch. A file's final newline is an ordinary line the hunk can add or remove.
 
 ## Model-ready examples
 
-Use explicit paths for multi-call workflows:
+Every relative path resolves against the workspace root; there is no
+session-scoped working directory. Use explicit paths for multi-call workflows:
 
 ```json
 {"cmd":"pytest -q","workdir":".","yield_time_ms":30000}
@@ -107,14 +108,8 @@ Page a truncated stream using the returned reference:
 {"output_ref":"command:abc:stdout","offset":0,"limit":4096}
 ```
 
-`set_default_cwd` is only a session-local convenience:
-
-```json
-{"path":"src"}
-```
-
-It may reset after the client reconnects. `exec_command.workdir` and each
-file/Git tool's `path` argument are the reliable source of truth.
+`exec_command.workdir` and each file/Git tool's `path` argument are how a call
+targets a subdirectory; both are still confined to the workspace.
 
 ## Command and output behavior
 

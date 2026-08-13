@@ -1,18 +1,16 @@
 # Compliance Report
 
-- contract: `coding-tools-mcp-v0.2`
-- commit: `e9c9acf6535d6c2e86c050dcc66ef73db11eb038+dirty`
+- contract: `coding-tools-mcp-v0.3`
+- commit: `a03882dab098d2f0ed49afa4430054712d415e2b+dirty`
 - suite: `all`
 - passed: `true`
-- tests_run: `84`
-- elapsed_seconds: `62.588`
+- tests_run: `127`
+- elapsed_seconds: `100.168`
 
 ## Required Tools
 
 - `server_info`: passed
 - `check_exec_environment`: passed
-- `get_default_cwd`: passed
-- `set_default_cwd`: passed
 - `read_file`: passed
 - `list_dir`: passed
 - `list_files`: passed
@@ -20,7 +18,7 @@
 - `apply_patch`: passed
 - `exec_command`: passed
 - `write_stdin`: passed
-- `kill_session`: passed
+- `kill_command`: passed
 - `read_output`: passed
 - `git_status`: passed
 - `git_diff`: passed

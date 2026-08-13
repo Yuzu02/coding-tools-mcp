@@ -13,11 +13,19 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import patch
 
 from coding_tools_mcp import server as server_module
 from coding_tools_mcp import processes as processes_module
-from coding_tools_mcp.patching import AtomicPatchCommitter, FileBaseline, StagedFile
+from coding_tools_mcp import telemetry as telemetry_module
+from coding_tools_mcp.patching import (
+    AtomicPatchCommitter,
+    FileBaseline,
+    StagedFile,
+    apply_update_hunks,
+    parse_patch,
+)
 from coding_tools_mcp.server import (
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
     LANDLOCK_ACCESS_FS_TRUNCATE,
@@ -36,8 +44,22 @@ from coding_tools_mcp.textutils import truncate_text_head, truncate_text_tail
 from coding_tools_mcp.tool_results import (
     MODEL_TEXT_SAFETY_LIMIT_BYTES,
     make_tool_result,
+    render_tool_text,
 )
 from tests.compliance.fixtures import git_fixture_preflight_error, init_git
+
+
+class _RecordingSender:
+    """Stands in for the telemetry sender and keeps the events in memory."""
+
+    def __init__(self, events: list[dict[str, Any]]) -> None:
+        self.events = events
+
+    def enqueue(self, events: list[dict[str, Any]], *, wake: bool = False) -> None:
+        self.events.extend(events)
+
+    def flush(self) -> None:
+        pass
 
 
 @contextmanager
@@ -488,6 +510,35 @@ class RuntimeHelperTests(unittest.TestCase):
                 self.assertNotIn(key, env)
             self.assertTrue(runtime.cache_dir.is_dir())
             self.assertFalse((workspace / ".coding-tools").exists())
+
+    def test_runtime_dirs_resolve_once_and_never_move_afterwards(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            runtime = Runtime(workspace)
+            unwritable = root / "unwritable"
+            unwritable.write_text("not a directory", encoding="utf-8")
+            fallback = root / "fallback" / "instance"
+            runtime._set_runtime_dir(unwritable / "instance")
+            runtime.fallback_runtime_dir = fallback
+
+            runtime._ensure_runtime_dirs()
+
+            self.assertEqual(runtime.runtime_dir, fallback)
+            self.assertEqual(runtime.command_home_dir(), fallback / "home")
+            self.assertEqual(runtime.command_tmp_dir(), fallback / "tmp")
+            self.assertTrue(runtime.cache_dir.is_dir())
+
+            shutil.rmtree(fallback.parent)
+            (root / "fallback").write_text("not a directory", encoding="utf-8")
+            runtime.fallback_runtime_dir = root / "second-fallback" / "instance"
+            with self.assertRaises(ToolFailure) as cm:
+                runtime._command_env({})
+
+            self.assertEqual(cm.exception.code, "RUNTIME_DIR_UNWRITABLE")
+            self.assertEqual(runtime.runtime_dir, fallback)
+            self.assertFalse((root / "second-fallback").exists())
 
     def test_runtime_and_server_info_do_not_create_exec_dirs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1016,7 +1067,7 @@ Maven home: /usr/share/maven
             self.assertIn("line-2000", model_text)
             self.assertNotIn("line-2001\n", model_text)
 
-    def test_read_file_continuation_preserves_default_cwd_relative_path(self) -> None:
+    def test_read_file_continuation_preserves_workspace_relative_path(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             nested = workspace / "nested"
@@ -1026,16 +1077,15 @@ Maven home: /usr/share/maven
                 encoding="utf-8",
             )
             runtime = Runtime(workspace)
-            runtime.set_default_cwd({"path": "nested"})
             first = runtime.call_tool(
                 "read_file",
-                {"path": "long.txt", "max_bytes": 16},
+                {"path": "nested/long.txt", "max_bytes": 16},
             )
             first_payload = first["structuredContent"]
             action = first_payload.get("next_action")
             self.assertIsInstance(action, dict)
             self.assertEqual(action.get("tool"), "read_file")
-            self.assertEqual(action.get("arguments", {}).get("path"), "long.txt")
+            self.assertEqual(action.get("arguments", {}).get("path"), "nested/long.txt")
             second = runtime.call_tool(action["tool"], action["arguments"])
             self.assertIs(second.get("isError"), False)
             self.assertEqual(
@@ -1389,8 +1439,9 @@ Maven home: /usr/share/maven
                 self.assertEqual(third.get("content"), data[60:].decode())
                 self.assertIsNone(third.get("next_offset"))
 
-    def test_output_retention_counters_and_server_info_track_evicted_output(self) -> None:
+    def test_output_retention_counters_track_evicted_output_and_reach_telemetry(self) -> None:
         data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
+        events: list[dict[str, Any]] = []
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="trusted")
             with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
@@ -1412,20 +1463,30 @@ Maven home: /usr/share/maven
                 stats = runtime.command_manager.retention_stats_snapshot()
                 self.assertEqual(stats["read_output_omitted_hits"], 1)
 
+                # server_info reports the static budget; how often it was hit
+                # is a runtime-wide counter that belongs to telemetry.
                 retention = runtime.server_info_payload()["output_retention"]
-                self.assertEqual(retention["evict_events"], 1)
-                self.assertEqual(retention["evicted_bytes_total"], 32)
-                self.assertEqual(retention["read_output_omitted_hits"], 1)
                 self.assertEqual(
-                    retention["buffer_bytes_per_stream"],
-                    server_module.COMMAND_BUFFER_BYTES,
-                )
-                self.assertEqual(
-                    retention["head_bytes_per_stream"],
-                    server_module.COMMAND_BUFFER_BYTES // 8,
+                    retention,
+                    {
+                        "buffer_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES,
+                        "head_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES // 8,
+                    },
                 )
 
-    def test_default_cwd_and_git_convenience_tools(self) -> None:
+            with patch.object(telemetry_module, "telemetry_mode", lambda: "on"):
+                with patch.object(telemetry_module, "_get_sender", lambda: _RecordingSender(events)):
+                    runtime.telemetry.record_request("legacy", "tools/call")
+                    runtime.close()
+
+        session_end = next(event for event in events if event["event"] == "session_end")
+        properties = session_end["properties"]
+        self.assertEqual(properties["evict_events"], 1)
+        self.assertEqual(properties["evicted_bytes_total"], 32)
+        self.assertEqual(properties["read_output_omitted_hits"], 1)
+        self.assertEqual(properties["poll_omitted_hits"], 0)
+
+    def test_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:
             self.skipTest("git is not available")
         with TemporaryDirectory() as tmp:
@@ -1444,9 +1505,7 @@ Maven home: /usr/share/maven
                     self.skipTest(f"git fixture setup failed: {completed.stderr.strip()}")
 
             runtime = Runtime(workspace)
-            cwd = runtime.set_default_cwd({"path": "src"})
-            self.assertEqual(cwd.get("default_cwd"), "src")
-            read = runtime.read_file({"path": "hello.txt"})
+            read = runtime.read_file({"path": "src/hello.txt"})
             self.assertEqual(read.get("content"), "hello\n")
 
             log = runtime.git_log({"max_count": 5})
@@ -1457,12 +1516,12 @@ Maven home: /usr/share/maven
             self.assertTrue(show.get("is_repo"))
             self.assertIn("initial commit", show.get("content", ""))
 
-            blame = runtime.git_blame({"path": "hello.txt", "max_lines": 5})
+            blame = runtime.git_blame({"path": "src/hello.txt", "max_lines": 5})
             self.assertTrue(blame.get("is_repo"))
             self.assertEqual(blame.get("lines", [])[0].get("content"), "hello")
 
             with self.assertRaises(ToolFailure):
-                runtime.set_default_cwd({"path": "../outside"})
+                runtime.git_blame({"path": "../outside", "max_lines": 5})
 
     def test_boundary_regressions_for_aliases_and_command_scanning(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1565,6 +1624,233 @@ Maven home: /usr/share/maven
             log = runtime.git_log({"max_count": 1})
             self.assertTrue(log.get("is_repo"))
             self.assertEqual(log.get("commits", [])[0].get("subject"), "baseline fixture")
+
+
+class PatchLineFidelityTests(unittest.TestCase):
+    """A patch may only change the lines it names.
+
+    The unit of a V4A patch is a line, and the file's line structure is exactly
+    what `split("\\n")` yields: the trailing empty element is the final newline.
+    Anything that re-derives that structure differently (splitlines(), a
+    remembered trailing-newline flag) either rewrites bytes no hunk touched or
+    makes the end of the file unaddressable.
+    """
+
+    def apply_via_runtime(self, name: str, original: bytes, patch: str) -> bytes:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / name).write_bytes(original)
+            Runtime(workspace, permission_mode="dangerous").apply_patch({"patch": patch})
+            return (workspace / name).read_bytes()
+
+    def test_hunks_can_express_any_number_of_trailing_newlines(self) -> None:
+        for source_newlines in range(3):
+            for target_newlines in range(3):
+                with self.subTest(source=source_newlines, target=target_newlines):
+                    content = "alpha" + "\n" * source_newlines
+                    # Replacing the whole file means consuming every line it
+                    # has, the trailing empty one included.
+                    hunk = (
+                        ["-alpha"]
+                        + ["-"] * source_newlines
+                        + ["+beta"]
+                        + ["+"] * target_newlines
+                    )
+                    self.assertEqual(
+                        apply_update_hunks(content, [hunk]),
+                        "beta" + "\n" * target_newlines,
+                    )
+
+    def test_runtime_writes_the_exact_bytes_the_hunk_describes(self) -> None:
+        stripped = self.apply_via_runtime(
+            "eof.txt",
+            b"alpha\n",
+            "*** Begin Patch\n*** Update File: eof.txt\n@@\n-alpha\n-\n+beta\n*** End Patch\n",
+        )
+        self.assertEqual(stripped, b"beta")
+
+        appended = self.apply_via_runtime(
+            "eof.txt",
+            b"alpha\n",
+            "*** Begin Patch\n*** Update File: eof.txt\n@@\n-alpha\n-\n+alpha\n+\n+\n*** End Patch\n",
+        )
+        self.assertEqual(appended, b"alpha\n\n")
+
+    def test_unicode_line_boundaries_survive_an_edit_to_another_line(self) -> None:
+        # str.splitlines() breaks on all of these and "\n".join would rewrite
+        # them to \n, corrupting lines the patch never mentioned.
+        for label, boundary in (
+            ("vertical tab", "\x0b"),
+            ("form feed", "\x0c"),
+            ("file separator", "\x1c"),
+            ("group separator", "\x1d"),
+            ("record separator", "\x1e"),
+            ("next line", "\x85"),
+            ("line separator", "\u2028"),
+            ("paragraph separator", "\u2029"),
+        ):
+            with self.subTest(boundary=label):
+                untouched = f"first{boundary}still-the-first-line"
+                written = self.apply_via_runtime(
+                    "boundary.txt",
+                    f"{untouched}\nsecond\n".encode("utf-8"),
+                    "*** Begin Patch\n*** Update File: boundary.txt\n@@\n-second\n+SECOND\n*** End Patch\n",
+                )
+                self.assertEqual(written, f"{untouched}\nSECOND\n".encode("utf-8"))
+
+    def test_context_lines_carrying_a_line_boundary_still_match(self) -> None:
+        written = self.apply_via_runtime(
+            "boundary.txt",
+            "keep\x0csame\nold\n".encode("utf-8"),
+            "*** Begin Patch\n*** Update File: boundary.txt\n@@\n keep\x0csame\n-old\n+new\n*** End Patch\n",
+        )
+        self.assertEqual(written, "keep\x0csame\nnew\n".encode("utf-8"))
+
+    def test_empty_context_line_is_read_as_a_stripped_space(self) -> None:
+        # V4A writes an empty context line as " "; model output and transports
+        # routinely strip that trailing space away.
+        self.assertEqual(
+            apply_update_hunks("alpha\n\nomega\n", [[" alpha", "", "-omega", "+OMEGA"]]),
+            "alpha\n\nOMEGA\n",
+        )
+        written = self.apply_via_runtime(
+            "blank.txt",
+            b"alpha\n\nomega\n",
+            "*** Begin Patch\n*** Update File: blank.txt\n@@\n alpha\n\n-omega\n+OMEGA\n*** End Patch\n",
+        )
+        self.assertEqual(written, b"alpha\n\nOMEGA\n")
+
+    def test_envelope_tolerates_extra_trailing_newlines(self) -> None:
+        for trailing in range(3):
+            with self.subTest(trailing=trailing):
+                patch_text = (
+                    "*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch" + "\n" * trailing
+                )
+                operations = parse_patch(patch_text)
+                self.assertEqual([(op.kind, op.path) for op in operations], [("delete", "gone.txt")])
+
+    def test_empty_patch_text_is_still_rejected(self) -> None:
+        for patch_text in ("", "\n", "\n\n"):
+            with self.subTest(patch=patch_text):
+                with self.assertRaises(ToolFailure) as raised:
+                    parse_patch(patch_text)
+                self.assertEqual(raised.exception.code, "PATCH_FAILED")
+
+    def test_crlf_and_bom_files_keep_their_encoding(self) -> None:
+        written = self.apply_via_runtime(
+            "crlf.txt",
+            "\ufeffalpha\r\nold\r\nomega\r\n".encode("utf-8"),
+            "*** Begin Patch\n*** Update File: crlf.txt\n@@\n-old\n+new\n*** End Patch\n",
+        )
+        self.assertEqual(written, "\ufeffalpha\r\nnew\r\nomega\r\n".encode("utf-8"))
+
+    def test_insertion_into_an_empty_file_ends_with_a_newline(self) -> None:
+        self.assertEqual(apply_update_hunks("", [["+alpha"]]), "alpha\n")
+
+    def test_appending_after_the_last_line_keeps_one_trailing_newline(self) -> None:
+        self.assertEqual(
+            apply_update_hunks("alpha\nomega\n", [[" omega", "+tail"]]),
+            "alpha\nomega\ntail\n",
+        )
+
+
+class ErrorTextTerminalityTests(unittest.TestCase):
+    """Whether a failure is worth retrying has to be in the model text.
+
+    `retryable` and `category` live in structuredContent, but most clients
+    forward only the text content to the model. A model that cannot see
+    "this can never work" keeps calling a dead command handle.
+    """
+
+    @staticmethod
+    def error_text(
+        code: str,
+        message: str,
+        *,
+        category: str | None = "runtime",
+        retryable: bool | None = False,
+        details: dict[str, Any] | None = None,
+    ) -> str:
+        error: dict[str, Any] = {"code": code, "message": message, "details": details or {}}
+        if category is not None:
+            error["category"] = category
+        if retryable is not None:
+            error["retryable"] = retryable
+        return render_tool_text("write_stdin", {"ok": False, "error": error}, is_error=True)
+
+    def test_first_line_is_still_code_and_message(self) -> None:
+        text = self.error_text("COMMAND_NOT_FOUND", "Command not found.")
+        self.assertEqual(text.splitlines()[0], "COMMAND_NOT_FOUND: Command not found.")
+
+    def test_terminal_failure_says_so_and_forbids_a_bare_retry(self) -> None:
+        text = self.error_text("COMMAND_NOT_FOUND", "Command not found.", category="not_found")
+        self.assertIn("Category: not_found.", text)
+        self.assertIn("Retryable: no.", text)
+        self.assertIn("Do not repeat this call unchanged.", text)
+
+    def test_retryable_failure_is_not_told_to_stop(self) -> None:
+        text = self.error_text(
+            "PATCH_CONFLICT",
+            "File changed while the patch was being prepared.",
+            category="conflict",
+            retryable=True,
+        )
+        self.assertIn("Category: conflict.", text)
+        self.assertIn("Retryable: yes.", text)
+        self.assertNotIn("Do not repeat", text)
+
+    def test_absent_fields_are_omitted_rather_than_guessed(self) -> None:
+        without_category = self.error_text("TOOL_ERROR", "Failed.", category=None)
+        self.assertNotIn("Category:", without_category)
+        self.assertIn("Retryable: no.", without_category)
+
+        without_retryable = self.error_text("TOOL_ERROR", "Failed.", retryable=None)
+        self.assertIn("Category: runtime.", without_retryable)
+        self.assertNotIn("Retryable:", without_retryable)
+        self.assertNotIn("Do not repeat", without_retryable)
+
+        bare = self.error_text("TOOL_ERROR", "Failed.", category=None, retryable=None)
+        self.assertEqual(bare, "TOOL_ERROR: Failed.")
+
+    def test_retry_hint_still_follows_the_terminality_line(self) -> None:
+        text = self.error_text(
+            "COMMAND_NOT_FOUND",
+            "Command not found.",
+            category="not_found",
+            details={"retry_hint": "Start over with exec_command."},
+        )
+        self.assertEqual(
+            text.splitlines(),
+            [
+                "COMMAND_NOT_FOUND: Command not found.",
+                "Category: not_found. Retryable: no. Do not repeat this call unchanged.",
+                "Retry: Start over with exec_command.",
+            ],
+        )
+
+    def test_dead_command_handle_tells_the_model_how_to_recover(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="dangerous")
+            for tool, arguments in (
+                ("write_stdin", {"command_id": "cmd-does-not-exist", "chars": "y\n"}),
+                ("kill_command", {"command_id": "cmd-does-not-exist"}),
+                ("read_output", {"output_ref": "command:cmd-does-not-exist:stdout"}),
+            ):
+                with self.subTest(tool=tool):
+                    result = runtime.call_tool(tool, arguments)
+                    self.assertTrue(result["isError"])
+                    text = "\n".join(
+                        item["text"]
+                        for item in result["content"]
+                        if item.get("type") == "text"
+                    )
+                    self.assertIn("COMMAND_NOT_FOUND", text)
+                    self.assertIn("Retryable: no", text)
+                    self.assertIn("Do not repeat this call unchanged.", text)
+                    self.assertIn("exec_command", text)
+                    self.assertIn(str(server_module.COMPLETED_COMMAND_TTL_SECONDS), text)
+                    self.assertIn(str(server_module.MAX_RETAINED_OUTPUT_COMMANDS), text)
+                    self.assertIs(result["structuredContent"]["error"]["retryable"], False)
 
 
 class FakeReadonlyAnnotationTests(unittest.TestCase):

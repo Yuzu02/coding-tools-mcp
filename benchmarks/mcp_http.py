@@ -2,7 +2,9 @@
 """Small MCP-over-HTTP JSON-RPC client used by deterministic benchmarks.
 
 The client intentionally depends only on the Python standard library so the
-dogfood path can run before project packaging is complete.
+dogfood path can run before project packaging is complete. It speaks the
+handshake era, which keeps the benchmark numbers comparable with earlier runs;
+the `2026-07-28` path is exercised by the compliance suite instead.
 """
 
 from __future__ import annotations
@@ -76,7 +78,6 @@ class McpHttpClient:
         self.timeout = timeout
         self.protocol_version = protocol_version
         self._next_id = 1
-        self.session_id: str | None = None
 
     def initialize(self) -> dict[str, Any]:
         result = self.request(
@@ -143,8 +144,6 @@ class McpHttpClient:
             "Content-Type": "application/json",
             "MCP-Protocol-Version": self.protocol_version,
         }
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
 
         request = urllib.request.Request(self.endpoint, data=body, headers=headers, method="POST")
         try:
@@ -152,11 +151,9 @@ class McpHttpClient:
                 status = response.getcode()
                 raw = response.read()
                 response_headers = {k: v for k, v in response.headers.items()}
-                self._capture_session_id(response_headers)
         except urllib.error.HTTPError as exc:
             raw = exc.read()
             response_headers = {k: v for k, v in exc.headers.items()}
-            self._capture_session_id(response_headers)
             parsed = self._parse_body(raw, response_headers.get("Content-Type", ""))
             raise McpHttpError(
                 f"HTTP {exc.code} from MCP endpoint",
@@ -176,11 +173,6 @@ class McpHttpClient:
                 payload=raw.decode("utf-8", errors="replace"),
             )
         return JsonRpcReply(status=status, payload=parsed, headers=response_headers)
-
-    def _capture_session_id(self, headers: dict[str, str]) -> None:
-        for key, value in headers.items():
-            if key.lower() == "mcp-session-id" and value:
-                self.session_id = value
 
     def _parse_body(self, raw: bytes, content_type: str) -> dict[str, Any] | None:
         text = raw.decode("utf-8", errors="replace").strip()
