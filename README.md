@@ -15,8 +15,9 @@ Coding Tools MCP is a **model-neutral coding runtime** served over the
 [Model Context Protocol](https://modelcontextprotocol.io): file reading and
 search, structured multi-file patches, command execution, interactive
 sessions, and git — one server that any MCP client can drive. Claude Desktop,
-Claude Code, Cursor, Cline, or an agent you build yourself all get the same
-18 battle-tested tools, confined to one workspace, gated by permission modes.
+Claude Code, Codex, Cursor, Cline, VS Code, Windsurf, Gemini CLI, or an agent
+you build yourself all get the same 18 battle-tested tools, confined to one
+workspace, gated by permission modes.
 
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -49,8 +50,9 @@ uvx coding-tools-mcp --stdio --workspace /path/to/repo   # Python toolchain
 npx coding-tools-mcp --stdio --workspace /path/to/repo   # Node toolchain
 ```
 
-Wire it into Claude Desktop, Claude Code, Cursor, or Cline — the JSON is the
-same everywhere (swap `uvx` for `npx` if you prefer Node):
+Wire it into Claude Desktop, Claude Code, Codex, Cursor, VS Code, Windsurf,
+Gemini CLI, or Cline — the JSON is the same everywhere (swap `uvx` for `npx`
+if you prefer Node):
 
 ```json
 {
@@ -89,6 +91,7 @@ CODING_TOOLS_MCP_AUTH_MODE=bearer ./scripts/tunnel.sh cloudflared /path/to/repo
 Loopback bind + authenticated HTTPS tunnel (`cloudflared`, `ngrok`, or
 Microsoft Dev Tunnel). Point claude.ai on your phone at
 `https://<tunnel-host>/mcp` and drive your home workstation from anywhere.
+ChatGPT and Grok connect through their connector settings the same way.
 Bearer tokens and OAuth 2.1 + PKCE (with RFC 7591 dynamic registration) are
 built in. → [docs/remote-mcp.md](docs/remote-mcp.md)
 
