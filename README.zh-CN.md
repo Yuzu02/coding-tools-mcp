@@ -14,9 +14,9 @@
 Coding Tools MCP 是一个**模型中立的编程运行时**，通过
 [Model Context Protocol](https://modelcontextprotocol.io) 对外提供服务：
 文件读取与搜索、结构化多文件补丁、命令执行、交互式命令、git 操作——
-一个服务器，任何 MCP 客户端都能驱动。Claude Desktop、Claude Code、Cursor、
-Cline，或你自己写的 agent，拿到的都是同一套久经考验的 18 个工具：
-限定在单一工作区内，由权限模式层层把关。
+一个服务器，任何 MCP 客户端都能驱动。Claude Desktop、Claude Code、Codex、
+Cursor、Cline、VS Code、Windsurf、Gemini CLI，或你自己写的 agent，拿到的
+都是同一套久经考验的 18 个工具：限定在单一工作区内，由权限模式层层把关。
 
 [![观看演示](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -43,8 +43,9 @@ uvx coding-tools-mcp --stdio --workspace /path/to/repo   # Python 工具链
 npx coding-tools-mcp --stdio --workspace /path/to/repo   # Node 工具链
 ```
 
-接入 Claude Desktop、Claude Code、Cursor 或 Cline——各家的 JSON 配置完全相同
-（偏好 Node 的话把 `uvx` 换成 `npx` 即可）：
+接入 Claude Desktop、Claude Code、Codex、Cursor、VS Code、Windsurf、
+Gemini CLI 或 Cline——各家的 JSON 配置完全相同（偏好 Node 的话把 `uvx`
+换成 `npx` 即可）：
 
 ```json
 {
@@ -80,7 +81,8 @@ CODING_TOOLS_MCP_AUTH_MODE=bearer ./scripts/tunnel.sh cloudflared /path/to/repo
 
 回环地址绑定 + 带认证的 HTTPS 隧道（`cloudflared`、`ngrok` 或 Microsoft Dev
 Tunnel）。手机上打开 claude.ai，指向 `https://<tunnel-host>/mcp`，就能驱动家里的
-工作站。内置 Bearer token 与 OAuth 2.1 + PKCE（含 RFC 7591 动态注册）。
+工作站。ChatGPT 与 Grok 通过各自的连接器设置同样接入。内置 Bearer token 与
+OAuth 2.1 + PKCE（含 RFC 7591 动态注册）。
 → [docs/remote-mcp.md](docs/remote-mcp.md)
 
 **3. 在一次性 Docker 沙箱里放心跑可疑代码。**
