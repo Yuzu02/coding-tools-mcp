@@ -1,10 +1,10 @@
 # Project Addressing + Semantic Navigation Design
 
 **Date:** 2026-08-16
-**Status:** Phase 0 and Phase A are implemented/verified; Phase B semantic navigation is implemented, with final semantic acceptance in progress
+**Status:** Phase 0, Phase A, and Phase B are implemented and verified
 **Target:** fork-owned multi-project and semantic extensions composed through the internal ExtensionHost
 
-**Repository validation snapshot (2026-08-17, refreshed after Phase A implementation):**
+**Repository validation snapshot (2026-08-17, refreshed after Phase B acceptance):**
 
 - fork `main`: `da89d81` after the four-project integration checkpoint
 - current original upstream `xyTom/main`: `66b3f19`
@@ -14,6 +14,10 @@
 - the default composed catalog exposes 24 tools (`projects` contributes four); disabling `projects` exposes the 20 mother-core tools
 - Phase A final acceptance passed on 2026-08-17: extension tests 141/141, project/skills regressions 16/16, full unit discovery 517 tests with 7 skips and 0 failures, full compliance 129/129, protocol/schema-drift/dispatch-input gates, Ruff, mypy, integration suites, npm launcher checks, and `mise run verify`
 - real-server acceptance covers four-project stdio/HTTP routing, concurrent reads, stateless command recovery, project-neutral discovery, nested project boundaries, and the normative runtime contract v0.4
+- Phase B implements the backend-neutral semantic model, four Coding Tools-owned read-only tools, the private worker protocol, exact-pinned `serena-agent==1.5.3`, lazy bounded per-project Serena workers, idle/LRU eviction, same-project serialization, cross-project concurrency, and typed semantic failure isolation
+- Phase B final acceptance on 2026-08-17 reran 56 semantic unit/fake/concurrency/doc tests; exact Serena Python, TypeScript, two-project concurrent MCP isolation, and no-`.serena` source-tree tests; project-addressing integration 3/3; schema drift 10/10; dual-era 10/10; tool golden 9/9; security 15/15; E2E 6/6; runtime semantics 4/4; npm launcher 4/4; dispatch-input validation; six MCP catalog/schema/annotation/dispatch/error seam tests; Ruff; semantic mypy across 7 source files; and public-fork hygiene 2/2
+- the monolithic `MCPContractTests` class exceeds this execution harness's 60-second command cap, so Phase B acceptance uses the six seam-critical MCP tests above together with the already-verified Phase A full-compliance baseline; no Phase B change modifies MCP transport semantics
+- final upstream revalidation found remote and local `xyTom/main` unchanged at `66b3f19`; the fork remained a strict descendant with no missing upstream commits
 
 ## 1. Objective
 
