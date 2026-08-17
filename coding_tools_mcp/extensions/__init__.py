@@ -24,6 +24,7 @@ from .contributions import (
     ToolDecorator,
     compose_tools,
 )
+from .host import ExtensionHost
 from .registry import ExtensionRegistry, ExtensionRegistryError
 from .services import CORE_WORKSPACE, CapabilityKey, ServiceRegistry, ServiceRegistryError, WorkspaceAccess
 
@@ -37,6 +38,7 @@ __all__ = [
     "ContributionRegistry",
     "Extension",
     "ExtensionContext",
+    "ExtensionHost",
     "ExtensionManifest",
     "ExtensionRegistry",
     "ExtensionRegistryError",
