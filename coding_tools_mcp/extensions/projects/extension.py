@@ -11,6 +11,7 @@ from ..contributions import ToolAnnotations, ToolContribution
 from ..services import CORE_WORKSPACE, CORE_WORKSPACE_RUNTIMES, CapabilityKey, WorkspaceAccess
 from .project_catalog import ProjectCatalog, build_project_catalog
 from .registry import PROJECT_REGISTRY, build_project_registry
+from .runtime import PROJECT_RUNTIMES, ProjectRuntimeManager
 from .skill_catalog import ProjectNotFoundError, SkillCatalog, SkillInvalidError, SkillNotFoundError
 
 
@@ -39,6 +40,7 @@ class ProjectsExtension:
         self._config: Mapping[str, object] = {}
         self._workspace: WorkspaceAccess | None = None
         self._skills: SkillCatalog | None = None
+        self._runtimes: ProjectRuntimeManager | None = None
 
     def configure(self, config: Mapping[str, object]) -> None:
         self._config = config
@@ -51,10 +53,13 @@ class ProjectsExtension:
             fallback_root=workspace.root,
             validate_root=workspace_runtimes.validate_root,
         )
+        runtimes = ProjectRuntimeManager(registry, workspace_runtimes)
         catalog = build_project_catalog(workspace.root)
         self._workspace = workspace
         self._skills = SkillCatalog(catalog)
+        self._runtimes = runtimes
         context.services.provide(PROJECT_REGISTRY, registry)
+        context.services.provide(PROJECT_RUNTIMES, runtimes)
         context.services.provide(PROJECT_CATALOG, catalog)
         context.add_tool(self._list_skills_tool())
         context.add_tool(self._read_skill_tool())
@@ -63,6 +68,13 @@ class ProjectsExtension:
         return None
 
     def stop(self) -> None:
+        runtimes = self._runtimes
+        self._runtimes = None
+        if runtimes is None:
+            return None
+        warnings = runtimes.close()
+        if warnings:
+            raise RuntimeError("; ".join(warnings))
         return None
 
     def _list_skills_tool(self) -> ToolContribution:

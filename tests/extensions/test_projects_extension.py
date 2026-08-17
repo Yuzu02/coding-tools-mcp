@@ -14,7 +14,12 @@ from coding_tools_mcp.extensions import (
     ServiceRegistry,
     builtin_extension_registry,
 )
-from coding_tools_mcp.extensions.projects import PROJECT_CATALOG, PROJECT_REGISTRY, ProjectsExtension
+from coding_tools_mcp.extensions.projects import (
+    PROJECT_CATALOG,
+    PROJECT_REGISTRY,
+    PROJECT_RUNTIMES,
+    ProjectsExtension,
+)
 from coding_tools_mcp.server import Runtime
 
 
@@ -75,11 +80,16 @@ class ProjectsExtensionTests(unittest.TestCase):
 
                 catalog = services.require(PROJECT_CATALOG)
                 registry = services.require(PROJECT_REGISTRY)
+                runtimes = services.require(PROJECT_RUNTIMES)
 
                 self.assertEqual(catalog.workspace, root.resolve())
                 self.assertEqual(catalog.main_projects[0].scope_id, ".")
                 self.assertEqual(registry.ids(), ("default",))
                 self.assertEqual(registry.get("default").root, root.resolve())
+                self.assertEqual(runtimes.active(), ())
+                extension.stop()
+                with self.assertRaisesRegex(RuntimeError, "closed"):
+                    runtimes.require("default")
             finally:
                 runtime.close()
 
