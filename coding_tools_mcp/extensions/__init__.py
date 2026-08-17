@@ -28,6 +28,13 @@ from .host import ExtensionHost
 from .registry import ExtensionRegistry, ExtensionRegistryError
 from .services import CORE_WORKSPACE, CapabilityKey, ServiceRegistry, ServiceRegistryError, WorkspaceAccess
 
+
+def builtin_extension_registry() -> ExtensionRegistry:
+    """Return the fork's statically registered built-in extensions."""
+
+    return ExtensionRegistry([], default_enabled=())
+
+
 __all__ = [
     "ConfigError",
     "ConfigNode",
@@ -51,6 +58,7 @@ __all__ = [
     "ToolAnnotations",
     "ToolContribution",
     "ToolDecorator",
+    "builtin_extension_registry",
     "compose_tools",
     "list_of",
     "load_runtime_config",

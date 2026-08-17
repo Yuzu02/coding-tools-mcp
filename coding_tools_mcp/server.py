@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -34,6 +35,15 @@ from typing import Any, cast
 from . import __version__
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
+from .extensions import (
+    CORE_WORKSPACE,
+    ComposedTool,
+    ExtensionHost,
+    ExtensionRegistry,
+    RuntimeConfig,
+    ToolAnnotations,
+    builtin_extension_registry,
+)
 from .landlock_exec import libc_syscall
 from .oauth import (
     OAUTH_CODE_TTL_SECONDS,
@@ -1470,15 +1480,11 @@ class Runtime:
         fake_readonly_annotations: bool = False,
         transport: str = "stdio",
         command_manager: WorkspaceCommandManager | None = None,
+        extension_config: RuntimeConfig | None = None,
+        extension_registry: ExtensionRegistry | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
-        self._exposed_tool_names = [
-            name
-            for name, spec in TOOL_REGISTRY.items()
-            if spec.gated_by is None or getattr(self, spec.gated_by)
-        ]
-        self._exposed_tool_name_set = frozenset(self._exposed_tool_names)
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -1536,7 +1542,19 @@ class Runtime:
         )
         self.skill_catalog = SkillCatalog(build_project_catalog(self.workspace.root))
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
-        self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
+        self.extension_registry = extension_registry or builtin_extension_registry()
+        self.extension_config = extension_config or RuntimeConfig.defaults(
+            enabled=self.extension_registry.default_enabled
+        )
+        self.extension_host = ExtensionHost.build(
+            registry=self.extension_registry,
+            config=self.extension_config,
+            core_tools=core_tool_contracts(self),
+            seed_services=((CORE_WORKSPACE, self.workspace),),
+        )
+        self._tools = self.extension_host.tools
+        self._exposed_tool_names = tuple(self._tools)
+        self._exposed_tool_name_set = frozenset(self._tools)
 
     def _set_runtime_dir(self, runtime_dir: Path) -> None:
         self.runtime_dir = runtime_dir
@@ -1548,6 +1566,8 @@ class Runtime:
         if self._closed:
             return
         self._closed = True
+        for warning in self.extension_host.stop():
+            print(f"WARNING: extension shutdown: {warning}", file=sys.stderr)
         if self._owns_command_manager:
             self.command_manager.close()
         self.telemetry.finish(output_retention=self.command_manager.retention_stats_snapshot())
@@ -1713,7 +1733,7 @@ class Runtime:
     def list_tools(self) -> dict[str, Any]:
         return {
             "tools": [
-                tool_definition(name, fake_readonly=self.fake_readonly_annotations)
+                tool_definition(self._tools[name], fake_readonly=self.fake_readonly_annotations)
                 for name in self.exposed_tool_names()
             ]
         }
@@ -1788,6 +1808,7 @@ class Runtime:
                 "nested_instruction_files": list(self.project_context.nested_files),
                 "warnings": list(self.project_context.warnings),
             },
+            "extensions": self.extension_host.metadata(),
             "tools": tools,
             "tool_count": len(tools),
         }
@@ -1801,17 +1822,22 @@ class Runtime:
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
-        handler = self._tool_handlers.get(name) if name in self._exposed_tool_name_set else None
-        if handler is None:
+        tool = self._tools.get(name) if name in self._exposed_tool_name_set else None
+        if tool is None:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
-        spec = TOOL_REGISTRY[name]
-        validate_arguments(name, args)
+        validate_arguments(tool, args)
         try:
-            payload = handler(args)
+            payload = tool.handler(args)
             payload.setdefault("ok", True)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
-            content = spec.content_builder(payload) if spec.content_builder else None
-            return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
+            content = tool.content_builder(payload) if tool.content_builder else None
+            return make_tool_result(
+                name,
+                payload,
+                is_error=payload.get("ok") is False,
+                content=content,
+                text_renderer=tool.text_renderer,
+            )
         except ToolFailure as exc:
             payload = {
                 "ok": False,
@@ -1823,8 +1849,8 @@ class Runtime:
                     "details": exc.details,
                 },
             }
-            if spec.error_status:
-                payload["status"] = spec.error_status
+            if tool.error_status:
+                payload["status"] = tool.error_status
             diagnostics = permission_failure_diagnostics(exc)
             if diagnostics:
                 payload["diagnostics"] = diagnostics
@@ -1839,7 +1865,7 @@ class Runtime:
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
             self.emit_tool_trace(name, args, payload, started_at, context=context)
-            return make_tool_result(name, payload, is_error=True)
+            return make_tool_result(name, payload, is_error=True, text_renderer=tool.text_renderer)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
             payload = {
                 "ok": False,
@@ -1851,10 +1877,10 @@ class Runtime:
                     "details": {},
                 },
             }
-            if spec.error_status:
-                payload["status"] = spec.error_status
+            if tool.error_status:
+                payload["status"] = tool.error_status
             self.emit_tool_trace(name, args, payload, started_at, context=context)
-            return make_tool_result(name, payload, is_error=True)
+            return make_tool_result(name, payload, is_error=True, text_renderer=tool.text_renderer)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
@@ -2248,7 +2274,7 @@ class Runtime:
             raise ToolFailure("INVALID_ARGUMENT", f"Invalid regex: {exc}", category="validation") from exc
         needle = query if case_sensitive else query.lower()
 
-        roots = [resolved.path] if resolved.path.is_file() else walk_files(resolved.path)
+        roots: Iterator[Path] = iter([resolved.path]) if resolved.path.is_file() else walk_files(resolved.path)
         for batch in path_batches(roots, 256):
             # Filter by glob first so git check-ignore runs once per batch of
             # candidates instead of once per walked file.
@@ -4949,8 +4975,33 @@ def tool_output_schema() -> dict[str, Any]:
     }
 
 
-def validate_arguments(tool_name: str, args: dict[str, Any]) -> None:
-    schema = input_schemas()[tool_name]
+def core_tool_contracts(runtime: Runtime) -> dict[str, ComposedTool]:
+    schemas = input_schemas()
+    contracts: dict[str, ComposedTool] = {}
+    for name, spec in TOOL_REGISTRY.items():
+        if spec.gated_by is not None and not getattr(runtime, spec.gated_by):
+            continue
+        contracts[name] = ComposedTool(
+            name=name,
+            title=spec.title,
+            description=spec.description,
+            input_schema=schemas[name],
+            handler=getattr(runtime, name),
+            annotations=ToolAnnotations(
+                read_only=spec.read_only,
+                destructive=spec.destructive,
+                idempotent=spec.idempotent,
+                open_world=spec.open_world,
+            ),
+            error_status=spec.error_status,
+            content_builder=spec.content_builder,
+            origin="core",
+        )
+    return contracts
+
+
+def validate_arguments(tool: ComposedTool | str, args: dict[str, Any]) -> None:
+    schema = input_schemas()[tool] if isinstance(tool, str) else dict(tool.input_schema)
     try:
         validate_schema_value(args, schema, path="arguments")
     except ToolFailure as exc:
@@ -5025,20 +5076,19 @@ def schema_type_name(expected_type: str | list[str]) -> str:
     return expected_type
 
 
-def tool_definition(name: str, *, fake_readonly: bool = False) -> dict[str, Any]:
-    schemas = input_schemas()
-    annotations = tool_annotations(name, fake_readonly=fake_readonly)
+def tool_definition(tool: ComposedTool, *, fake_readonly: bool = False) -> dict[str, Any]:
+    annotations = tool_annotations(tool, fake_readonly=fake_readonly)
     return {
-        "name": name,
+        "name": tool.name,
         "title": annotations["title"],
-        "description": TOOL_REGISTRY[name].description,
-        "inputSchema": schemas[name],
+        "description": tool.description,
+        "inputSchema": deepcopy(dict(tool.input_schema)),
         "outputSchema": tool_output_schema(),
         "annotations": annotations,
     }
 
 
-def tool_annotations(name: str, *, fake_readonly: bool = False) -> dict[str, Any]:
+def tool_annotations(tool: ComposedTool | str, *, fake_readonly: bool = False) -> dict[str, Any]:
     """Return a tool's MCP annotations.
 
     ``fake_readonly`` serves clients that refuse to call, or prompt on every call
@@ -5048,21 +5098,34 @@ def tool_annotations(name: str, *, fake_readonly: bool = False) -> dict[str, Any
     `tools/list` may pass it: `server_info` and the server card must keep
     reporting the real annotations so the override stays discoverable.
     """
-    spec = TOOL_REGISTRY[name]
+    if isinstance(tool, str):
+        spec = TOOL_REGISTRY[tool]
+        title = spec.title
+        read_only = spec.read_only
+        destructive = spec.destructive
+        idempotent = spec.idempotent
+        open_world = spec.open_world
+    else:
+        annotations = tool.annotations
+        title = tool.title
+        read_only = annotations.read_only
+        destructive = annotations.destructive
+        idempotent = annotations.idempotent
+        open_world = annotations.open_world
     if fake_readonly:
         return {
-            "title": spec.title,
+            "title": title,
             "readOnlyHint": True,
             "destructiveHint": False,
-            "idempotentHint": spec.idempotent,
+            "idempotentHint": idempotent,
             "openWorldHint": False,
         }
     return {
-        "title": spec.title,
-        "readOnlyHint": spec.read_only,
-        "destructiveHint": spec.destructive,
-        "idempotentHint": spec.idempotent,
-        "openWorldHint": spec.open_world,
+        "title": title,
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": open_world,
     }
 
 
@@ -5318,7 +5381,7 @@ def server_card_payload(runtime: Runtime, *, oauth_base_url: str | None = None) 
     names = runtime.exposed_tool_names()
     # Always the real annotations, never the tools/list override: this card is
     # what an operator fetches to find out what the endpoint actually does.
-    annotations = {name: tool_annotations(name, fake_readonly=False) for name in names}
+    annotations = {name: tool_annotations(runtime._tools[name], fake_readonly=False) for name in names}
     read_only = [name for name in names if annotations[name].get("readOnlyHint") is True]
     mutating = [name for name in names if annotations[name].get("readOnlyHint") is not True]
     payload = {
@@ -5370,7 +5433,8 @@ def rpc_response_status(era: str, response: dict[str, Any]) -> int:
     error = response.get("error")
     if not isinstance(error, dict):
         return 200
-    return MODERN_ERROR_STATUSES.get(error.get("code"), 200)
+    code = error.get("code")
+    return MODERN_ERROR_STATUSES.get(code, 200) if isinstance(code, int) else 200
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):

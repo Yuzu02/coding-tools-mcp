@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 
 MODEL_TEXT_SAFETY_LIMIT_BYTES = (2 * 1_048_576) + 65_536
+ToolTextRenderer = Callable[[dict[str, Any]], str]
 
 
 def make_tool_result(
@@ -13,6 +14,7 @@ def make_tool_result(
     *,
     is_error: bool,
     content: list[dict[str, Any]] | None = None,
+    text_renderer: ToolTextRenderer | None = None,
 ) -> dict[str, Any]:
     """Build an MCP result without mirroring structured JSON into model text.
 
@@ -22,7 +24,12 @@ def make_tool_result(
     """
 
     result_content = list(content or [])
-    text = render_tool_text(tool_name, payload, is_error=is_error)
+    text = render_tool_text(
+        tool_name,
+        payload,
+        is_error=is_error,
+        text_renderer=text_renderer,
+    )
     if text:
         result_content.append(
             {"type": "text", "text": _bounded_model_text(text, tool_name)}
@@ -30,10 +37,16 @@ def make_tool_result(
     return {"content": result_content, "structuredContent": payload, "isError": is_error}
 
 
-def render_tool_text(tool_name: str, payload: dict[str, Any], *, is_error: bool) -> str:
+def render_tool_text(
+    tool_name: str,
+    payload: dict[str, Any],
+    *,
+    is_error: bool,
+    text_renderer: ToolTextRenderer | None = None,
+) -> str:
     if is_error or payload.get("ok") is False:
         return _render_error(payload)
-    renderer = _RENDERERS.get(tool_name)
+    renderer = text_renderer or _RENDERERS.get(tool_name)
     if renderer is not None:
         return renderer(payload)
     summary = payload.get("summary")
@@ -277,7 +290,8 @@ def _render_git_status(payload: dict[str, Any]) -> str:
     if not payload.get("is_repo", True):
         return "Not a Git repository."
     branch = payload.get("branch") or "detached"
-    entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+    raw_entries = payload.get("entries")
+    entries = raw_entries if isinstance(raw_entries, list) else []
     lines = [f"## {branch}"]
     for entry in entries:
         if not isinstance(entry, dict):
