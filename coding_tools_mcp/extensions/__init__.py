@@ -14,15 +14,21 @@ from .config import (
     table,
 )
 from .registry import ExtensionRegistry, ExtensionRegistryError
+from .services import CORE_WORKSPACE, CapabilityKey, ServiceRegistry, ServiceRegistryError, WorkspaceAccess
 
 __all__ = [
     "ConfigError",
     "ConfigNode",
+    "CORE_WORKSPACE",
+    "CapabilityKey",
     "Extension",
     "ExtensionManifest",
     "ExtensionRegistry",
     "ExtensionRegistryError",
     "RuntimeConfig",
+    "ServiceRegistry",
+    "ServiceRegistryError",
+    "WorkspaceAccess",
     "list_of",
     "load_runtime_config",
     "map_of",
