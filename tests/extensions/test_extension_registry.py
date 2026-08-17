@@ -12,6 +12,9 @@ class Alpha:
     def configure(self, config):
         self.config = config
 
+    def prepare(self):
+        pass
+
     def register(self, context):
         self.context = context
 

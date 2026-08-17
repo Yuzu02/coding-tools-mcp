@@ -77,6 +77,9 @@ class ProjectsExtension:
     def configure(self, config: Mapping[str, object]) -> None:
         self._config = config
 
+    def prepare(self) -> None:
+        return None
+
     def register(self, context: ExtensionContext) -> None:
         workspace = context.services.require(CORE_WORKSPACE)
         workspace_runtimes = context.services.require(CORE_WORKSPACE_RUNTIMES)

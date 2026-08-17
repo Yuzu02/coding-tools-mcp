@@ -259,6 +259,9 @@ class SemanticExtension:
             allow_dependency_install=allow_dependency_install,
         )
 
+    def prepare(self) -> None:
+        return None
+
     def register(self, context: ExtensionContext) -> None:
         self._registry = context.services.require(PROJECT_REGISTRY)
         self._runtimes = context.services.require(PROJECT_RUNTIMES)

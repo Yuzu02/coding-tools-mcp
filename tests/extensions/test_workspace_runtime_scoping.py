@@ -30,6 +30,9 @@ class ScopedReadProbe:
     def configure(self, config) -> None:
         return None
 
+    def prepare(self) -> None:
+        return None
+
     def register(self, context) -> None:
         service = context.services.require(CORE_WORKSPACE_RUNTIMES)
         self._service = service

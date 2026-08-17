@@ -53,6 +53,9 @@ class Extension(Protocol):
     def configure(self, config: Mapping[str, object]) -> None:
         raise NotImplementedError
 
+    def prepare(self) -> None:
+        raise NotImplementedError
+
     def register(self, context: ExtensionContext) -> None:
         raise NotImplementedError
 

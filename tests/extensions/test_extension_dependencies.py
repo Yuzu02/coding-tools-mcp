@@ -13,6 +13,9 @@ def fake_extension(name: str, requires: tuple[str, ...] = ()):
         def configure(self, config):
             self.config = config
 
+        def prepare(self):
+            pass
+
         def register(self, context):
             self.context = context
 

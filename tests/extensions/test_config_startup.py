@@ -23,6 +23,9 @@ def fake_extension(name: str):
         def configure(self, config):
             pass
 
+        def prepare(self):
+            pass
+
         def register(self, context):
             pass
 

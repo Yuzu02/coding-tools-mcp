@@ -26,6 +26,9 @@ class EchoExtension:
     def configure(self, config):
         self.config = config
 
+    def prepare(self):
+        pass
+
     def register(self, context):
         context.add_tool(
             ToolContribution(
@@ -55,6 +58,9 @@ class DecoratorExtension:
     manifest = ExtensionManifest(name="decorator")
 
     def configure(self, config):
+        pass
+
+    def prepare(self):
         pass
 
     def register(self, context):

@@ -43,17 +43,36 @@ class ExtensionHost:
             services.provide(key, value)
         for name in order:
             instances[name].configure(config.extension(name))
+
+        prepared: list[str] = []
         for name in order:
-            instances[name].register(
-                ExtensionContext(
-                    services=services,
-                    contributions=contributions,
-                    extension_name=name,
+            prepared.append(name)
+            try:
+                instances[name].prepare()
+            except Exception as exc:
+                warnings = cls._stop_instances(instances, reversed(prepared))
+                for warning in warnings:
+                    exc.add_note(f"extension cleanup: {warning}")
+                raise
+
+        try:
+            for name in order:
+                instances[name].register(
+                    ExtensionContext(
+                        services=services,
+                        contributions=contributions,
+                        extension_name=name,
+                    )
                 )
-            )
-        tools = compose_tools(core_tools, contributions, order)
-        contributions.freeze()
-        services.freeze()
+            tools = compose_tools(core_tools, contributions, order)
+            contributions.freeze()
+            services.freeze()
+        except Exception as exc:
+            warnings = cls._stop_instances(instances, reversed(prepared))
+            for warning in warnings:
+                exc.add_note(f"extension cleanup: {warning}")
+            raise
+
         host = cls(
             order=order,
             instances=instances,
@@ -66,7 +85,7 @@ class ExtensionHost:
             try:
                 instances[name].start()
             except Exception as exc:
-                warnings = host._stop_names((name, *reversed(started)))
+                warnings = host._stop_names(reversed(order))
                 for warning in warnings:
                     exc.add_note(f"extension cleanup: {warning}")
                 host._stopped = True
@@ -98,15 +117,22 @@ class ExtensionHost:
     def server_instructions(self, default_text: str) -> str:
         return self._contributions.compose_server_instructions(default_text, self._order)
 
-    def _stop_names(self, names: Iterable[str]) -> tuple[str, ...]:
+    @staticmethod
+    def _stop_instances(
+        instances: Mapping[str, Extension],
+        names: Iterable[str],
+    ) -> tuple[str, ...]:
         warnings: list[str] = []
         for name in names:
             try:
-                self._instances[name].stop()
+                instances[name].stop()
             except Exception as exc:
                 if len(warnings) < 32:
                     warnings.append(f"{name}: {exc}")
         return tuple(warnings)
+
+    def _stop_names(self, names: Iterable[str]) -> tuple[str, ...]:
+        return self._stop_instances(self._instances, names)
 
     def stop(self) -> tuple[str, ...]:
         if self._stopped:

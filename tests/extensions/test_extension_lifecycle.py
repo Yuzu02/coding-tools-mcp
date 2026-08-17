@@ -19,6 +19,7 @@ def lifecycle_extension(
     events: list[str],
     *,
     requires: tuple[str, ...] = (),
+    fail_prepare: bool = False,
     fail_register: bool = False,
     fail_start: bool = False,
     fail_stop: bool = False,
@@ -28,6 +29,11 @@ def lifecycle_extension(
 
         def configure(self, config):
             events.append(f"{name}.configure")
+
+        def prepare(self):
+            events.append(f"{name}.prepare")
+            if fail_prepare:
+                raise RuntimeError(f"{name} prepare failed")
 
         def register(self, context):
             events.append(f"{name}.register")
@@ -69,6 +75,8 @@ class ExtensionLifecycleTests(unittest.TestCase):
             [
                 "base.configure",
                 "child.configure",
+                "base.prepare",
+                "child.prepare",
                 "base.register",
                 "child.register",
                 "base.start",
@@ -78,6 +86,30 @@ class ExtensionLifecycleTests(unittest.TestCase):
             ],
         )
 
+    def test_prepare_failure_registers_and_starts_nothing_and_cleans_up_in_reverse(self) -> None:
+        events: list[str] = []
+        base = lifecycle_extension("base", events)
+        child = lifecycle_extension("child", events, requires=("base",), fail_prepare=True)
+
+        with self.assertRaisesRegex(RuntimeError, "child prepare failed"):
+            self.build_host([base, child], ("base", "child"))
+
+        self.assertEqual(
+            events,
+            [
+                "base.configure",
+                "child.configure",
+                "base.prepare",
+                "child.prepare",
+                "child.stop",
+                "base.stop",
+            ],
+        )
+        self.assertNotIn("base.register", events)
+        self.assertNotIn("child.register", events)
+        self.assertNotIn("base.start", events)
+        self.assertNotIn("child.start", events)
+
     def test_registries_are_frozen_before_first_start_call(self) -> None:
         test_case = self
 
@@ -86,6 +118,9 @@ class ExtensionLifecycleTests(unittest.TestCase):
 
             def configure(self, config):
                 self.context: ExtensionContext | None = None
+
+            def prepare(self):
+                pass
 
             def register(self, context):
                 self.context = context
@@ -155,6 +190,9 @@ class ExtensionLifecycleTests(unittest.TestCase):
             def configure(self, config):
                 pass
 
+            def prepare(self):
+                pass
+
             def register(self, context):
                 seen.append(context.services.require(key))
 
@@ -182,6 +220,9 @@ class ExtensionLifecycleTests(unittest.TestCase):
 
             def configure(self, config):
                 self.config = config
+
+            def prepare(self):
+                pass
 
             def register(self, context):
                 context.add_metadata("health", "ready")
