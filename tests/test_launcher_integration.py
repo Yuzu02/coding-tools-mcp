@@ -65,6 +65,7 @@ class FakeDependencies:
     ) -> None:
         self.commands: list[list[str]] = []
         self.started: list[str] = []
+        self.start_kwargs: dict[str, dict[str, object]] = {}
         self.terminated: list[str] = []
         self.closed: list[str] = []
         self.events: list[str] = []
@@ -87,6 +88,7 @@ class FakeDependencies:
 
     def process_starter(self, name: str, _argv: list[str], **kwargs: object) -> ManagedProcess:
         self.started.append(name)
+        self.start_kwargs[name] = dict(kwargs)
         self.events.append(f"start:{name}")
         process = ManagedProcess(
             name=name,
@@ -235,6 +237,7 @@ class LauncherIntegrationTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(fake.started, ["mcp"])
             self.assertEqual(fake.terminated, ["mcp"])
+            self.assertEqual(fake.start_kwargs["mcp"]["cwd"], config.mcp_repository)
 
     def test_run_manifest_finishes_with_child_failure(self) -> None:
         fake = FakeDependencies(child_exit=("mcp", 9))

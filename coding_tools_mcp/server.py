@@ -38,11 +38,17 @@ from .errors import JsonRpcError, ToolFailure
 from .extensions import (
     CORE_WORKSPACE,
     ComposedTool,
+    ConfigError,
+    ContributionError,
     ExtensionHost,
     ExtensionRegistry,
+    ExtensionRegistryError,
     RuntimeConfig,
+    ServiceRegistryError,
     ToolAnnotations,
     builtin_extension_registry,
+    load_runtime_config,
+    parse_extension_list,
 )
 from .landlock_exec import libc_syscall
 from .oauth import (
@@ -6124,6 +6130,21 @@ def build_runtime(
     command_manager: WorkspaceCommandManager | None = None,
 ) -> Runtime:
     workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
+    registry = builtin_extension_registry()
+    raw_cli_extensions = getattr(args, "extensions", None)
+    config = load_runtime_config(
+        cwd=Path.cwd(),
+        extension_schemas=registry.schemas(),
+        default_enabled=registry.default_enabled,
+        environ=os.environ,
+        public_path=getattr(args, "config", None),
+        local_path=getattr(args, "local_config", None),
+        cli_extensions=(
+            parse_extension_list(raw_cli_extensions)
+            if raw_cli_extensions is not None
+            else None
+        ),
+    )
     runtime = Runtime(
         workspace,
         enable_view_image=args.enable_view_image,
@@ -6136,6 +6157,8 @@ def build_runtime(
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
         transport=transport,
         command_manager=command_manager,
+        extension_config=config,
+        extension_registry=registry,
     )
     if emit_warning and runtime.capabilities.skip_all_permissions:
         print(
@@ -6262,7 +6285,17 @@ def run_http(args: argparse.Namespace) -> int:
         )
         return 2
 
-    runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
+    try:
+        runtime = build_runtime(
+            args,
+            runtime_policy,
+            auth_token=auth_token,
+            oauth_config=oauth_config,
+            transport="http",
+        )
+    except (ConfigError, ExtensionRegistryError, ContributionError, ServiceRegistryError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
@@ -6289,13 +6322,35 @@ def run_stdio(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    runtime = build_runtime(args, runtime_policy)
+    try:
+        runtime = build_runtime(args, runtime_policy)
+    except (ConfigError, ExtensionRegistryError, ContributionError, ServiceRegistryError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     return serve_stdio(runtime)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Serve workspace-confined coding tools over MCP.")
     parser.add_argument("--workspace", help="workspace root; defaults to CODING_TOOLS_MCP_WORKSPACE or cwd")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=f"public extension config TOML; defaults to {ENV_PREFIX}_CONFIG or ./coding-tools.toml when present",
+    )
+    parser.add_argument(
+        "--local-config",
+        default=None,
+        help=(
+            f"private extension overlay TOML; defaults to {ENV_PREFIX}_LOCAL_CONFIG "
+            "or coding-tools.local.toml when present"
+        ),
+    )
+    parser.add_argument(
+        "--extensions",
+        default=None,
+        help=f"comma-separated full enabled-extension override; defaults to {ENV_PREFIX}_EXTENSIONS when set",
+    )
     parser.add_argument(
         "--host",
         default=os.environ.get(f"{ENV_PREFIX}_HOST") or "127.0.0.1",
