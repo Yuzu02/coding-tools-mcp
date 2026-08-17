@@ -40,6 +40,17 @@ desktop = [
 image = [
   "Pillow>=10.0",
 ]
+semantic = [
+  "serena-agent==1.5.3",
+]
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "dev" },
+    { extra = "semantic" },
+  ],
+]
 
 [project.scripts]
 coding-tools-mcp = "coding_tools_mcp.server:main"
