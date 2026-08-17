@@ -116,8 +116,19 @@ class HostSecurityConfig:
 class HostTunnelConfig:
     mode: Literal["disabled", "profile", "profile-file", "generated"]
     client: str = "tunnel-client"
+    profile: str | None = None
+    profile_dir: Path | None = None
     profile_file: Path | None = None
     health_listen_addr: str = "127.0.0.1:0"
+    tunnel_id: str | None = None
+    api_key_ref: SecretRef | None = None
+    control_plane_base_url: str = "https://api.openai.com"
+    control_plane_url_path: str | None = None
+    mcp_server_url: str | None = None
+    generated_profile_name: str | None = None
+    write_profile: Path | None = None
+    force_profile_write: bool = False
+    open_web_ui: bool = False
 
 
 @dataclass(frozen=True)
@@ -248,8 +259,19 @@ def host_config_schema(extension_schemas: Mapping[str, ConfigNode]) -> ConfigNod
                         {
                             "mode": scalar(str),
                             "client": scalar(str),
+                            "profile": scalar(str),
+                            "profile_dir": scalar(str),
                             "profile_file": scalar(str),
                             "health_listen_addr": scalar(str),
+                            "tunnel_id": scalar(str),
+                            "api_key_ref": scalar(str),
+                            "control_plane_base_url": scalar(str),
+                            "control_plane_url_path": scalar(str),
+                            "mcp_server_url": scalar(str),
+                            "generated_profile_name": scalar(str),
+                            "write_profile": scalar(str),
+                            "force_profile_write": scalar(bool),
+                            "open_web_ui": scalar(bool),
                         }
                     ),
                 }
@@ -338,11 +360,47 @@ def _normalize_tunnel(data: Mapping[str, object]) -> HostTunnelConfig:
     )
     if mode == "profile-file" and profile_file is None:
         raise ConfigError("host.deployment.tunnel.profile_file is required for profile-file mode")
+    profile = tunnel.get("profile")
+    if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+        raise ConfigError("host.deployment.tunnel.profile must be a non-empty string")
+    if mode == "profile" and profile is None:
+        raise ConfigError("host.deployment.tunnel.profile is required for profile mode")
+    tunnel_id = tunnel.get("tunnel_id")
+    if tunnel_id is not None and (not isinstance(tunnel_id, str) or not tunnel_id.strip()):
+        raise ConfigError("host.deployment.tunnel.tunnel_id must be a non-empty string")
+    api_key_ref = (
+        parse_secret_ref(cast(str, tunnel["api_key_ref"]))
+        if "api_key_ref" in tunnel
+        else None
+    )
+    if mode == "generated" and (tunnel_id is None or api_key_ref is None):
+        raise ConfigError(
+            "host.deployment.tunnel.generated mode requires tunnel_id and api_key_ref"
+        )
     return HostTunnelConfig(
         mode=cast(Literal["disabled", "profile", "profile-file", "generated"], mode),
         client=str(tunnel.get("client", "tunnel-client")),
+        profile=cast(str | None, profile),
+        profile_dir=_optional_absolute_path(
+            tunnel.get("profile_dir"),
+            field_name="host.deployment.tunnel.profile_dir",
+        ),
         profile_file=profile_file,
         health_listen_addr=str(tunnel.get("health_listen_addr", "127.0.0.1:0")),
+        tunnel_id=cast(str | None, tunnel_id),
+        api_key_ref=api_key_ref,
+        control_plane_base_url=str(
+            tunnel.get("control_plane_base_url", "https://api.openai.com")
+        ),
+        control_plane_url_path=cast(str | None, tunnel.get("control_plane_url_path")),
+        mcp_server_url=cast(str | None, tunnel.get("mcp_server_url")),
+        generated_profile_name=cast(str | None, tunnel.get("generated_profile_name")),
+        write_profile=_optional_absolute_path(
+            tunnel.get("write_profile"),
+            field_name="host.deployment.tunnel.write_profile",
+        ),
+        force_profile_write=bool(tunnel.get("force_profile_write", False)),
+        open_web_ui=bool(tunnel.get("open_web_ui", False)),
     )
 
 
@@ -723,8 +781,19 @@ def _host_fingerprint_payload(config: HostConfig) -> dict[str, object]:
             "tunnel": {
                 "mode": config.deployment.tunnel.mode,
                 "client": config.deployment.tunnel.client,
+                "profile": config.deployment.tunnel.profile,
+                "profile_dir": _jsonable(config.deployment.tunnel.profile_dir),
                 "profile_file": _jsonable(config.deployment.tunnel.profile_file),
                 "health_listen_addr": config.deployment.tunnel.health_listen_addr,
+                "tunnel_id": config.deployment.tunnel.tunnel_id,
+                "api_key_ref": _jsonable(config.deployment.tunnel.api_key_ref),
+                "control_plane_base_url": config.deployment.tunnel.control_plane_base_url,
+                "control_plane_url_path": config.deployment.tunnel.control_plane_url_path,
+                "mcp_server_url": config.deployment.tunnel.mcp_server_url,
+                "generated_profile_name": config.deployment.tunnel.generated_profile_name,
+                "write_profile": _jsonable(config.deployment.tunnel.write_profile),
+                "force_profile_write": config.deployment.tunnel.force_profile_write,
+                "open_web_ui": config.deployment.tunnel.open_web_ui,
             },
         },
     }
@@ -765,6 +834,7 @@ def build_host_snapshot(config: HostConfig) -> ConfigSnapshot:
         ("security.oauth_client_secret_ref", config.security.oauth_client_secret_ref),
         ("security.oauth_password_ref", config.security.oauth_password_ref),
         ("security.oauth_token_secret_ref", config.security.oauth_token_secret_ref),
+        ("deployment.tunnel.api_key_ref", config.deployment.tunnel.api_key_ref),
     ):
         if ref is not None:
             secret_references[name] = _secret_ref_identity(ref)

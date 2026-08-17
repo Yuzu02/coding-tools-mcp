@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from coding_tools_mcp.config_schema import ConfigError as HostConfigError
+from coding_tools_mcp.extensions import builtin_extension_registry
+from coding_tools_mcp.host_config import ConfigSnapshot, HostTunnelConfig, build_host_snapshot, load_host_config
+
 
 ENV_PREFIX = "CODING_TOOLS_SERVICES_"
 DOTENV_ENTRY_RE = re.compile(
@@ -25,6 +29,30 @@ TUNNEL_SELECTION_FLAGS = {
     "--write-tunnel-profile",
 }
 TUNNEL_ONLY_ENV_PREFIXES = ("CONTROL_PLANE_", "TUNNEL_CLIENT_")
+HOST_CONFIG_AUTHORITY_FLAGS = (
+    "--workspace",
+    "--mcp-repository",
+    "--host",
+    "--port",
+    "--permission-mode",
+    "--shell-env-inherit",
+    "--enable-view-image",
+    "--no-enable-view-image",
+    "--mcp-arg",
+    "--sync",
+    "--no-sync",
+    "--sync-extra",
+    "--no-tunnel",
+    "--tunnel-profile",
+    "--tunnel-profile-file",
+    "--tunnel-id",
+    "--tunnel-client",
+    "--startup-timeout",
+    "--shutdown-timeout",
+    "--poll-interval",
+    "--logs-root",
+    "--tunnel-health-listen-addr",
+)
 
 
 class ConfigError(ValueError):
@@ -56,6 +84,8 @@ class TunnelSelection:
 @dataclass(frozen=True)
 class ServiceConfig:
     repository_root: Path
+    host_config_path: Path | None
+    config_snapshot: ConfigSnapshot | None
     workspace: Path
     mcp_repository: Path
     host: str
@@ -107,17 +137,24 @@ class ServiceConfig:
             "python",
             "-m",
             "coding_tools_mcp",
-            "--workspace",
-            str(self.workspace),
-            "--host",
-            self.host,
-            "--port",
-            str(self.port),
-            "--permission-mode",
-            self.permission_mode,
-            "--shell-env-inherit",
-            self.shell_env_inherit,
         ]
+        if self.host_config_path is not None:
+            argv.extend(("--host-config", str(self.host_config_path)))
+            return argv
+        argv.extend(
+            (
+                "--workspace",
+                str(self.workspace),
+                "--host",
+                self.host,
+                "--port",
+                str(self.port),
+                "--permission-mode",
+                self.permission_mode,
+                "--shell-env-inherit",
+                self.shell_env_inherit,
+            )
+        )
         if self.enable_view_image:
             argv.append("--enable-view-image")
         argv.extend(self.mcp_args)
@@ -146,6 +183,10 @@ class ServiceConfig:
                 str(self.tunnel.write_profile) if self.tunnel.write_profile else None
             )
         return {
+            "config_mode": "host" if self.host_config_path is not None else "compatibility",
+            "config_fingerprint": (
+                self.config_snapshot.fingerprint if self.config_snapshot is not None else None
+            ),
             "workspace": str(self.workspace),
             "mcp_repository": str(self.mcp_repository),
             "endpoint": f"http://{self.host}:{self.port}/mcp",
@@ -204,6 +245,173 @@ def _optional_path(value: str | None) -> Path | None:
     if not value:
         return None
     return Path(value).expanduser().resolve()
+
+
+def _secret_ref_text(ref: object | None) -> str | None:
+    if ref is None:
+        return None
+    scheme = getattr(ref, "scheme", None)
+    target = getattr(ref, "target", None)
+    if not isinstance(scheme, str) or not isinstance(target, str):
+        raise ConfigError("HostConfig contains an invalid secret reference")
+    return f"{scheme}:{target}"
+
+
+def _host_tunnel_selection(tunnel: HostTunnelConfig) -> TunnelSelection:
+    api_key_ref = _secret_ref_text(tunnel.api_key_ref)
+    if tunnel.mode == "disabled":
+        return TunnelSelection(mode="disabled", api_key_ref=api_key_ref)
+    if tunnel.mode == "profile-file":
+        profile_file = tunnel.profile_file
+        if profile_file is None or not profile_file.is_file():
+            raise ConfigError(f"tunnel profile file does not exist: {profile_file}")
+        return TunnelSelection(
+            mode="profile-file",
+            profile_file=profile_file,
+            api_key_ref=api_key_ref,
+        )
+    if tunnel.mode == "profile":
+        return TunnelSelection(
+            mode="profile",
+            profile=tunnel.profile,
+            profile_dir=tunnel.profile_dir,
+            api_key_ref=api_key_ref,
+        )
+    return TunnelSelection(
+        mode="generated",
+        tunnel_id=tunnel.tunnel_id,
+        api_key_ref=api_key_ref,
+        control_plane_base_url=tunnel.control_plane_base_url,
+        control_plane_url_path=tunnel.control_plane_url_path,
+        mcp_server_url=tunnel.mcp_server_url,
+        generated_profile_name=tunnel.generated_profile_name,
+        write_profile=tunnel.write_profile,
+        force_profile_write=tunnel.force_profile_write,
+        open_web_ui=tunnel.open_web_ui,
+    )
+
+
+def _token_uses_option(token: str, option: str) -> bool:
+    return token == option or token.startswith(f"{option}=")
+
+
+def _selected_host_config_path(
+    argv: Sequence[str],
+    environment: Mapping[str, str],
+) -> Path | None:
+    parser = LauncherArgumentParser(add_help=False)
+    parser.add_argument("--host-config")
+    args, _ = parser.parse_known_args(argv)
+    raw = args.host_config or environment.get(_env_name("HOST_CONFIG"))
+    return _optional_path(raw)
+
+
+def _resolve_host_mode_config(
+    argv: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    repo_root: Path,
+    host_config_path: Path,
+) -> ServiceConfig:
+    for token in argv:
+        for option in HOST_CONFIG_AUTHORITY_FLAGS:
+            if _token_uses_option(token, option):
+                raise ConfigError(f"--host-config cannot be combined with {option}")
+
+    parser = LauncherArgumentParser(
+        description="Start and supervise coding-tools-mcp from canonical HostConfig.",
+    )
+    parser.add_argument("--host-config", required=False)
+    parser.add_argument("--sync-only", action="store_true")
+    parser.add_argument("--doctor-only", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--uv", default=environment.get(_env_name("UV"), "uv"))
+    parser.add_argument(
+        "--tunnel-log-minutes",
+        type=int,
+        default=_env_int(environment, "TUNNEL_LOG_MINUTES", 120),
+    )
+    parser.add_argument("--tunnel-health-url-file")
+    parser.add_argument("--keep-generated-profile", action="store_true")
+    parser.add_argument("--allow-remote-tunnel-ui", action="store_true")
+    args = parser.parse_args(list(argv))
+
+    registry = builtin_extension_registry()
+    try:
+        host_config = load_host_config(
+            host_config_path,
+            extension_schemas=registry.schemas(),
+            default_enabled=registry.default_enabled,
+        )
+        snapshot = build_host_snapshot(host_config)
+    except HostConfigError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    if host_config.runtime is None:
+        raise ConfigError("HostConfig runtime.bootstrap_workspace is required by the services launcher")
+    workspace = host_config.runtime.bootstrap_workspace.resolve(strict=False)
+    repository = (host_config.deployment.mcp_repository or repo_root).expanduser().resolve(strict=False)
+    if not workspace.is_dir():
+        raise ConfigError(f"workspace directory does not exist: {workspace}")
+    if not repository.is_dir():
+        raise ConfigError(f"MCP repository directory does not exist: {repository}")
+    for marker in ("pyproject.toml", "uv.lock"):
+        if not (repository / marker).is_file():
+            raise ConfigError(f"MCP repository is missing {marker}: {repository}")
+    if not 1 <= args.tunnel_log_minutes <= 1440:
+        raise ConfigError("--tunnel-log-minutes must be between 1 and 1440")
+
+    tunnel = _host_tunnel_selection(host_config.deployment.tunnel)
+    if tunnel.mode == "generated" and tunnel.write_profile:
+        if tunnel.write_profile.exists() and not tunnel.force_profile_write:
+            raise ConfigError(
+                f"generated tunnel profile already exists: {tunnel.write_profile}; "
+                "set deployment.tunnel.force_profile_write=true to replace it"
+            )
+    if args.doctor_only and tunnel.mode == "disabled":
+        raise ConfigError("--doctor-only requires tunnel mode")
+    if (
+        not args.allow_remote_tunnel_ui
+        and not _is_loopback_listener(host_config.deployment.tunnel.health_listen_addr)
+    ):
+        raise ConfigError("remote tunnel admin listeners require --allow-remote-tunnel-ui")
+
+    logs_root = (
+        host_config.deployment.logs_root or repo_root / ".runtime" / "services"
+    ).expanduser().resolve(strict=False)
+    return ServiceConfig(
+        repository_root=repo_root,
+        host_config_path=host_config_path,
+        config_snapshot=snapshot,
+        workspace=workspace,
+        mcp_repository=repository,
+        host=host_config.transport.host,
+        port=host_config.transport.port,
+        permission_mode=host_config.security.permission_mode,
+        shell_env_inherit=host_config.security.shell_env_inherit,
+        enable_view_image=host_config.runtime.enable_view_image,
+        mcp_args=(),
+        uv=args.uv,
+        tunnel_client=host_config.deployment.tunnel.client,
+        tunnel=tunnel,
+        sync=host_config.deployment.sync,
+        sync_extras=host_config.deployment.sync_extras,
+        sync_only=args.sync_only,
+        doctor_only=args.doctor_only,
+        dry_run=args.dry_run,
+        startup_timeout=host_config.deployment.startup_timeout_seconds,
+        shutdown_timeout=host_config.deployment.shutdown_timeout_seconds,
+        poll_interval=host_config.deployment.poll_interval_seconds,
+        logs_root=logs_root,
+        tunnel_health_listen_addr=host_config.deployment.tunnel.health_listen_addr,
+        tunnel_health_url_file=_optional_path(args.tunnel_health_url_file),
+        tunnel_log_minutes=args.tunnel_log_minutes,
+        keep_generated_profile=args.keep_generated_profile,
+        allow_remote_tunnel_ui=args.allow_remote_tunnel_ui,
+        env_file=None,
+        env_file_loaded=False,
+        process_environment=dict(environment),
+    )
 
 
 def _bool_option(
@@ -575,6 +783,14 @@ def resolve_config(
     tokens = list(argv or [])
     existing_environment = dict(os.environ if environ is None else environ)
     root = (repo_root or Path(__file__).resolve().parents[2]).expanduser().resolve()
+    host_config_path = _selected_host_config_path(tokens, existing_environment)
+    if host_config_path is not None:
+        return _resolve_host_mode_config(
+            tokens,
+            environment=existing_environment,
+            repo_root=root,
+            host_config_path=host_config_path,
+        )
     _workspace_hint, env_file_hint, no_env_file = _preparse_environment_inputs(
         tokens,
         existing_environment,
@@ -631,6 +847,8 @@ def resolve_config(
 
     return ServiceConfig(
         repository_root=root,
+        host_config_path=None,
+        config_snapshot=None,
         workspace=workspace,
         mcp_repository=repository,
         host=args.host,

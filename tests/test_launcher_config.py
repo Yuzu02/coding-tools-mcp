@@ -23,6 +23,53 @@ def make_repository(root: Path) -> Path:
     return repository
 
 
+def write_launcher_host_config(
+    path: Path,
+    *,
+    workspace: Path,
+    repository: Path,
+    profile_file: Path,
+    logs_root: Path,
+) -> None:
+    path.write_text(
+        "\n".join(
+            (
+                "config_version = 2",
+                "[runtime]",
+                f'bootstrap_workspace = "{workspace}"',
+                "enable_view_image = true",
+                "[transport]",
+                'kind = "http"',
+                'host = "127.0.0.1"',
+                "port = 9555",
+                "[security]",
+                'permission_mode = "dangerous"',
+                'shell_env_inherit = "all"',
+                "allow_network = true",
+                'auth_mode = "noauth"',
+                "[extensions]",
+                'enabled = ["projects"]',
+                "[deployment]",
+                f'mcp_repository = "{repository}"',
+                "sync = false",
+                'sync_extras = ["semantic"]',
+                "startup_timeout_seconds = 45",
+                "shutdown_timeout_seconds = 12",
+                "poll_interval_seconds = 0.5",
+                f'logs_root = "{logs_root}"',
+                "[deployment.tunnel]",
+                'mode = "profile-file"',
+                f'profile_file = "{profile_file}"',
+                'client = "host-tunnel-client"',
+                'health_listen_addr = "127.0.0.1:8181"',
+                'api_key_ref = "env:HOST_TUNNEL_SECRET"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+
 @contextmanager
 def resolve_fixture(
     extra: list[str],
@@ -47,6 +94,171 @@ def resolve_fixture(
 
 
 class LauncherConfigTests(unittest.TestCase):
+    def test_host_config_mode_emits_minimal_locked_mcp_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = make_repository(root)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            profile = root / "tunnel.yaml"
+            profile.write_text("config_version: 1\n", encoding="utf-8")
+            logs = root / "logs"
+            host = root / "host.toml"
+            write_launcher_host_config(
+                host,
+                workspace=workspace,
+                repository=repository,
+                profile_file=profile,
+                logs_root=logs,
+            )
+
+            config = resolve_config(
+                ["--host-config", str(host)],
+                environ={},
+                repo_root=repository,
+            )
+
+            self.assertEqual(
+                config.mcp_argv(),
+                [
+                    "uv",
+                    "run",
+                    "--project",
+                    str(repository.resolve()),
+                    "--locked",
+                    "python",
+                    "-m",
+                    "coding_tools_mcp",
+                    "--host-config",
+                    str(host.resolve()),
+                ],
+            )
+
+    def test_host_config_mode_does_not_read_workspace_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = make_repository(root)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / ".env").write_text(
+                "THIS IS DELIBERATELY INVALID DOTENV\nHOST_TUNNEL_SECRET=from-dotenv\n",
+                encoding="utf-8",
+            )
+            profile = root / "tunnel.yaml"
+            profile.write_text("config_version: 1\n", encoding="utf-8")
+            host = root / "host.toml"
+            write_launcher_host_config(
+                host,
+                workspace=workspace,
+                repository=repository,
+                profile_file=profile,
+                logs_root=root / "logs",
+            )
+
+            config = resolve_config(
+                ["--host-config", str(host)],
+                environ={"HOST_TUNNEL_SECRET": "from-process"},
+                repo_root=repository,
+            )
+
+            self.assertFalse(config.env_file_loaded)
+            self.assertIsNone(config.env_file)
+            self.assertEqual(config.process_environment["HOST_TUNNEL_SECRET"], "from-process")
+
+    def test_host_config_mode_maps_profile_file_tunnel_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = make_repository(root)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            profile = root / "tunnel.yaml"
+            profile.write_text("config_version: 1\n", encoding="utf-8")
+            host = root / "host.toml"
+            write_launcher_host_config(
+                host,
+                workspace=workspace,
+                repository=repository,
+                profile_file=profile,
+                logs_root=root / "logs",
+            )
+
+            config = resolve_config(
+                ["--host-config", str(host)],
+                environ={},
+                repo_root=repository,
+            )
+
+            self.assertEqual(config.tunnel.mode, "profile-file")
+            self.assertEqual(config.tunnel.profile_file, profile.resolve())
+            self.assertEqual(config.tunnel_client, "host-tunnel-client")
+            self.assertEqual(config.tunnel_health_listen_addr, "127.0.0.1:8181")
+            self.assertEqual(config.tunnel.api_key_ref, "env:HOST_TUNNEL_SECRET")
+
+    def test_host_config_mode_rejects_legacy_host_authority_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = make_repository(root)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            profile = root / "tunnel.yaml"
+            profile.write_text("config_version: 1\n", encoding="utf-8")
+            host = root / "host.toml"
+            write_launcher_host_config(
+                host,
+                workspace=workspace,
+                repository=repository,
+                profile_file=profile,
+                logs_root=root / "logs",
+            )
+
+            for option, value in (
+                ("--workspace", str(root / "other")),
+                ("--host", "0.0.0.0"),
+                ("--port", "9999"),
+                ("--permission-mode", "safe"),
+                ("--shell-env-inherit", "none"),
+            ):
+                with self.subTest(option=option), self.assertRaisesRegex(
+                    ConfigError,
+                    "--host-config",
+                ):
+                    resolve_config(
+                        ["--host-config", str(host), option, value],
+                        environ={},
+                        repo_root=repository,
+                    )
+
+    def test_host_config_tunnel_secret_stays_out_of_mcp_child_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = make_repository(root)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            profile = root / "tunnel.yaml"
+            profile.write_text("config_version: 1\n", encoding="utf-8")
+            host = root / "host.toml"
+            write_launcher_host_config(
+                host,
+                workspace=workspace,
+                repository=repository,
+                profile_file=profile,
+                logs_root=root / "logs",
+            )
+            config = resolve_config(
+                ["--host-config", str(host)],
+                environ={
+                    "PATH": "bin",
+                    "HOST_TUNNEL_SECRET": "tunnel-only-secret",
+                },
+                repo_root=repository,
+            )
+
+            self.assertEqual(config.process_environment["HOST_TUNNEL_SECRET"], "tunnel-only-secret")
+            self.assertEqual(
+                scrub_mcp_environment(config.process_environment, config.tunnel.api_key_ref),
+                {"PATH": "bin"},
+            )
+
     def test_cli_overrides_process_environment_and_dotenv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
