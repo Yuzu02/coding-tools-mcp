@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coding_tools_mcp.project_catalog import build_project_catalog
-from coding_tools_mcp.skill_catalog import (
+from coding_tools_mcp.extensions.projects.project_catalog import build_project_catalog
+from coding_tools_mcp.extensions.projects.skill_catalog import (
     MAX_SKILL_BODY_BYTES,
     ProjectNotFoundError,
     SkillCatalog,

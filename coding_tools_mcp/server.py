@@ -102,8 +102,6 @@ from .protocol import (
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
-from .project_catalog import build_project_catalog
-from .skill_catalog import ProjectNotFoundError, SkillCatalog, SkillInvalidError, SkillNotFoundError
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
@@ -702,19 +700,6 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description="Search UTF-8 workspace files for text or regex matches.",
         read_only=True,
         idempotent=True,
-    ),
-    "list_skills": ToolSpec(
-        title="List skills",
-        description="List project-scoped skills and instruction files for the explicit workspace-relative workdir.",
-        read_only=True,
-        idempotent=True,
-    ),
-    "read_skill": ToolSpec(
-        title="Read skill",
-        description="Read the effective named skill for the explicit workspace-relative workdir.",
-        read_only=True,
-        idempotent=True,
-        error_status="failed",
     ),
     "apply_patch": ToolSpec(
         title="Apply patch",
@@ -1546,7 +1531,6 @@ class Runtime:
         self.project_context: ProjectContext = (
             project_context if project_context is not None else load_project_context(self.workspace.root)
         )
-        self.skill_catalog = SkillCatalog(build_project_catalog(self.workspace.root))
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self.extension_registry = extension_registry or builtin_extension_registry()
         self.extension_config = extension_config or RuntimeConfig.defaults(
@@ -2334,39 +2318,6 @@ class Runtime:
             "truncated": total > len(matches),
             "warnings": ["result limit reached"] if total > len(matches) else [],
         }
-
-    def list_skills(self, args: dict[str, Any]) -> dict[str, Any]:
-        workdir = self._resolve_skill_workdir(str(args.get("workdir", ".")))
-        try:
-            context = self.skill_catalog.list_for(workdir.path)
-        except ValueError as exc:
-            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
-        return {"ok": True, **context.payload()}
-
-    def read_skill(self, args: dict[str, Any]) -> dict[str, Any]:
-        workdir = self._resolve_skill_workdir(str(args.get("workdir", ".")))
-        skill = str(args.get("skill", ""))
-        if not skill:
-            raise ToolFailure("INVALID_ARGUMENT", "skill is required.", category="validation")
-        try:
-            loaded = self.skill_catalog.read(workdir.path, skill)
-        except ValueError as exc:
-            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
-        except ProjectNotFoundError as exc:
-            raise ToolFailure("PROJECT_NOT_FOUND", str(exc), category="not_found") from exc
-        except SkillNotFoundError as exc:
-            raise ToolFailure(
-                "SKILL_NOT_FOUND", str(exc), category="not_found", details={"available": list(exc.available)}
-            ) from exc
-        except SkillInvalidError as exc:
-            raise ToolFailure("SKILL_INVALID", str(exc), category="invalid_state") from exc
-        return {"ok": True, **loaded.payload()}
-
-    def _resolve_skill_workdir(self, raw_workdir: str) -> ResolvedPath:
-        resolved = self.resolve_existing(raw_workdir or ".")
-        if not resolved.path.is_dir():
-            raise ToolFailure("NOT_A_DIRECTORY", "workdir must be a directory.", category="validation")
-        return resolved
 
     def _search_text_with_rg(
         self,
@@ -5194,10 +5145,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "max_preview_bytes": {**integer, "minimum": 80, "maximum": 4096, "default": 512},
             },
             ["query"],
-        ),
-        "list_skills": object_schema({"workdir": {**string, "default": "."}}),
-        "read_skill": object_schema(
-            {"workdir": {**string, "default": "."}, "skill": {**string, "minLength": 1}}, ["skill"]
         ),
         "apply_patch": object_schema({"patch": {**string, "minLength": 1}, "dry_run": {**boolean, "default": False}}, ["patch"]),
         "exec_command": object_schema(

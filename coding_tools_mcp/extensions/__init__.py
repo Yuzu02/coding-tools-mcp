@@ -32,7 +32,9 @@ from .services import CORE_WORKSPACE, CapabilityKey, ServiceRegistry, ServiceReg
 def builtin_extension_registry() -> ExtensionRegistry:
     """Return the fork's statically registered built-in extensions."""
 
-    return ExtensionRegistry([], default_enabled=())
+    from .projects import ProjectsExtension
+
+    return ExtensionRegistry([ProjectsExtension], default_enabled=("projects",))
 
 
 __all__ = [

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coding_tools_mcp.server import Runtime, input_schemas
+from coding_tools_mcp.server import Runtime
 
 
 def write_skill(project: Path, name: str, description: str, body: str) -> Path:
@@ -46,14 +46,22 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
                 runtime.close()
 
     def test_skill_tool_schemas_use_explicit_workdir_and_no_source_path(self) -> None:
-        schemas = input_schemas()
+        temporary, root, _, _ = self.make_workspace()
+        with temporary:
+            runtime = Runtime(root)
+            try:
+                tools = {item["name"]: item for item in runtime.list_tools()["tools"]}
+                list_schema = tools["list_skills"]["inputSchema"]
+                read_schema = tools["read_skill"]["inputSchema"]
 
-        self.assertEqual(schemas["list_skills"].get("required", []), [])
-        self.assertEqual(schemas["list_skills"]["properties"]["workdir"]["default"], ".")
-        self.assertEqual(schemas["read_skill"]["required"], ["skill"])
-        self.assertEqual(schemas["read_skill"]["properties"]["workdir"]["default"], ".")
-        self.assertNotIn("path", schemas["read_skill"]["properties"])
-        self.assertNotIn("source", schemas["read_skill"]["properties"])
+                self.assertEqual(list_schema.get("required", []), [])
+                self.assertEqual(list_schema["properties"]["workdir"]["default"], ".")
+                self.assertEqual(read_schema["required"], ["skill"])
+                self.assertEqual(read_schema["properties"]["workdir"]["default"], ".")
+                self.assertNotIn("path", read_schema["properties"])
+                self.assertNotIn("source", read_schema["properties"])
+            finally:
+                runtime.close()
 
     def test_list_and_read_skill_return_project_scoped_payloads(self) -> None:
         temporary, root, sdk, nested = self.make_workspace()
@@ -63,10 +71,16 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
             write_skill(nested, "jsdocs", "Nested JSDoc guidance", "NESTED SKILL BODY")
             runtime = Runtime(root)
             try:
-                listed = runtime.list_skills({"workdir": "sdk/repos/effect"})
-                loaded = runtime.read_skill(
+                listed_result = runtime.call_tool("list_skills", {"workdir": "sdk/repos/effect"})
+                loaded_result = runtime.call_tool(
+                    "read_skill",
                     {"workdir": "sdk/repos/effect", "skill": "effect-ts"}
                 )
+                listed = listed_result["structuredContent"]
+                loaded = loaded_result["structuredContent"]
+
+                self.assertFalse(listed_result["isError"])
+                self.assertFalse(loaded_result["isError"])
 
                 self.assertEqual(listed["main_project"], "sdk")
                 self.assertEqual(listed["subprojects"], ["sdk/repos/effect"])

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from coding_tools_mcp.project_catalog import build_project_catalog
+from coding_tools_mcp.extensions.projects.project_catalog import build_project_catalog
 
 
 class ProjectCatalogTests(unittest.TestCase):

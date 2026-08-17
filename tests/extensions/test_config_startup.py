@@ -94,8 +94,21 @@ class ConfigStartupTests(unittest.TestCase):
         beta = fake_extension("beta")
         registry = ExtensionRegistry([alpha, beta], default_enabled=())
         with tempfile.TemporaryDirectory() as tmp:
+            synthetic_config = Path(tmp) / "synthetic.toml"
+            synthetic_config.write_text(
+                'config_version = 1\n[extensions]\nenabled = ["alpha"]\n',
+                encoding="utf-8",
+            )
             args = build_parser().parse_args(
-                ["--workspace", tmp, "--extensions", "beta", "--stdio"]
+                [
+                    "--workspace",
+                    tmp,
+                    "--config",
+                    str(synthetic_config),
+                    "--extensions",
+                    "beta",
+                    "--stdio",
+                ]
             )
             policy = runtime_policy_from_args(args)
 
