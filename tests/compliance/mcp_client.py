@@ -124,6 +124,7 @@ class MCPClient:
     workspace: Path
     url: str | None = None
     default_project_id: str | None = None
+    extra_args: list[str] | None = None
     process: subprocess.Popen[str] | None = None
     request_id: int = 0
     initialized: bool = False
@@ -137,7 +138,7 @@ class MCPClient:
 
         port = free_port()
         self.url = os.environ.get("CODING_TOOLS_MCP_URL", f"http://127.0.0.1:{port}/mcp")
-        cmd = default_server_command(self.workspace, port)
+        cmd = [*default_server_command(self.workspace, port), *(self.extra_args or [])]
         if not cmd or shutil.which(cmd[0]) is None:
             raise MCPTransportError(
                 "MCP server command is unavailable. Set CODING_TOOLS_MCP_SERVER_CMD "

@@ -28,7 +28,7 @@ from typing import Any
 
 from coding_tools_mcp.server import Runtime
 from tests.compliance.fixtures import FixtureWorkspace, workspace_from_fixture
-from tests.compliance.mcp_client import prepend_repo_pythonpath, safe_server_env
+from tests.compliance.mcp_client import PROJECT_SCOPED_TOOL_NAMES, prepend_repo_pythonpath, safe_server_env
 from tests.compliance.test_support import ComplianceTestCase, structured_payload
 
 
@@ -60,12 +60,26 @@ STDIO_READ_TIMEOUT_SECONDS = 15.0
 RACE_TIMEOUT_SECONDS = 60.0
 
 
+def project_arguments(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(arguments or {})
+    if name in PROJECT_SCOPED_TOOL_NAMES:
+        payload.setdefault("project_id", "default")
+    return payload
+
+
 def legacy_request(request_id: Any, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
+    body = dict(params or {})
+    if method == "tools/call" and isinstance(body.get("name"), str):
+        name = str(body["name"])
+        body["arguments"] = project_arguments(name, body.get("arguments"))
+    return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": body}
 
 
 def modern_request(request_id: Any, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     body = dict(params or {})
+    if method == "tools/call" and isinstance(body.get("name"), str):
+        name = str(body["name"])
+        body["arguments"] = project_arguments(name, body.get("arguments"))
     body["_meta"] = {
         META_PROTOCOL_VERSION: MODERN_PROTOCOL_VERSION,
         META_CLIENT_CAPABILITIES: {},
@@ -406,7 +420,11 @@ class WorkspaceRaceTests(unittest.TestCase):
 
             def patch(tag: str) -> dict[str, Any]:
                 return runtime.call_tool(
-                    "apply_patch", {"patch": update_patch("src/math.js", old_line, replacements[tag])}
+                    "apply_patch",
+                    project_arguments(
+                        "apply_patch",
+                        {"patch": update_patch("src/math.js", old_line, replacements[tag])},
+                    ),
                 )
 
             outcomes = run_in_barrier({tag: (lambda tag=tag: patch(tag)) for tag in replacements})
@@ -434,9 +452,15 @@ class WorkspaceRaceTests(unittest.TestCase):
             def first_command(tag: str) -> dict[str, Any]:
                 started = runtime.call_tool(
                     "exec_command",
-                    {"cmd": f"printf '{tag}'", "timeout_ms": 10000, "yield_time_ms": 5000},
+                    project_arguments(
+                        "exec_command",
+                        {"cmd": f"printf '{tag}'", "timeout_ms": 10000, "yield_time_ms": 5000},
+                    ),
                 )
-                environment = runtime.call_tool("check_exec_environment", {})
+                environment = runtime.call_tool(
+                    "check_exec_environment",
+                    project_arguments("check_exec_environment"),
+                )
                 return {"command": structured_payload(started), "environment": structured_payload(environment)}
 
             outcomes = run_in_barrier({tag: (lambda tag=tag: first_command(tag)) for tag in ("first", "second")})
@@ -451,15 +475,10 @@ class WorkspaceRaceTests(unittest.TestCase):
                 directories[1],
                 "the runtime tree must not move under a command that is already running",
             )
-            self.assertEqual(
-                directories[0],
-                {
-                    "runtime_dir": str(runtime.runtime_dir),
-                    "home": str(runtime.home_dir),
-                    "tmpdir": str(runtime.tmp_dir),
-                    "cache_dir": str(runtime.cache_dir),
-                },
-            )
+            project_runtime_dir = Path(directories[0]["runtime_dir"])
+            self.assertEqual(directories[0]["home"], str(project_runtime_dir / "home"))
+            self.assertEqual(directories[0]["tmpdir"], str(project_runtime_dir / "tmp"))
+            self.assertEqual(directories[0]["cache_dir"], str(project_runtime_dir / "cache"))
 
     def test_the_non_git_diff_fallback_survives_a_concurrent_patch(self) -> None:
         if shutil.which("git") is None:
@@ -468,15 +487,25 @@ class WorkspaceRaceTests(unittest.TestCase):
             # The fallback diffs against the baselines apply_patch records, so
             # there has to be one before the race is worth running.
             seed = runtime.call_tool(
-                "apply_patch", {"patch": update_patch("src/math.js", "  return a - b;", "  return a + b;")}
+                "apply_patch",
+                project_arguments(
+                    "apply_patch",
+                    {"patch": update_patch("src/math.js", "  return a - b;", "  return a + b;")},
+                ),
             )
             self.assertFalse(seed.get("isError"), seed)
 
             add = "*** Begin Patch\n*** Add File: notes/race.md\n+raced\n*** End Patch\n"
             outcomes = run_in_barrier(
                 {
-                    "patch": lambda: runtime.call_tool("apply_patch", {"patch": add}),
-                    "diff": lambda: runtime.call_tool("git_diff", {}),
+                    "patch": lambda: runtime.call_tool(
+                        "apply_patch",
+                        project_arguments("apply_patch", {"patch": add}),
+                    ),
+                    "diff": lambda: runtime.call_tool(
+                        "git_diff",
+                        project_arguments("git_diff"),
+                    ),
                 }
             )
 
@@ -520,7 +549,10 @@ async def sdk_smoke(transport: Any) -> dict[str, Any]:
 
     async with Client(transport, raise_exceptions=True) as client:
         listed = await client.list_tools()
-        result = await client.call_tool("check_exec_environment", {})
+        result = await client.call_tool(
+            "check_exec_environment",
+            project_arguments("check_exec_environment"),
+        )
         tools_capability = getattr(client.server_capabilities, "tools", None)
         return {
             "protocol_version": client.protocol_version,
@@ -549,7 +581,9 @@ def assert_sdk_smoke(test: unittest.TestCase, summary: dict[str, Any]) -> None:
     test.assertEqual(summary["protocol_version"], MODERN_PROTOCOL_VERSION, summary)
     test.assertEqual(summary["server_name"], "coding-tools-mcp", summary)
     test.assertEqual(summary["tools_capability"], False, summary)
-    test.assertIn("inside the configured workspace", summary["instructions"], summary)
+    test.assertIn("list_projects", summary["instructions"], summary)
+    test.assertIn("project_id", summary["instructions"], summary)
+    test.assertIn("No previous request selects a current project", summary["instructions"], summary)
     test.assertIn("check_exec_environment", summary["tools"])
     test.assertGreaterEqual(len(summary["tools"]), 18, summary)
     test.assertFalse(summary["is_error"], summary)
