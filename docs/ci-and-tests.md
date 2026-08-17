@@ -137,6 +137,28 @@ command without relying on POSIX `SIGKILL`, initializes Visual Studio with
 `vcvarsall.bat x64`, checks the narrow default `core` environment, and confirms
 that `--shell-env-inherit all` can compile and run a single-file `cl.exe` smoke.
 
+The same workflow has a separate Linux `semantic-integration` job. The default
+compliance job installs `.[dev]` and remains Serena-independent; the semantic
+job installs only `.[semantic]`, sets up Node 22 for TypeScript/SolidLSP, and
+runs both `test_semantic_serena_integration` and
+`test_semantic_mcp_integration`. This split is intentional: the dev extra
+validates MCP 2.x while exact-pinned `serena-agent==1.5.3` requires MCP 1.27.0,
+so the two extras are declared incompatible rather than weakening either
+dependency contract.
+
+Local equivalents are:
+
+```bash
+uv run --locked --extra dev python -m unittest discover -s tests/extensions -p 'test_semantic*.py' -v
+uv run --isolated --locked --extra semantic python -m unittest \
+  tests.extensions.test_semantic_serena_integration \
+  tests.extensions.test_semantic_mcp_integration -v
+```
+
+The first command exercises fake-backend/protocol/lifecycle/doc drift tests and
+may explicitly skip real Serena integration when that extra is absent. The
+second proves the exact Serena 1.5.3 adapter on Python and TypeScript fixtures.
+
 Manual SWE-bench workflow:
 
 ```text

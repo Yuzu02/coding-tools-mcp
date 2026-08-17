@@ -59,6 +59,35 @@ independently gated by installation capability. V1 tool decorators are
 deterministic and may add schema properties and wrap handlers, but may not
 replace existing schema properties.
 
+## Optional semantic tools
+
+The built-in `semantic` extension is disabled by default and depends on
+`projects`. When it is enabled and exact-pinned `serena-agent==1.5.3` is
+available at startup, the frozen catalog grows from 24 to 28 tools:
+
+- `list_symbols`: list normalized semantic symbols in one project file;
+- `find_symbol`: locate symbols by semantic name path, optionally returning a
+  bounded body;
+- `find_definition`: resolve a one-based project-relative source position;
+- `find_references`: return project-relative one-based references, optionally
+  including the declaration.
+
+All four are `readOnlyHint=true`, `destructiveHint=false`,
+`idempotentHint=true`, and `openWorldHint=false`. They always require an
+explicit `project_id`; there is no Serena activation/current-project API.
+
+If the semantic extension is enabled but Serena is absent or not version
+1.5.3, startup still succeeds without these four tools. If a worker later
+fails after a 28-tool catalog was composed, the catalog stays fixed and the
+semantic call returns a typed `SEMANTIC_*` failure. Filesystem, Git, and command
+tools remain usable.
+
+The adapter uses one lazy Serena worker per active project. Worker state lives
+under runtime state, never `.serena` in the project source tree. Workers are
+bounded by `max_semantic_projects`, reaped by idle timeout/LRU policy, and
+serialize same-project operations while allowing different projects to make
+semantic progress concurrently. Semantic source operations are read-only.
+
 ## Result envelope
 
 Every successful tool call has:

@@ -13,8 +13,8 @@ code named by TOML.
 
 ## Built-in extensions
 
-The current built-in extension is `projects`. It is enabled by default and owns
-the fork's explicit multi-project addressing and project/skill discovery:
+`projects` is enabled by default and owns the fork's explicit multi-project
+addressing and project/skill discovery:
 
 - the immutable configured project registry;
 - lazy project-local runtime/catalog/context state;
@@ -35,6 +35,23 @@ The default composition therefore exposes 24 tools. If `projects` is disabled
 before startup, its four contributed tools are absent and that process exposes
 the 20 mother-core tools, subject to the existing `view_image` capability gate.
 
+`semantic` is a second built-in extension, disabled by default. It requires
+`projects` and contributes `list_symbols`, `find_symbol`, `find_definition`,
+and `find_references` only when the exact supported Serena backend is available
+at startup. The supported backend is `serena-agent==1.5.3`; with both
+extensions enabled and Serena available the frozen catalog contains 28 tools.
+If Serena is unavailable or the version is unsupported, the process still
+starts and semantic metadata reports the backend unavailable, but the four
+semantic tools are absent for that process.
+
+Semantic backend state is isolated behind one lazy worker per active project.
+Workers are bounded by `max_semantic_projects`, idle/LRU reaped, and use a
+private JSON-lines protocol so Serena/SolidLSP types never enter the public MCP
+contract. Worker state, HOME, temp files, cache, and Serena metadata live under
+runtime state rather than inside project roots. Runtime worker failure does not
+remove tools from an already frozen catalog and does not affect filesystem,
+Git, or command capabilities.
+
 ## Configuration files
 
 The committed public configuration is `coding-tools.toml`:
@@ -47,6 +64,36 @@ enabled = ["projects"]
 
 [extensions.projects]
 ```
+
+To opt into semantic navigation, install its exact dependency set separately
+and enable it in configuration:
+
+```bash
+uv sync --extra semantic
+```
+
+```toml
+[extensions]
+enabled = ["projects", "semantic"]
+
+[extensions.semantic]
+backend = "serena"
+max_semantic_projects = 4
+semantic_idle_timeout_seconds = 900
+semantic_start_timeout_seconds = 60
+semantic_request_timeout_seconds = 60
+allow_dependency_install = false
+```
+
+The repository's `dev` and `semantic` extras are intentionally incompatible in
+one uv environment: development validation uses MCP 2.x while Serena 1.5.3
+requires MCP 1.27.0. Use `uv run --isolated --locked --extra semantic ...` for
+semantic integration and `uv run --locked --extra dev ...` for normal
+development gates. CI follows the same split.
+
+`allow_dependency_install = false` keeps SolidLSP dependency bootstrap offline.
+Set it to `true` only in host-local configuration when the operator explicitly
+wants missing `uvx`/npm language-server dependencies to be downloaded.
 
 Register actual project roots in the local overlay rather than the public file:
 

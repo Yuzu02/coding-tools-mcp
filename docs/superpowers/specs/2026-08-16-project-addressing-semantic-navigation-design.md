@@ -1,7 +1,7 @@
 # Project Addressing + Semantic Navigation Design
 
 **Date:** 2026-08-16
-**Status:** Phase 0 extension foundation and Phase A project addressing are implemented and verified; Phase B semantic navigation is pending
+**Status:** Phase 0 and Phase A are implemented/verified; Phase B semantic navigation is implemented, with final semantic acceptance in progress
 **Target:** fork-owned multi-project and semantic extensions composed through the internal ExtensionHost
 
 **Repository validation snapshot (2026-08-17, refreshed after Phase A implementation):**

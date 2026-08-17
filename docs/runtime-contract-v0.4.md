@@ -189,6 +189,80 @@ roots, duplicate canonical roots, contribution collisions, and invalid
 decorator composition fail startup before transport begins accepting normal
 requests.
 
+## Optional semantic composition
+
+Semantic navigation is an optional internal extension layered on top of the
+default `projects` extension. The contract states are explicit:
+
+- default projects-only composition: 24 tools
+- projects + semantic with Serena 1.5.3 available at startup: 28 tools
+- semantic enabled but Serena unavailable at startup: process starts without semantic tools
+- runtime semantic worker failure: semantic tools remain in the frozen catalog
+
+The four optional semantic tools are read-only and project-addressed. Their
+live schemas and annotations are drift-checked against these canonical lines:
+
+- `list_symbols` properties=`depth,max_results,path,project_id` required=`path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
+- `find_symbol` properties=`include_body,max_results,path,project_id,query` required=`project_id,query` readOnly=true destructive=false idempotent=true openWorld=false
+- `find_definition` properties=`column,line,path,project_id` required=`column,line,path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
+- `find_references` properties=`column,include_declaration,line,max_results,path,project_id` required=`column,line,path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
+
+Semantic failures use the normal MCP tool-error envelope with category
+`semantic`. The complete semantic error catalog is:
+
+- `SEMANTIC_BACKEND_UNAVAILABLE`
+- `SEMANTIC_PROJECT_START_FAILED`
+- `SEMANTIC_LANGUAGE_UNSUPPORTED`
+- `SEMANTIC_FILE_UNSUPPORTED`
+- `SEMANTIC_SYMBOL_NOT_FOUND`
+- `SEMANTIC_POSITION_INVALID`
+- `SEMANTIC_TIMEOUT`
+- `SEMANTIC_BACKEND_ERROR`
+
+The Serena 1.5.3 adapter uses one Serena worker per active project. Workers are
+created lazily, bounded by `max_semantic_projects`, reaped after
+`semantic_idle_timeout_seconds`, and evicted least-recently-used only while
+idle. Different projects may run semantic requests concurrently; one worker
+serializes its own requests. A runtime worker failure affects only the selected
+project's semantic worker and does not mutate the frozen MCP tool catalog.
+
+Serena/SolidLSP integration stays behind a private JSON-lines worker protocol.
+Worker HOME, temp files, caches, and Serena project state live under the
+project's runtime state directory rather than the source tree. Public semantic
+positions are one-based and returned paths are project-relative.
+
+Install the exact optional backend from a checkout with:
+
+```bash
+uv sync --extra semantic
+```
+
+Enable it explicitly:
+
+```toml
+[extensions]
+enabled = ["projects", "semantic"]
+
+[extensions.semantic]
+backend = "serena"
+max_semantic_projects = 4
+semantic_idle_timeout_seconds = 900
+semantic_start_timeout_seconds = 60
+semantic_request_timeout_seconds = 60
+allow_dependency_install = false
+```
+
+`allow_dependency_install = false` is the offline-safe default. Set it to
+`true` only in host-local configuration when SolidLSP may bootstrap missing
+`uvx`/npm language-server dependencies.
+
+For Serena 1.5.3, Coding Tools deliberately uses one private worker per active
+project instead of one shared Serena ProjectServer/current-project lifecycle.
+The per-project process boundary gives every request an explicit immutable
+project owner and avoids reintroducing Serena activation/session state into the
+stateless MCP contract. Semantic operations are read-only and never mutate
+source files.
+
 ## Stable tool inventory
 
 The following 24 sections are checked against the live default composed

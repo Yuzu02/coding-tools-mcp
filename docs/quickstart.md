@@ -68,6 +68,42 @@ coding-tools-mcp --stdio --workspace /path/to/repo --extensions ''
 See [extensions.md](extensions.md) for config file selection, lifecycle,
 capabilities, and the upstream synchronization boundary.
 
+### Optional semantic navigation
+
+Semantic navigation is intentionally outside the default install. From a
+checkout, install/run the exact semantic dependency set separately:
+
+```bash
+uv sync --extra semantic
+uv run --isolated --locked --extra semantic coding-tools-mcp --stdio --workspace /path/to/repo
+```
+
+Enable it alongside project addressing:
+
+```toml
+[extensions]
+enabled = ["projects", "semantic"]
+
+[extensions.semantic]
+backend = "serena"
+max_semantic_projects = 4
+semantic_idle_timeout_seconds = 900
+semantic_start_timeout_seconds = 60
+semantic_request_timeout_seconds = 60
+allow_dependency_install = false
+```
+
+The supported backend is exact-pinned `serena-agent==1.5.3`. The repository's
+`dev` extra uses MCP 2.x while Serena 1.5.3 requires MCP 1.27.0, so do not try
+to combine `dev` and `semantic` in one uv environment. Keep normal development
+gates on `--extra dev` and semantic integration on an isolated
+`--extra semantic` environment.
+
+With Serena available at startup, `projects + semantic` exposes 28 tools. If
+Serena is unavailable, the process still starts with the 24-tool
+projects-only catalog. Worker/runtime state is kept outside project roots, and
+semantic operations do not modify source files.
+
 ### Address projects explicitly
 
 With the default `projects` extension, there is no active/current project. Call

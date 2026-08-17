@@ -21,6 +21,11 @@ you build yourself all get the default 24 battle-tested tools, with explicit
 permission-mode gating. This fork composes its own internal extensions once at
 startup; the resulting catalog is then frozen for that process.
 
+An optional `semantic` extension adds four read-only symbol, definition, and
+reference tools through exact-pinned Serena 1.5.3. When explicitly enabled and
+available at startup the catalog contains 28 tools; the default remains
+Serena-independent at 24. See [internal extensions](docs/extensions.md).
+
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
 ## Why people use it
