@@ -1,5 +1,11 @@
 # Quickstart
 
+For a cloned checkout that should supervise both this MCP server and OpenAI
+`tunnel-client` on Windows, Linux, or macOS, use the
+[multiplatform services launcher](services-launcher.md). It supports `mise`
+tool provisioning, locked `uv` synchronization, existing or generated tunnel
+profiles, diagnostics, and a `systemd` deployment.
+
 Install the published command from PyPI:
 
 ```bash
@@ -43,6 +49,20 @@ When working from this checkout instead of a published package, start Streamable
 ```bash
 make start
 ```
+
+Or start the checkout plus an optional OpenAI tunnel through the canonical
+multiplatform supervisor:
+
+```bash
+mise trust
+mise install
+uv run --locked python scripts/start_services.py \
+  --workspace /path/to/repo \
+  --tunnel-profile coding-tools-dev
+```
+
+See [services-launcher.md](services-launcher.md) for profile-file, generated
+profile, `--no-sync`, diagnostics, and VPS service examples.
 
 Endpoint:
 

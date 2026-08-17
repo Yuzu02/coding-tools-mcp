@@ -1,0 +1,42 @@
+[tools]
+python = "3.14.7"
+uv = "0.12.3"
+node = "24.19.0"
+rust = "1.97.1"
+gh = "2.97.0"
+"github:openai/tunnel-client" = "0.0.11"
+
+[env]
+PYTHONUTF8 = "1"
+PYTHONDONTWRITEBYTECODE = "1"
+UV_MANAGED_PYTHON = "1"
+UV_PYTHON = "3.13.12"
+
+[tasks.setup]
+description = "Synchronize the locked runtime environment"
+run = "uv sync --locked"
+
+[tasks.setup-dev]
+description = "Synchronize the locked development environment"
+run = "uv sync --locked --extra dev"
+
+[tasks.start]
+description = "Start coding-tools-mcp and the optional OpenAI tunnel"
+run = "uv run --locked python scripts/start_services.py"
+
+[tasks.check-npm]
+description = "Test and dry-pack the npm launcher"
+dir = "npm/coding-tools-mcp"
+run = "npm test && npm pack --dry-run --json"
+
+[tasks.test-launcher]
+description = "Run the multiplatform services launcher tests"
+run = "uv run --locked python -m unittest tests.test_launcher_toolchain tests.test_launcher_config tests.test_launcher_diagnostics tests.test_launcher_tunnel tests.test_launcher_processes tests.test_launcher_integration -v"
+
+[tasks.verify]
+description = "Run static checks, the Python suite, and the npm launcher gate"
+run = [
+  "uv run --locked --extra dev python -m ruff check scripts tests",
+  "uv run --locked --extra dev python -m unittest discover -s tests -p \"test_*.py\"",
+  { task = "check-npm" },
+]
