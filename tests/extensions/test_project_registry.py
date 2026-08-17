@@ -10,7 +10,9 @@ from coding_tools_mcp.extensions.config import ConfigError
 from coding_tools_mcp.extensions.projects.registry import (
     ProjectRegistryError,
     build_project_registry,
+    build_project_registry_from_records,
 )
+from coding_tools_mcp.host_config import RegisteredProjectConfig
 from coding_tools_mcp.server import Runtime
 
 
@@ -66,6 +68,22 @@ class ProjectRegistryTests(unittest.TestCase):
         self.assertEqual(registry.ids(), ("frontend", "api"))
         self.assertEqual(registry.get("frontend").root, first.resolve())
         self.assertEqual(registry.get("api").root, second.resolve())
+
+    def test_snapshot_records_preserve_stable_id_in_registry(self) -> None:
+        root = self.project("nested/root-basename")
+
+        registry = build_project_registry_from_records(
+            (
+                RegisteredProjectConfig(
+                    project_id="stable-api-id",
+                    root=root,
+                ),
+            ),
+            validate_root=self.validate_root,
+        )
+
+        self.assertEqual(registry.ids(), ("stable-api-id",))
+        self.assertEqual(registry.get("stable-api-id").root, root.resolve())
 
     def test_empty_registry_synthesizes_default_project(self) -> None:
         registry = self.build({})

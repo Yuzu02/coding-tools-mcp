@@ -106,3 +106,4 @@ class WorkspaceRuntimeService(Protocol):
 
 CORE_WORKSPACE = CapabilityKey[WorkspaceAccess]("core.workspace")
 CORE_WORKSPACE_RUNTIMES = CapabilityKey[WorkspaceRuntimeService]("core.workspace_runtimes")
+CORE_CONFIG_SNAPSHOT = CapabilityKey["ConfigSnapshot"]("core.config_snapshot")

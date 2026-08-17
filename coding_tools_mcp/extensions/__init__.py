@@ -28,6 +28,7 @@ from .contributions import (
 from .host import ExtensionHost
 from .registry import ExtensionRegistry, ExtensionRegistryError
 from .services import (
+    CORE_CONFIG_SNAPSHOT,
     CORE_WORKSPACE,
     CORE_WORKSPACE_RUNTIMES,
     CapabilityKey,
@@ -54,6 +55,7 @@ def builtin_extension_registry() -> ExtensionRegistry:
 __all__ = [
     "ConfigError",
     "ConfigNode",
+    "CORE_CONFIG_SNAPSHOT",
     "CORE_WORKSPACE",
     "CORE_WORKSPACE_RUNTIMES",
     "CapabilityKey",

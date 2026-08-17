@@ -22,6 +22,12 @@ class RootValidator(Protocol):
         raise NotImplementedError
 
 
+class RegisteredProjectRecord(Protocol):
+    project_id: str
+    root: Path
+    allow_unavailable: bool
+
+
 def _contains(root: Path, path: Path) -> bool:
     try:
         path.relative_to(root)
@@ -145,6 +151,46 @@ class ProjectRegistry:
                 "Project path crosses a registered project boundary through a symlink.",
             )
         return physical_project, resolved
+
+
+def build_project_registry_from_records(
+    records: tuple[RegisteredProjectRecord, ...],
+    *,
+    validate_root: RootValidator,
+) -> ProjectRegistry:
+    projects: list[RegisteredProject] = []
+    roots: dict[Path, str] = {}
+    for record in records:
+        project_id = record.project_id
+        if PROJECT_ID_RE.fullmatch(project_id) is None:
+            raise ConfigError(f"invalid project_id: {project_id}")
+        try:
+            root = validate_root(
+                record.root,
+                require_exists=not record.allow_unavailable,
+            )
+        except ToolFailure as exc:
+            raise ConfigError(f"invalid root for project {project_id}: {exc.message}") from exc
+        available = root.is_dir()
+        if not available and not record.allow_unavailable:
+            raise ConfigError(f"project root does not exist: {project_id}: {root}")
+        previous = roots.get(root)
+        if previous is not None:
+            raise ConfigError(
+                f"projects {previous!r} and {project_id!r} resolve to the same canonical root: {root}"
+            )
+        roots[root] = project_id
+        warnings = () if available else ("configured project root is unavailable until restart",)
+        projects.append(
+            RegisteredProject(
+                project_id=project_id,
+                root=root,
+                markers=project_markers(root) if available else (),
+                available=available,
+                warnings=warnings,
+            )
+        )
+    return ProjectRegistry(tuple(projects))
 
 
 def build_project_registry(

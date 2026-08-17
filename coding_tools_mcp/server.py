@@ -37,6 +37,7 @@ from . import __version__
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
 from .extensions import (
+    CORE_CONFIG_SNAPSHOT,
     CORE_WORKSPACE,
     CORE_WORKSPACE_RUNTIMES,
     ComposedTool,
@@ -53,6 +54,7 @@ from .extensions import (
     load_runtime_config,
     parse_extension_list,
 )
+from .host_config import ConfigSnapshot, build_developer_snapshot
 from .landlock_exec import libc_syscall
 from .oauth import (
     OAUTH_CODE_TTL_SECONDS,
@@ -1650,6 +1652,7 @@ class Runtime:
         command_manager: WorkspaceCommandManager | None = None,
         extension_config: RuntimeConfig | None = None,
         extension_registry: ExtensionRegistry | None = None,
+        config_snapshot: ConfigSnapshot | None = None,
     ) -> None:
         bootstrap_workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
@@ -1713,6 +1716,10 @@ class Runtime:
         self.extension_config = extension_config or RuntimeConfig.defaults(
             enabled=self.extension_registry.default_enabled
         )
+        self.config_snapshot = config_snapshot or build_developer_snapshot(
+            runtime_config=self.extension_config,
+            bootstrap_workspace=bootstrap_workspace.root,
+        )
         self.workspace_runtime_service = CoreWorkspaceRuntimeService(self)
         try:
             self.extension_host = ExtensionHost.build(
@@ -1720,6 +1727,7 @@ class Runtime:
                 config=self.extension_config,
                 core_tools=core_tool_contracts(self),
                 seed_services=(
+                    (CORE_CONFIG_SNAPSHOT, self.config_snapshot),
                     (CORE_WORKSPACE, bootstrap_workspace),
                     (CORE_WORKSPACE_RUNTIMES, self.workspace_runtime_service),
                 ),
@@ -6369,6 +6377,10 @@ def build_runtime(
             else None
         ),
     )
+    snapshot = build_developer_snapshot(
+        runtime_config=config,
+        bootstrap_workspace=workspace,
+    )
     runtime = Runtime(
         workspace,
         enable_view_image=args.enable_view_image,
@@ -6383,6 +6395,7 @@ def build_runtime(
         command_manager=command_manager,
         extension_config=config,
         extension_registry=registry,
+        config_snapshot=snapshot,
     )
     if emit_warning and runtime.capabilities.skip_all_permissions:
         print(

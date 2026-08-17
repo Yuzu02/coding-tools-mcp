@@ -20,6 +20,7 @@ from coding_tools_mcp.extensions.projects import (
     PROJECT_RUNTIMES,
     ProjectsExtension,
 )
+from coding_tools_mcp.host_config import build_developer_snapshot
 from coding_tools_mcp.server import Runtime
 
 
@@ -131,6 +132,58 @@ class ProjectsExtensionTests(unittest.TestCase):
                 registry = services.require(PROJECT_REGISTRY)
                 self.assertEqual(registry.ids(), ("alpha",))
                 self.assertEqual(registry.get("alpha").root, alpha.resolve())
+            finally:
+                runtime.close()
+
+    def test_runtime_snapshot_project_identity_wins_over_legacy_extension_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap = root / "bootstrap"
+            selected = root / "root-basename"
+            legacy = root / "legacy"
+            bootstrap.mkdir()
+            selected.mkdir()
+            legacy.mkdir()
+            (bootstrap / "package.json").write_text("{}", encoding="utf-8")
+            (selected / "pyproject.toml").write_text("", encoding="utf-8")
+            (legacy / "pyproject.toml").write_text("", encoding="utf-8")
+
+            snapshot_config = RuntimeConfig.defaults(
+                enabled=("projects",),
+                settings={
+                    "projects": {
+                        "registry": {
+                            "stable-snapshot-id": {"root": str(selected)},
+                        }
+                    }
+                },
+            )
+            snapshot = build_developer_snapshot(
+                runtime_config=snapshot_config,
+                bootstrap_workspace=bootstrap,
+            )
+            legacy_config = RuntimeConfig.defaults(
+                enabled=("projects",),
+                settings={
+                    "projects": {
+                        "registry": {
+                            "legacy-id": {"root": str(legacy)},
+                        }
+                    }
+                },
+            )
+
+            runtime = Runtime(
+                bootstrap,
+                extension_config=legacy_config,
+                config_snapshot=snapshot,
+            )
+            try:
+                payload = runtime.call_tool("list_projects", {})["structuredContent"]
+                self.assertEqual(
+                    [(item["id"], item["root"]) for item in payload["projects"]],
+                    [("stable-snapshot-id", str(selected.resolve()))],
+                )
             finally:
                 runtime.close()
 

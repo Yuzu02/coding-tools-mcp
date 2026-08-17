@@ -9,9 +9,22 @@ from coding_tools_mcp.errors import ToolFailure
 from ..api import ExtensionContext, ExtensionManifest
 from ..config import map_of, scalar, table
 from ..contributions import SchemaPatch, ToolAnnotations, ToolContribution, ToolDecorator, ToolHandler
-from ..services import CORE_WORKSPACE, CORE_WORKSPACE_RUNTIMES, CapabilityKey
+from ..services import (
+    CORE_CONFIG_SNAPSHOT,
+    CORE_WORKSPACE,
+    CORE_WORKSPACE_RUNTIMES,
+    CapabilityKey,
+    ServiceRegistryError,
+)
 from .project_catalog import ProjectCatalog, build_project_catalog
-from .registry import PROJECT_ID_RE, PROJECT_REGISTRY, ProjectRegistry, ProjectRegistryError, build_project_registry
+from .registry import (
+    PROJECT_ID_RE,
+    PROJECT_REGISTRY,
+    ProjectRegistry,
+    ProjectRegistryError,
+    build_project_registry,
+    build_project_registry_from_records,
+)
 from .runtime import PROJECT_RUNTIMES, ProjectRuntimeManager
 from .skill_catalog import ProjectNotFoundError, SkillInvalidError, SkillNotFoundError
 
@@ -67,11 +80,19 @@ class ProjectsExtension:
     def register(self, context: ExtensionContext) -> None:
         workspace = context.services.require(CORE_WORKSPACE)
         workspace_runtimes = context.services.require(CORE_WORKSPACE_RUNTIMES)
-        registry = build_project_registry(
-            self._config,
-            fallback_root=workspace.root,
-            validate_root=workspace_runtimes.validate_root,
-        )
+        try:
+            snapshot = context.services.require(CORE_CONFIG_SNAPSHOT)
+        except ServiceRegistryError:
+            registry = build_project_registry(
+                self._config,
+                fallback_root=workspace.root,
+                validate_root=workspace_runtimes.validate_root,
+            )
+        else:
+            registry = build_project_registry_from_records(
+                snapshot.registered_projects,
+                validate_root=workspace_runtimes.validate_root,
+            )
         runtimes = ProjectRuntimeManager(registry, workspace_runtimes)
         catalog = build_project_catalog(workspace.root)
         self._registry = registry

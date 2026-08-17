@@ -520,7 +520,7 @@ def _registered_projects_from_host(config: HostConfig) -> tuple[RegisteredProjec
                 project_config=project_config,
             )
         )
-    return tuple(sorted(projects, key=lambda item: item.project_id))
+    return tuple(projects)
 
 
 def resolve_project_config_path(
@@ -714,7 +714,7 @@ def build_host_snapshot(config: HostConfig) -> ConfigSnapshot:
             "project": PROJECT_CONFIG_VERSION,
         }
     )
-    projects = MappingProxyType(dict(sorted(effective_projects.items())))
+    projects = MappingProxyType(dict(effective_projects))
     fingerprint_payload = {
         "resolution_mode": "host",
         "host": _host_fingerprint_payload(config),
@@ -725,7 +725,7 @@ def build_host_snapshot(config: HostConfig) -> ConfigSnapshot:
                 "allow_unavailable": project.allow_unavailable,
                 "project_config": project.project_config,
             }
-            for project in registered_projects
+            for project in sorted(registered_projects, key=lambda item: item.project_id)
         ],
         "projects": {
             project_id: {
@@ -760,4 +760,160 @@ def build_host_snapshot(config: HostConfig) -> ConfigSnapshot:
         warnings=tuple(warnings),
         secret_references=MappingProxyType(dict(secret_references)),
         fingerprint=fingerprint,
+    )
+
+
+def _registered_projects_from_runtime_config(
+    runtime_config: RuntimeConfig,
+    *,
+    bootstrap_workspace: Path,
+) -> tuple[RegisteredProjectConfig, ...]:
+    raw_registry = runtime_config.extension("projects").get("registry")
+    if raw_registry is None or raw_registry == {}:
+        return (
+            RegisteredProjectConfig(
+                project_id="default",
+                root=bootstrap_workspace.expanduser().resolve(strict=False),
+            ),
+        )
+    if not isinstance(raw_registry, Mapping):
+        raise ConfigError("extensions.projects.registry must be a table")
+
+    records: list[RegisteredProjectConfig] = []
+    roots: dict[Path, str] = {}
+    for raw_project_id, raw_settings in raw_registry.items():
+        project_id = str(raw_project_id)
+        if PROJECT_ID_RE.fullmatch(project_id) is None:
+            raise ConfigError(f"invalid project_id: {project_id}")
+        if not isinstance(raw_settings, Mapping):
+            raise ConfigError(f"extensions.projects.registry.{project_id} must be a table")
+        raw_root = raw_settings.get("root")
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            raise ConfigError(f"extensions.projects.registry.{project_id}.root is required")
+        root = Path(raw_root).expanduser().resolve(strict=False)
+        allow_unavailable = raw_settings.get("allow_unavailable", False)
+        if type(allow_unavailable) is not bool:
+            raise ConfigError(
+                f"extensions.projects.registry.{project_id}.allow_unavailable must be boolean"
+            )
+        previous = roots.get(root)
+        if previous is not None:
+            raise ConfigError(
+                f"projects {previous!r} and {project_id!r} resolve to the same canonical root: {root}"
+            )
+        roots[root] = project_id
+        raw_project_config = raw_settings.get("project_config")
+        project_config: str | None = None
+        if raw_project_config is not None:
+            if not isinstance(raw_project_config, str) or not raw_project_config.strip():
+                raise ConfigError(
+                    f"extensions.projects.registry.{project_id}.project_config must be a non-empty path"
+                )
+            project_config = raw_project_config
+        records.append(
+            RegisteredProjectConfig(
+                project_id=project_id,
+                root=root,
+                allow_unavailable=allow_unavailable,
+                project_config=project_config,
+            )
+        )
+    return tuple(records)
+
+
+def build_developer_snapshot(
+    *,
+    runtime_config: RuntimeConfig,
+    bootstrap_workspace: Path,
+) -> ConfigSnapshot:
+    registered_projects = _registered_projects_from_runtime_config(
+        runtime_config,
+        bootstrap_workspace=bootstrap_workspace,
+    )
+    registered_roots = tuple(project.root for project in registered_projects)
+    host_capabilities = frozenset(
+        capability
+        for capability in PROJECT_REDUCIBLE_CAPABILITIES
+        if capability in runtime_config.enabled_extensions
+    )
+    effective_projects: dict[str, EffectiveProjectConfig] = {}
+    warnings: list[str] = []
+    for project in registered_projects:
+        if not project.root.is_dir() and project.allow_unavailable:
+            if project.project_config is not None and Path(project.project_config).is_absolute():
+                raise ConfigError(f"project {project.project_id} project_config must be relative")
+            warnings.append(f"project {project.project_id} root is unavailable until restart")
+            effective_projects[project.project_id] = _effective_project_config(
+                project,
+                project_config=None,
+                host_capabilities=host_capabilities,
+            )
+            continue
+        config_path = resolve_project_config_path(project, registered_roots=registered_roots)
+        project_config = None if config_path is None else _load_project_config(config_path)
+        effective_projects[project.project_id] = _effective_project_config(
+            project,
+            project_config=project_config,
+            host_capabilities=host_capabilities,
+        )
+
+    projects = MappingProxyType(dict(effective_projects))
+    config_versions = MappingProxyType(
+        {
+            "developer": runtime_config.config_version,
+            "project": PROJECT_CONFIG_VERSION,
+        }
+    )
+    fingerprint_payload = {
+        "resolution_mode": "developer",
+        "bootstrap_workspace": str(bootstrap_workspace.expanduser().resolve(strict=False)),
+        "runtime_config": {
+            "config_version": runtime_config.config_version,
+            "enabled_extensions": list(runtime_config.enabled_extensions),
+            "extension_settings": _jsonable(runtime_config.extension_settings),
+        },
+        "registered_projects": [
+            {
+                "project_id": project.project_id,
+                "root": str(project.root),
+                "allow_unavailable": project.allow_unavailable,
+                "project_config": project.project_config,
+            }
+            for project in sorted(registered_projects, key=lambda item: item.project_id)
+        ],
+        "projects": {
+            project_id: {
+                "root": str(effective.root),
+                "allow_unavailable": effective.allow_unavailable,
+                "enabled_capabilities": sorted(effective.enabled_capabilities),
+                "disabled_capabilities": list(effective.disabled_capabilities),
+                "project_config": None
+                if effective.source is None
+                else _jsonable(read_toml(effective.source)),
+            }
+            for project_id, effective in projects.items()
+        },
+        "config_versions": dict(config_versions),
+    }
+    encoded = json.dumps(
+        fingerprint_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    sources = tuple(
+        ConfigSource(role=f"developer-{index}", path=path)
+        for index, path in enumerate(runtime_config.sources, start=1)
+    )
+    return ConfigSnapshot(
+        resolution_mode="developer",
+        sources=sources,
+        host_config=None,
+        runtime_config=runtime_config,
+        registered_projects=registered_projects,
+        projects=projects,
+        config_versions=config_versions,
+        warnings=tuple(warnings),
+        secret_references=MappingProxyType({}),
+        fingerprint=hashlib.sha256(encoded).hexdigest(),
     )
