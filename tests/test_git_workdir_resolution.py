@@ -188,7 +188,7 @@ class GitWorkdirResolutionTests(unittest.TestCase):
         temporary, workspace, alpha, beta = self.make_workspace()
         with temporary:
             (alpha / "tracked.txt").write_text("alpha changed\ntwo\n", encoding="utf-8")
-            with StdioMCPClient(workspace) as client:
+            with StdioMCPClient(workspace, default_project_id="default") as client:
                 alpha_status = structured_payload(
                     client.call_tool("git_status", {"workdir": "alpha"})
                 )

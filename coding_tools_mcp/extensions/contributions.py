@@ -44,6 +44,7 @@ class ToolDecorator:
     targets: tuple[str, ...]
     schema_patch: SchemaPatch
     wrap_handler: HandlerWrapper
+    optional_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,10 @@ def compose_tools(
         for target in decorator.targets:
             if target not in tools:
                 raise ContributionError(f"unknown decorator target: {target}")
+            by_target.setdefault(target, []).append((extension, decorator))
+        for target in decorator.optional_targets:
+            if target in decorator.targets or target not in tools:
+                continue
             by_target.setdefault(target, []).append((extension, decorator))
 
     for target, entries in by_target.items():

@@ -16,7 +16,7 @@ class ComplianceTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.workspace_cm = workspace_from_fixture(self.fixture_name)
         self.workspace: FixtureWorkspace = self.workspace_cm.__enter__()
-        self.client_cm = MCPClient(self.workspace.root)
+        self.client_cm = MCPClient(self.workspace.root, default_project_id="default")
         self.client = self.client_cm.__enter__()
 
     def tearDown(self) -> None:
@@ -28,7 +28,7 @@ class ComplianceTestCase(unittest.TestCase):
     @contextmanager
     def session_for_fixture(self, fixture_name: str) -> Iterator[tuple[FixtureWorkspace, MCPClient]]:
         with workspace_from_fixture(fixture_name) as workspace:
-            with MCPClient(workspace.root) as client:
+            with MCPClient(workspace.root, default_project_id="default") as client:
                 yield workspace, client
 
     def assert_tool_success(self, result: dict[str, Any]) -> dict[str, Any]:

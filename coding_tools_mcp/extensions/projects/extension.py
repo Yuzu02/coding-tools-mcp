@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -7,7 +8,7 @@ from coding_tools_mcp.errors import ToolFailure
 
 from ..api import ExtensionContext, ExtensionManifest
 from ..config import map_of, scalar, table
-from ..contributions import ToolAnnotations, ToolContribution
+from ..contributions import SchemaPatch, ToolAnnotations, ToolContribution, ToolDecorator, ToolHandler
 from ..services import CORE_WORKSPACE, CORE_WORKSPACE_RUNTIMES, CapabilityKey
 from .project_catalog import ProjectCatalog, build_project_catalog
 from .registry import PROJECT_ID_RE, PROJECT_REGISTRY, ProjectRegistry, ProjectRegistryError, build_project_registry
@@ -16,6 +17,24 @@ from .skill_catalog import ProjectNotFoundError, SkillInvalidError, SkillNotFoun
 
 
 PROJECT_CATALOG = CapabilityKey[ProjectCatalog]("projects.catalog")
+PROJECT_SCOPED_CORE_TOOLS = (
+    "check_exec_environment",
+    "read_file",
+    "list_dir",
+    "list_files",
+    "search_text",
+    "apply_patch",
+    "exec_command",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+)
+OPTIONAL_PROJECT_SCOPED_CORE_TOOLS = ("view_image",)
+PROJECT_SCOPED_PUBLIC_TOOLS = frozenset(
+    (*PROJECT_SCOPED_CORE_TOOLS, *OPTIONAL_PROJECT_SCOPED_CORE_TOOLS, "list_skills", "read_skill")
+)
 
 
 class ProjectsExtension:
@@ -63,6 +82,11 @@ class ProjectsExtension:
         context.add_tool(self._resolve_project_tool())
         context.add_tool(self._list_skills_tool())
         context.add_tool(self._read_skill_tool())
+        context.add_decorator(self._project_routing_decorator())
+        context.add_decorator(self._command_id_routing_decorator())
+        context.add_decorator(self._read_output_routing_decorator())
+        context.add_decorator(self._get_command_routing_decorator())
+        context.add_decorator(self._list_commands_routing_decorator())
 
     def start(self) -> None:
         return None
@@ -160,6 +184,257 @@ class ProjectsExtension:
             error_status="failed",
             text_renderer=self._render_read_skill,
         )
+
+    def _project_routing_decorator(self) -> ToolDecorator:
+        return ToolDecorator(
+            targets=PROJECT_SCOPED_CORE_TOOLS,
+            optional_targets=OPTIONAL_PROJECT_SCOPED_CORE_TOOLS,
+            schema_patch=SchemaPatch(
+                properties={
+                    "project_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": PROJECT_ID_RE.pattern,
+                    }
+                },
+                required=("project_id",),
+            ),
+            wrap_handler=self._wrap_project_scoped_core_handler,
+        )
+
+    def _command_id_routing_decorator(self) -> ToolDecorator:
+        return ToolDecorator(
+            targets=("write_stdin", "kill_command"),
+            schema_patch=SchemaPatch(),
+            wrap_handler=self._wrap_command_id_handler,
+        )
+
+    def _read_output_routing_decorator(self) -> ToolDecorator:
+        return ToolDecorator(
+            targets=("read_output",),
+            schema_patch=SchemaPatch(),
+            wrap_handler=self._wrap_read_output_handler,
+        )
+
+    def _get_command_routing_decorator(self) -> ToolDecorator:
+        return ToolDecorator(
+            targets=("get_command",),
+            schema_patch=SchemaPatch(properties={"project_id": self._project_id_schema()}),
+            wrap_handler=self._wrap_get_command_handler,
+        )
+
+    def _list_commands_routing_decorator(self) -> ToolDecorator:
+        return ToolDecorator(
+            targets=("list_commands",),
+            schema_patch=SchemaPatch(properties={"project_id": self._project_id_schema()}),
+            wrap_handler=self._wrap_list_commands_handler,
+        )
+
+    @staticmethod
+    def _project_id_schema() -> dict[str, Any]:
+        return {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": PROJECT_ID_RE.pattern,
+        }
+
+    def _wrap_project_scoped_core_handler(self, next_handler: ToolHandler) -> ToolHandler:
+        def routed(args: dict[str, Any]) -> dict[str, Any]:
+            project_id = str(args.get("project_id", ""))
+            clean = dict(args)
+            clean.pop("project_id", None)
+            payload = self._require_runtimes().invoke(project_id, next_handler, clean)
+            return self._restore_project_addressing(payload, project_id)
+
+        return routed
+
+    def _wrap_command_id_handler(self, next_handler: ToolHandler) -> ToolHandler:
+        def routed(args: dict[str, Any]) -> dict[str, Any]:
+            command_id = str(args.get("command_id", ""))
+            runtimes = self._require_runtimes()
+            owner = runtimes.command_owners.owner(command_id)
+            payload = runtimes.invoke(owner, next_handler, dict(args))
+            return self._restore_project_addressing(payload, owner)
+
+        return routed
+
+    def _wrap_read_output_handler(self, next_handler: ToolHandler) -> ToolHandler:
+        def routed(args: dict[str, Any]) -> dict[str, Any]:
+            output_ref = str(args.get("output_ref", ""))
+            match = re.fullmatch(r"command:([^:]+):(stdout|stderr)", output_ref)
+            if match is None:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "output_ref must look like command:<id>:stdout or command:<id>:stderr.",
+                    category="validation",
+                )
+            runtimes = self._require_runtimes()
+            owner = runtimes.command_owners.owner(match.group(1))
+            payload = runtimes.invoke(owner, next_handler, dict(args))
+            return self._restore_project_addressing(payload, owner)
+
+        return routed
+
+    def _wrap_get_command_handler(self, next_handler: ToolHandler) -> ToolHandler:
+        def routed(args: dict[str, Any]) -> dict[str, Any]:
+            clean = dict(args)
+            supplied_project = clean.pop("project_id", None)
+            command_id = clean.get("command_id")
+            client_request_id = clean.get("client_request_id")
+            if (command_id is None) == (client_request_id is None):
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "Provide exactly one of command_id or client_request_id.",
+                    category="validation",
+                )
+            runtimes = self._require_runtimes()
+            if command_id is not None:
+                owner = runtimes.command_owners.owner(str(command_id))
+                if supplied_project is not None and str(supplied_project) != owner:
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        "project_id does not own the requested command_id.",
+                        category="validation",
+                    )
+                payload = runtimes.invoke(owner, next_handler, clean)
+                return self._restore_project_addressing(payload, owner)
+
+            if supplied_project is None or not str(supplied_project):
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "project_id is required with client_request_id.",
+                    category="validation",
+                )
+            project_id = str(supplied_project)
+            self._require_registry_project(project_id)
+            runtime = runtimes.active_for(project_id)
+            if runtime is None:
+                raise ToolFailure(
+                    "COMMAND_NOT_FOUND",
+                    "No command is retained for client_request_id in the selected project.",
+                    category="not_found",
+                )
+            payload = runtimes.workspace_runtimes.invoke(runtime.workspace, next_handler, clean)
+            return self._restore_project_addressing(payload, project_id)
+
+        return routed
+
+    def _wrap_list_commands_handler(self, next_handler: ToolHandler) -> ToolHandler:
+        def routed(args: dict[str, Any]) -> dict[str, Any]:
+            clean = dict(args)
+            supplied_project = clean.pop("project_id", None)
+            client_request_id = clean.get("client_request_id")
+            runtimes = self._require_runtimes()
+            if client_request_id is not None and (supplied_project is None or not str(supplied_project)):
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "project_id is required with client_request_id.",
+                    category="validation",
+                )
+
+            if supplied_project is not None:
+                project_id = str(supplied_project)
+                self._require_registry_project(project_id)
+                runtime = runtimes.active_for(project_id)
+                if runtime is None:
+                    if client_request_id is not None:
+                        raise ToolFailure(
+                            "COMMAND_NOT_FOUND",
+                            "No command is retained for client_request_id in the selected project.",
+                            category="not_found",
+                        )
+                    return self._empty_command_list(project_id=project_id)
+                payload = runtimes.workspace_runtimes.invoke(runtime.workspace, next_handler, clean)
+                return self._annotate_command_list(payload, project_id)
+
+            status_filter = str(clean.get("status", "all"))
+            limit = max(1, min(int(clean.get("limit", 20)), 100))
+            commands: list[dict[str, Any]] = []
+            for runtime in runtimes.active():
+                per_project = runtimes.workspace_runtimes.invoke(
+                    runtime.workspace,
+                    next_handler,
+                    {"status": "all", "limit": 100},
+                )
+                for raw_item in per_project.get("commands", []):
+                    if isinstance(raw_item, dict):
+                        item = dict(raw_item)
+                        item["project_id"] = runtime.project.project_id
+                        commands.append(item)
+            if status_filter == "running":
+                commands = [item for item in commands if item.get("status") == "running"]
+            elif status_filter == "completed":
+                commands = [item for item in commands if item.get("status") != "running"]
+            commands.sort(key=lambda item: str(item.get("started_at", "")), reverse=True)
+            total = len(commands)
+            return {
+                "commands": commands[:limit],
+                "count": min(total, limit),
+                "total": total,
+                "truncated": total > limit,
+                "pending": False,
+                "ok": True,
+                "warnings": [],
+            }
+
+        return routed
+
+    def _require_registry_project(self, project_id: str) -> None:
+        try:
+            self._require_registry().require_available(project_id)
+        except ProjectRegistryError as exc:
+            self._raise_registry_failure(exc)
+
+    @staticmethod
+    def _empty_command_list(*, project_id: str) -> dict[str, Any]:
+        return {
+            "commands": [],
+            "count": 0,
+            "total": 0,
+            "truncated": False,
+            "pending": False,
+            "project_id": project_id,
+            "ok": True,
+            "warnings": [],
+        }
+
+    @staticmethod
+    def _annotate_command_list(payload: dict[str, Any], project_id: str) -> dict[str, Any]:
+        annotated = dict(payload)
+        raw_commands = annotated.get("commands")
+        if isinstance(raw_commands, list):
+            annotated["commands"] = [
+                {**item, "project_id": project_id} if isinstance(item, dict) else item
+                for item in raw_commands
+            ]
+        annotated["project_id"] = project_id
+        return annotated
+
+    @staticmethod
+    def _restore_project_addressing(payload: dict[str, Any], project_id: str) -> dict[str, Any]:
+        restored = dict(payload)
+        restored["project_id"] = project_id
+
+        def restore_action(raw_action: object) -> object:
+            if not isinstance(raw_action, dict):
+                return raw_action
+            action = dict(raw_action)
+            tool = action.get("tool")
+            raw_arguments = action.get("arguments")
+            if tool in PROJECT_SCOPED_PUBLIC_TOOLS and isinstance(raw_arguments, dict):
+                arguments = dict(raw_arguments)
+                arguments["project_id"] = project_id
+                action["arguments"] = arguments
+            return action
+
+        if "next_action" in restored:
+            restored["next_action"] = restore_action(restored["next_action"])
+        raw_actions = restored.get("next_actions")
+        if isinstance(raw_actions, list):
+            restored["next_actions"] = [restore_action(action) for action in raw_actions]
+        return restored
 
     def _require_registry(self) -> ProjectRegistry:
         if self._registry is None:

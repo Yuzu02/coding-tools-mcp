@@ -314,7 +314,11 @@ class SecurityComplianceTests(ComplianceTestCase):
 
     def test_concurrent_read_only_tool_calls_are_stable(self) -> None:
         def call(index: int) -> str:
-            with MCPClient(self.workspace.root, url=self.client.url) as client:
+            with MCPClient(
+                self.workspace.root,
+                url=self.client.url,
+                default_project_id="default",
+            ) as client:
                 if index % 2 == 0:
                     result = client.call_tool("read_file", {"path": "inside.txt"})
                 else:

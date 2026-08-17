@@ -1447,12 +1447,23 @@ class WorkspaceCommandManager:
         with self._retention_stats_lock:
             return dict(self._retention_stats)
 
+    def notify_command_registered(self, command_id: str) -> None:
+        callback = self.on_command_registered
+        if callback is not None:
+            callback(command_id)
+
+    def notify_command_removed(self, command_id: str) -> None:
+        callback = self.on_command_removed
+        if callback is not None:
+            callback(command_id)
+
     def close(self) -> None:
         with self.lock:
             if self.closed:
                 return
             self.closed = True
             commands = list(self.commands.values())
+            command_ids = set(self.commands) | set(self.output_commands)
             bindings = list(self.client_requests.values())
             self.commands.clear()
             self.output_commands.clear()
@@ -1465,6 +1476,8 @@ class WorkspaceCommandManager:
             if command.process.poll() is None:
                 terminate_process_group(command.process, signal.SIGTERM)
             command.drain_readers()
+        for command_id in command_ids:
+            self.notify_command_removed(command_id)
         shutil.rmtree(self.runtime_dir, ignore_errors=True)
         if self.fallback_runtime_dir is not None:
             shutil.rmtree(self.fallback_runtime_dir, ignore_errors=True)
@@ -2982,6 +2995,7 @@ class Runtime:
                     registered = True
             if not registered:
                 raise ToolFailure("COMMAND_CLOSED", "Runtime closed while the command was starting.", category="runtime")
+            self.command_manager.notify_command_registered(command.command_id)
             if client_request_id is not None and client_binding is not None:
                 self.command_manager.publish_client_request(client_request_id, client_binding, command.command_id)
                 binding_published = True
@@ -3376,6 +3390,7 @@ class Runtime:
         ):
             oldest = self.output_commands.pop(next(iter(self.output_commands)))
             self.command_manager.remove_command_binding_locked(oldest.command_id)
+            self.command_manager.notify_command_removed(oldest.command_id)
             retained -= oldest.retained_bytes
 
     def _complete_command(self, command: CommandRun) -> None:
@@ -3403,6 +3418,7 @@ class Runtime:
             for command_id in expired:
                 self.output_commands.pop(command_id, None)
                 self.command_manager.remove_command_binding_locked(command_id)
+                self.command_manager.notify_command_removed(command_id)
             self._evict_retained_locked()
 
     def _get_output_command(self, command_id: str) -> CommandRun:

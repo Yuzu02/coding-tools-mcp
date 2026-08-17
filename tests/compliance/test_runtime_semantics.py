@@ -16,7 +16,7 @@ class RuntimeSemanticsTests(ComplianceTestCase):
         for case in vectors["apply_patch"]:
             with self.subTest(case=case["name"]):
                 with workspace_from_fixture("tiny-js-project") as workspace:
-                    with MCPClient(workspace.root) as client:
+                    with MCPClient(workspace.root, default_project_id="default") as client:
                         try:
                             result = client.call_tool("apply_patch", {"patch": case["patch"]})
                         except MCPError:
@@ -51,7 +51,14 @@ class RuntimeSemanticsTests(ComplianceTestCase):
             client.call_tool("write_stdin", {"command_id": command_id, "chars": "exit\n"})
 
     def test_missing_and_closed_commands_return_structured_errors(self) -> None:
-        self.assert_denied_or_permission_required("write_stdin", {"command_id": "missing-command", "chars": "hello\n"})
+        missing = self.client.call_tool(
+            "write_stdin",
+            {"command_id": "missing-command", "chars": "hello\n"},
+        )
+        self.assertTrue(missing.get("isError"))
+        payload = missing.get("structuredContent")
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["error"]["code"], "COMMAND_NOT_FOUND")
         with self.session_for_fixture("long-running-project") as (_workspace, client):
             started = client.call_tool(
                 "exec_command",

@@ -21,6 +21,25 @@ from typing import Any
 
 PROTOCOL_VERSION = "2025-11-25"
 ROOT = Path(__file__).resolve().parents[2]
+PROJECT_SCOPED_TOOL_NAMES = frozenset(
+    {
+        "check_exec_environment",
+        "read_file",
+        "list_dir",
+        "list_files",
+        "search_text",
+        "list_skills",
+        "read_skill",
+        "apply_patch",
+        "exec_command",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "git_blame",
+        "view_image",
+    }
+)
 
 REQUIRED_TOOLS = (
     "server_info",
@@ -104,6 +123,7 @@ def default_server_command(workspace: Path, port: int) -> list[str]:
 class MCPClient:
     workspace: Path
     url: str | None = None
+    default_project_id: str | None = None
     process: subprocess.Popen[str] | None = None
     request_id: int = 0
     initialized: bool = False
@@ -222,7 +242,10 @@ class MCPClient:
         return tools
 
     def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self.rpc("tools/call", {"name": name, "arguments": arguments or {}})
+        payload = dict(arguments or {})
+        if self.default_project_id is not None and name in PROJECT_SCOPED_TOOL_NAMES:
+            payload.setdefault("project_id", self.default_project_id)
+        return self.rpc("tools/call", {"name": name, "arguments": payload})
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         self._post({"jsonrpc": "2.0", "method": method, "params": params or {}})
@@ -339,9 +362,16 @@ def subprocess_group_kwargs() -> dict[str, Any]:
 class StdioMCPClient:
     """Newline-delimited JSON-RPC client around a `coding_tools_mcp --stdio` subprocess."""
 
-    def __init__(self, workspace: Path, *, extra_args: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        extra_args: list[str] | None = None,
+        default_project_id: str | None = None,
+    ) -> None:
         self.workspace = workspace
         self.extra_args = list(extra_args or [])
+        self.default_project_id = default_project_id
         self.process: subprocess.Popen[str] | None = None
         self.request_id = 0
         self.stdout_lines: queue.Queue[str] = queue.Queue()
@@ -399,7 +429,10 @@ class StdioMCPClient:
             self.stderr_lines.append(line)
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self.rpc("tools/call", {"name": name, "arguments": arguments})
+        payload = dict(arguments)
+        if self.default_project_id is not None and name in PROJECT_SCOPED_TOOL_NAMES:
+            payload.setdefault("project_id", self.default_project_id)
+        return self.rpc("tools/call", {"name": name, "arguments": payload})
 
     def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params or {}})

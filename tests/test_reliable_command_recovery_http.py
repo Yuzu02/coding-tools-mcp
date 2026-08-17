@@ -42,20 +42,29 @@ class ReliableCommandRecoveryHTTPTests(unittest.TestCase):
             {"CODING_TOOLS_MCP_SERVER_CMD": server_command},
             clear=False,
         ):
-            with MCPClient(workspace) as owner:
+            with MCPClient(workspace, default_project_id="default") as owner:
                 first = structured(owner.call_tool("exec_command", arguments))
-                with MCPClient(workspace, url=owner.url) as sibling:
+                with MCPClient(
+                    workspace,
+                    url=owner.url,
+                    default_project_id="default",
+                ) as sibling:
                     second = structured(sibling.call_tool("exec_command", arguments))
                     recovered = structured(
                         sibling.call_tool(
                             "get_command",
-                            {"client_request_id": key, "max_output_bytes": 4096},
+                            {
+                                "project_id": "default",
+                                "client_request_id": key,
+                                "max_output_bytes": 4096,
+                            },
                         )
                     )
                     listed = structured(
                         sibling.call_tool(
                             "list_commands",
                             {
+                                "project_id": "default",
                                 "client_request_id": key,
                                 "status": "all",
                                 "limit": 10,

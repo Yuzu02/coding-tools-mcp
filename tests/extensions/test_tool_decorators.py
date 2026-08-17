@@ -75,6 +75,26 @@ class ToolDecoratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ContributionError, "unknown decorator target: missing"):
             compose_tools({"core_tool": CORE}, registry, ("a",))
 
+    def test_explicit_optional_decorator_target_may_be_absent(self) -> None:
+        registry = ContributionRegistry()
+        registry.add_decorator(
+            "a",
+            ToolDecorator(
+                targets=("core_tool",),
+                optional_targets=("view_image",),
+                schema_patch=SchemaPatch(
+                    properties={"project_id": {"type": "string"}},
+                    required=("project_id",),
+                ),
+                wrap_handler=lambda handler: handler,
+            ),
+        )
+
+        composed = compose_tools({"core_tool": CORE}, registry, ("a",))
+
+        self.assertIn("project_id", composed["core_tool"].input_schema["required"])
+        self.assertNotIn("view_image", composed)
+
     def test_decorator_cannot_replace_existing_schema_property(self) -> None:
         core = replace(
             CORE,
