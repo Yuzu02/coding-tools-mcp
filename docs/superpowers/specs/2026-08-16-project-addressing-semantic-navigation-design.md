@@ -1,17 +1,19 @@
 # Project Addressing + Semantic Navigation Design
 
 **Date:** 2026-08-16
-**Status:** Architecture approved and revalidated; implementation is gated on the Extension Architecture + TOML Configuration foundation
+**Status:** Architecture approved and revalidated; Phase 0 extension foundation is implemented and verified, Phase A project addressing is ready for implementation
 **Target:** fork-owned multi-project and semantic extensions composed through the internal ExtensionHost
 
-**Repository validation snapshot (2026-08-17):**
+**Repository validation snapshot (2026-08-17, refreshed after Phase 0):**
 
-- fork `main`: `a5173ab`, synchronized on top of current `xyTom/main`
+- fork `main`: `f5bf954`, synchronized on top of current `xyTom/main`
 - current original upstream `xyTom/main`: `66b3f19`
-- fork/upstream relation at validation time: `xyTom/main...main = 0 4`
-- current runtime remains single-workspace: `Runtime`, `WorkspaceCommandManager`, and `Workspace` are rooted at one configured workspace
+- fork/upstream relation at validation time: `xyTom/main...main = 0 18`; upstream is an ancestor of fork `main`
+- Phase 0 is implemented: layered TOML config, static extension registry/DAG, typed services, contributions/decorators, `ExtensionHost`, mother-core bridge, and the first `projects` extension are live and verified
+- current operational core remains single-workspace per handler invocation: `Runtime`, `WorkspaceCommandManager`, and `Workspace` still expose one active workspace state, which Phase A must generalize without mutating shared request state
 - current `ProjectCatalog` uses display-path-derived `project_id` values (`"."` or relative paths), confirming the need to separate stable configured identity from structural discovery
-- current v0.3 baseline still exposes a fixed 22-tool catalog; the fork may deliberately evolve that contract through the extension composition layer rather than preserving the count indefinitely
+- current default composed catalog exposes 22 tools; disabling the `projects` extension exposes 20, proving startup composition is already active
+- Phase 0 acceptance was re-run on this snapshot: extension tests 78/78, project/skills regression 16/16, full compliance 128/128, `mise run verify`, schema drift, dispatch-input, Ruff, mypy, integration, npm launcher, public/private config boundary, and upstream-bridge compatibility all pass
 
 ## 1. Objective
 
@@ -93,16 +95,16 @@ The implementation must not reintroduce direct extension-specific mutation of `T
 
 ### 3.1 Stable IDs
 
-Projects are explicitly registered in the global configuration:
+Projects are explicitly registered inside the `projects` extension configuration. Phase 0 established that extension-owned configuration must remain under `[extensions.<name>]`; Phase A therefore does not introduce a parallel top-level `[projects]` namespace:
 
 ```toml
-[projects.coding-tools]
+[extensions.projects.registry.coding-tools]
 root = "/srv/projects/coding-tools-mcp"
 
-[projects.app]
+[extensions.projects.registry.app]
 root = "/srv/projects/app"
 
-[projects.api]
+[extensions.projects.registry.api]
 root = "/srv/projects/api"
 ```
 
@@ -175,6 +177,10 @@ ProjectRuntime
 It does **not** own MCP transport, authentication, protocol negotiation, or the global ExtensionHost. Those remain process-wide.
 
 Project runtimes may be created lazily, but the configured `ProjectRegistry` is immutable after startup. Command handles are globally routable through an internal `command_id -> project_id` ownership index, while `client_request_id` idempotency remains keyed by `(project_id, client_request_id)`.
+
+Phase A reuses the existing mother-core tool implementations rather than copying them into the extension. The implementation introduces a generic workspace-runtime state/lease seam in the mother core and a concurrency-safe scoped binding used only while one explicit request is executing. A `ProjectRuntime` owns one such state plus its project-local catalogs/context. A projects-extension decorator resolves `project_id`, binds the corresponding workspace state, invokes the existing core handler, and always restores the previous binding. It must never implement routing by assigning to shared `Runtime.workspace`, `Runtime.command_manager`, patch state, runtime directories, or another process-wide mutable "current project" field.
+
+The scoped binding is an internal dependency-injection mechanism, not client-visible session state: its value is derived exclusively from the current tool arguments, is reset at the end of the call, supports nested calls safely, and must be isolated across concurrent threads/tasks by tests.
 
 ## 4. Public project tools
 
@@ -298,6 +304,8 @@ read_output
 - `client_request_id`: `project_id` is required because idempotency keys are project-scoped.
 
 `list_commands` gains an optional `project_id` filter.
+
+Because `client_request_id` is project-scoped, `list_commands(client_request_id=...)` also requires `project_id` semantically. A bare `list_commands` with neither field aggregates retained command metadata across projects without creating mutable current-project state.
 
 Command records must internally persist `project_id`. Idempotency bindings are keyed by `(project_id, client_request_id)`, preserving today's workspace-local semantics when several former workspaces share one process. A `client_request_id` reused in project A and project B is therefore independent, while reuse inside one project retains the existing fingerprint/conflict behavior.
 
