@@ -131,6 +131,8 @@ if args.mode == "graceful_close":
 class FakeWorkspaceHandle:
     root: Path
     runtime_dir: Path
+    state_dir: Path
+    cache_dir: Path
 
 
 @dataclass(frozen=True)
@@ -139,9 +141,22 @@ class FakeProjectRuntime:
 
 
 class FakeRuntimes:
-    def __init__(self, project: RegisteredProject, runtime_dir: Path) -> None:
+    def __init__(
+        self,
+        project: RegisteredProject,
+        runtime_dir: Path,
+        state_dir: Path,
+        cache_dir: Path,
+    ) -> None:
         self.project = project
-        self.runtime = FakeProjectRuntime(FakeWorkspaceHandle(project.root, runtime_dir))
+        self.runtime = FakeProjectRuntime(
+            FakeWorkspaceHandle(
+                project.root,
+                runtime_dir,
+                state_dir,
+                cache_dir,
+            )
+        )
 
     def require(self, project_id: str) -> FakeProjectRuntime:
         if project_id != self.project.project_id:
@@ -159,6 +174,10 @@ class SemanticSerenaBackendTests(unittest.TestCase):
         (self.project_root / "a.py").write_text("x = 1\n", encoding="utf-8")
         self.runtime_dir = self.root / "runtime"
         self.runtime_dir.mkdir()
+        self.state_dir = self.root / "state"
+        self.state_dir.mkdir()
+        self.cache_dir = self.root / "cache"
+        self.cache_dir.mkdir()
         self.script = self.root / "fake_worker.py"
         self.script.write_text(textwrap.dedent(FAKE_WORKER), encoding="utf-8")
         self.alpha = RegisteredProject(
@@ -168,7 +187,12 @@ class SemanticSerenaBackendTests(unittest.TestCase):
             available=True,
         )
         self.registry = ProjectRegistry((self.alpha,))
-        self.runtimes = FakeRuntimes(self.alpha, self.runtime_dir)
+        self.runtimes = FakeRuntimes(
+            self.alpha,
+            self.runtime_dir,
+            self.state_dir,
+            self.cache_dir,
+        )
 
     def command(self, mode: str, project_id: str = "alpha") -> list[str]:
         return [
@@ -351,10 +375,16 @@ class SemanticSerenaBackendTests(unittest.TestCase):
         self.assertEqual(modes, [])
 
     def test_backend_worker_state_is_project_runtime_scoped(self) -> None:
-        seen: list[tuple[Path, tuple[Path, ...]]] = []
+        seen: list[tuple[Path, Path, tuple[Path, ...]]] = []
 
         def worker_factory(**kwargs):
-            seen.append((kwargs["state_dir"], kwargs["excluded_roots"]))
+            seen.append(
+                (
+                    kwargs["state_dir"],
+                    kwargs["cache_dir"],
+                    kwargs["excluded_roots"],
+                )
+            )
             return _SerenaWorker(
                 **kwargs,
                 command=self.command("ready"),
@@ -375,7 +405,13 @@ class SemanticSerenaBackendTests(unittest.TestCase):
 
         self.assertEqual(
             seen,
-            [(self.runtime_dir / "semantic" / "serena", ())],
+            [
+                (
+                    self.state_dir / "semantic" / "serena",
+                    self.cache_dir / "semantic" / "serena",
+                    (),
+                )
+            ],
         )
 
     def test_unavailable_backend_fails_without_starting_worker(self) -> None:

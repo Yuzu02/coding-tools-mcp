@@ -70,6 +70,14 @@ class WorkspaceRuntimeHandle(Protocol):
     def runtime_dir(self) -> Path:
         raise NotImplementedError
 
+    @property
+    def state_dir(self) -> Path:
+        raise NotImplementedError
+
+    @property
+    def cache_dir(self) -> Path:
+        raise NotImplementedError
+
 
 class WorkspaceRuntimeService(Protocol):
     def validate_root(self, root: Path, *, require_exists: bool = True) -> Path:

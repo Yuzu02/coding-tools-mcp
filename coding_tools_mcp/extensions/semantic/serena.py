@@ -92,6 +92,7 @@ def detect_serena() -> SerenaAvailability:
 def _worker_environment(
     state_dir: Path,
     *,
+    cache_dir: Path | None = None,
     environ: Mapping[str, str] | None,
     allow_dependency_install: bool,
 ) -> dict[str, str]:
@@ -104,7 +105,7 @@ def _worker_environment(
 
     worker_home = state_dir / "home"
     worker_tmp = state_dir / "tmp"
-    worker_cache = state_dir / "cache"
+    worker_cache = cache_dir or state_dir / "cache"
     serena_home = state_dir / "serena-home"
     for path in (state_dir, worker_home, worker_tmp, worker_cache, serena_home):
         path.mkdir(parents=True, exist_ok=True)
@@ -141,6 +142,7 @@ class _SerenaWorker:
         *,
         project: RegisteredProject,
         state_dir: Path,
+        cache_dir: Path | None = None,
         excluded_roots: tuple[Path, ...],
         start_timeout_seconds: int,
         request_timeout_seconds: int,
@@ -151,12 +153,14 @@ class _SerenaWorker:
         self.project = project
         self.project_id = project.project_id
         self.state_dir = state_dir
+        self.cache_dir = cache_dir or state_dir / "cache"
         self.excluded_roots = excluded_roots
         self.start_timeout_seconds = start_timeout_seconds
         self.request_timeout_seconds = request_timeout_seconds
         self.command = tuple(command) if command is not None else None
         self.environ = _worker_environment(
             state_dir,
+            cache_dir=self.cache_dir,
             environ=environ,
             allow_dependency_install=allow_dependency_install,
         )
@@ -606,10 +610,12 @@ class SerenaSemanticBackend:
 
     def _create_worker(self, project: RegisteredProject) -> _SerenaWorker:
         runtime = self.runtimes.require(project.project_id)
-        state_dir = runtime.workspace.runtime_dir / "semantic" / "serena"
+        state_dir = runtime.workspace.state_dir / "semantic" / "serena"
+        cache_dir = runtime.workspace.cache_dir / "semantic" / "serena"
         return self._worker_factory(
             project=project,
             state_dir=state_dir,
+            cache_dir=cache_dir,
             excluded_roots=self.registry.excluded_roots_for(project.project_id),
             start_timeout_seconds=self.config.semantic_start_timeout_seconds,
             request_timeout_seconds=self.config.semantic_request_timeout_seconds,

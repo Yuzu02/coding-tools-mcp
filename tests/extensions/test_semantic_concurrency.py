@@ -51,6 +51,14 @@ class FakeWorkspaceHandle:
     root: Path
     runtime_dir: Path
 
+    @property
+    def state_dir(self) -> Path:
+        return self.runtime_dir
+
+    @property
+    def cache_dir(self) -> Path:
+        return self.runtime_dir / "cache"
+
 
 @dataclass(frozen=True)
 class FakeProjectRuntime:

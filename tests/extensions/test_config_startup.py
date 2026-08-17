@@ -7,8 +7,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from coding_tools_mcp.extensions import ConfigError, ExtensionManifest, ExtensionRegistry
+from coding_tools_mcp.extensions import ConfigError, ExtensionManifest, ExtensionRegistry, RuntimeConfig
+from coding_tools_mcp.host_config import build_developer_snapshot
 from coding_tools_mcp.server import (
+    Runtime,
     build_parser,
     build_runtime,
     resolve_config_snapshot,
@@ -44,6 +46,9 @@ def write_host_config(
     path: Path,
     *,
     workspace: Path,
+    runtime_root: Path | None = None,
+    state_root: Path | None = None,
+    cache_root: Path | None = None,
     transport: str = "stdio",
     permission_mode: str = "dangerous",
     shell_env_inherit: str = "all",
@@ -57,6 +62,15 @@ def write_host_config(
         "config_version = 2",
         "[runtime]",
         f"bootstrap_workspace = {json.dumps(str(workspace))}",
+    ]
+    if runtime_root is not None:
+        lines.append(f"runtime_root = {json.dumps(str(runtime_root))}")
+    if state_root is not None:
+        lines.append(f"state_root = {json.dumps(str(state_root))}")
+    if cache_root is not None:
+        lines.append(f"cache_root = {json.dumps(str(cache_root))}")
+    lines.extend(
+        [
         "enable_view_image = false",
         "[transport]",
         f"kind = {json.dumps(transport)}",
@@ -67,7 +81,8 @@ def write_host_config(
         f"shell_env_inherit = {json.dumps(shell_env_inherit)}",
         f"allow_network = {str(allow_network).lower()}",
         f"auth_mode = {json.dumps(auth_mode)}",
-    ]
+        ]
+    )
     if auth_token_ref is not None:
         lines.append(f"auth_token_ref = {json.dumps(auth_token_ref)}")
     lines.extend(security_extra)
@@ -82,6 +97,30 @@ def write_host_config(
 
 
 class ConfigStartupTests(unittest.TestCase):
+    def test_runtime_uses_prebuilt_snapshot_runtime_config_when_no_duplicate_config_is_supplied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            registry = ExtensionRegistry(
+                [fake_extension("default-on")],
+                default_enabled=("default-on",),
+            )
+            snapshot_config = RuntimeConfig.defaults(enabled=())
+            snapshot = build_developer_snapshot(
+                runtime_config=snapshot_config,
+                bootstrap_workspace=workspace,
+            )
+
+            runtime = Runtime(
+                workspace,
+                extension_registry=registry,
+                config_snapshot=snapshot,
+            )
+            try:
+                self.assertIs(runtime.extension_config, snapshot.runtime_config)
+                self.assertEqual(runtime.extension_config.enabled_extensions, ())
+            finally:
+                runtime.close()
+
     def test_build_parser_accepts_host_config(self) -> None:
         args = build_parser().parse_args(["--host-config", "host.toml"])
 
@@ -138,6 +177,84 @@ class ConfigStartupTests(unittest.TestCase):
                 self.assertEqual(runtime.config_snapshot.sources[0].path, host.resolve())
             finally:
                 runtime.close()
+
+    def test_host_runtime_state_and_cache_roots_govern_all_workspace_runtimes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            project = root / "project"
+            runtime_root = root / "runtime"
+            state_root = root / "state"
+            cache_root = root / "cache"
+            for path in (workspace, project, runtime_root, state_root, cache_root):
+                path.mkdir()
+            host = root / "host.toml"
+            write_host_config(
+                host,
+                workspace=workspace,
+                runtime_root=runtime_root,
+                state_root=state_root,
+                cache_root=cache_root,
+            )
+            args = build_parser().parse_args(["--host-config", str(host)])
+            with mock.patch.dict(
+                os.environ,
+                {"CODING_TOOLS_MCP_RUNTIME_ROOT": str(root / "developer-env-runtime")},
+                clear=False,
+            ):
+                runtime = build_runtime(args, runtime_policy_from_args(args), emit_warning=False)
+            bootstrap_state_dir = runtime.state_dir
+            bootstrap_cache_dir = runtime.cache_dir
+            try:
+                self.assertTrue(runtime.runtime_dir.is_relative_to(runtime_root.resolve()))
+                self.assertTrue(runtime.state_dir.is_relative_to(state_root.resolve()))
+                self.assertTrue(runtime.cache_dir.is_relative_to(cache_root.resolve()))
+
+                runtime._ensure_runtime_dirs()
+                self.assertTrue(runtime.state_dir.is_dir())
+                self.assertTrue(runtime.cache_dir.is_dir())
+
+                handle = runtime.workspace_runtime_service.create(project)
+                self.assertTrue(handle.runtime_dir.is_relative_to(runtime_root.resolve()))
+                self.assertTrue(handle.state_dir.is_relative_to(state_root.resolve()))
+                self.assertTrue(handle.cache_dir.is_relative_to(cache_root.resolve()))
+                runtime.workspace_runtime_service.invoke(
+                    handle,
+                    lambda _arguments: (runtime._ensure_runtime_dirs() or {}),
+                    {},
+                )
+                self.assertTrue(handle.state_dir.is_dir())
+                self.assertTrue(handle.cache_dir.is_dir())
+            finally:
+                runtime.close()
+
+            self.assertTrue(bootstrap_state_dir.is_dir())
+            self.assertTrue(bootstrap_cache_dir.is_dir())
+
+    def test_host_runtime_rejects_storage_roots_inside_registered_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            runtime_root = root / "runtime"
+            cache_root = root / "cache"
+            runtime_root.mkdir()
+            cache_root.mkdir()
+            host = root / "host.toml"
+            write_host_config(
+                host,
+                workspace=workspace,
+                runtime_root=runtime_root,
+                state_root=workspace / "state",
+                cache_root=cache_root,
+            )
+            args = build_parser().parse_args(["--host-config", str(host)])
+
+            with self.assertRaisesRegex(
+                ConfigError,
+                "state_root must be outside registered project roots",
+            ):
+                build_runtime(args, runtime_policy_from_args(args), emit_warning=False)
 
     def test_run_http_resolves_host_bearer_secret_only_for_http_consumer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

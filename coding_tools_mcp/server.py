@@ -57,6 +57,7 @@ from .extensions import (
 from .host_config import (
     ConfigSnapshot,
     HostConfig,
+    HostRuntimeConfig,
     build_developer_snapshot,
     build_host_snapshot,
     load_host_config,
@@ -544,19 +545,48 @@ def configured_runtime_root() -> Path | None:
     return Path(configured).expanduser()
 
 
+@dataclass(frozen=True)
+class RuntimeStoragePolicy:
+    runtime_root: Path
+    fallback_runtime_root: Path | None
+    runtime_root_explicit: bool
+    state_root: Path | None = None
+    cache_root: Path | None = None
+
+
+def default_runtime_parent_root() -> Path:
+    return Path(tempfile.gettempdir()) / RUNTIME_ROOT_DIR_NAME
+
+
+def default_runtime_parent_fallback_root(primary: Path) -> Path | None:
+    if os.name == "nt":
+        return None
+    fallback = Path("/tmp") / RUNTIME_ROOT_DIR_NAME
+    if fallback == primary:
+        return None
+    return fallback
+
+
 def runtime_parent_root() -> Path:
-    return configured_runtime_root() or Path(tempfile.gettempdir()) / RUNTIME_ROOT_DIR_NAME
+    return configured_runtime_root() or default_runtime_parent_root()
 
 
 def runtime_parent_fallback_root() -> Path | None:
     if configured_runtime_root() is not None:
         return None
-    if os.name == "nt":
-        return None
-    fallback = Path("/tmp") / RUNTIME_ROOT_DIR_NAME
-    if fallback == runtime_parent_root():
-        return None
-    return fallback
+    return default_runtime_parent_fallback_root(runtime_parent_root())
+
+
+def legacy_runtime_storage_policy() -> RuntimeStoragePolicy:
+    configured = configured_runtime_root()
+    primary = configured or default_runtime_parent_root()
+    return RuntimeStoragePolicy(
+        runtime_root=primary,
+        fallback_runtime_root=(
+            None if configured is not None else default_runtime_parent_fallback_root(primary)
+        ),
+        runtime_root_explicit=configured is not None,
+    )
 
 
 def workspace_runtime_hash(workspace: Path) -> str:
@@ -564,28 +594,59 @@ def workspace_runtime_hash(workspace: Path) -> str:
     return hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
 
 
-def runtime_dir_for_workspace(workspace: Path, instance_id: str) -> Path:
-    root = runtime_parent_root()
+def runtime_dir_for_workspace(
+    workspace: Path,
+    instance_id: str,
+    *,
+    storage: RuntimeStoragePolicy | None = None,
+) -> Path:
+    selected = storage or legacy_runtime_storage_policy()
+    root = selected.runtime_root
     try:
         root_in_workspace = is_relative_to(root.resolve(strict=False), workspace.expanduser().resolve(strict=False))
     except OSError:
         root_in_workspace = False
     if root_in_workspace:
-        if configured_runtime_root() is not None:
+        if selected.runtime_root_explicit:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
-                f"{ENV_PREFIX}_RUNTIME_ROOT must be outside the configured workspace.",
+                "configured runtime root must be outside the configured workspace.",
                 category="validation",
             )
-        root = runtime_parent_fallback_root() or root
+        root = selected.fallback_runtime_root or root
     return root / workspace_runtime_hash(workspace) / instance_id
 
 
-def fallback_runtime_dir_for_workspace(workspace: Path, instance_id: str) -> Path | None:
-    fallback = runtime_parent_fallback_root()
+def fallback_runtime_dir_for_workspace(
+    workspace: Path,
+    instance_id: str,
+    *,
+    storage: RuntimeStoragePolicy | None = None,
+) -> Path | None:
+    selected = storage or legacy_runtime_storage_policy()
+    fallback = selected.fallback_runtime_root
     if fallback is None:
         return None
     return fallback / workspace_runtime_hash(workspace) / instance_id
+
+
+def scoped_storage_dir(root: Path, workspace: Path) -> Path:
+    return root / workspace_runtime_hash(workspace)
+
+
+def validate_host_storage_separation(snapshot: ConfigSnapshot, runtime: HostRuntimeConfig) -> None:
+    configured_roots = (
+        ("runtime_root", runtime.runtime_root),
+        ("state_root", runtime.state_root),
+        ("cache_root", runtime.cache_root),
+    )
+    project_roots = tuple(project.root.resolve(strict=False) for project in snapshot.registered_projects)
+    for name, configured in configured_roots:
+        if configured is None:
+            continue
+        resolved = configured.resolve(strict=False)
+        if any(resolved.is_relative_to(project_root) for project_root in project_roots):
+            raise ConfigError(f"host.runtime.{name} must be outside registered project roots")
 
 
 def shell_env_policy_from_args(args: argparse.Namespace) -> ShellEnvPolicy:
@@ -1429,14 +1490,22 @@ class WorkspaceCommandManager:
         *,
         on_command_registered: Callable[[str], None] | None = None,
         on_command_removed: Callable[[str], None] | None = None,
+        storage: RuntimeStoragePolicy | None = None,
     ) -> None:
         self.workspace = workspace.expanduser().resolve(strict=True)
         self.on_command_registered = on_command_registered
         self.on_command_removed = on_command_removed
         self.server_instance_id = secrets.token_urlsafe(12)
-        self.runtime_dir = runtime_dir_for_workspace(self.workspace, self.server_instance_id)
+        self.storage = storage or legacy_runtime_storage_policy()
+        self.runtime_dir = runtime_dir_for_workspace(
+            self.workspace,
+            self.server_instance_id,
+            storage=self.storage,
+        )
         self.fallback_runtime_dir = fallback_runtime_dir_for_workspace(
-            self.workspace, self.server_instance_id
+            self.workspace,
+            self.server_instance_id,
+            storage=self.storage,
         )
         self.commands: dict[str, CommandRun] = {}
         self.output_commands: dict[str, CommandRun] = {}
@@ -1559,7 +1628,10 @@ class WorkspaceRuntimeState:
     fallback_runtime_dir: Path | None
     home_dir: Path
     tmp_dir: Path
+    state_dir: Path
     cache_dir: Path
+    state_follows_runtime: bool
+    cache_follows_runtime: bool
     runtime_dir_lock: threading.Lock = field(default_factory=threading.Lock)
     runtime_dir_resolved: bool = False
     patch_baselines: dict[str, str | None] = field(default_factory=dict)
@@ -1576,7 +1648,10 @@ class WorkspaceRuntimeState:
         self.runtime_dir = runtime_dir
         self.home_dir = runtime_dir / "home"
         self.tmp_dir = runtime_dir / "tmp"
-        self.cache_dir = runtime_dir / "cache"
+        if self.state_follows_runtime:
+            self.state_dir = runtime_dir
+        if self.cache_follows_runtime:
+            self.cache_dir = runtime_dir / "cache"
 
 
 class CoreWorkspaceRuntimeService:
@@ -1611,6 +1686,7 @@ class CoreWorkspaceRuntimeService:
             workspace.root,
             on_command_registered=on_command_registered,
             on_command_removed=on_command_removed,
+            storage=self._runtime._runtime_storage,
         )
         state = self._runtime._new_workspace_runtime_state(
             workspace,
@@ -1710,7 +1786,53 @@ class Runtime:
         self.allow_network = allow_network or self.capabilities.network
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
-        bootstrap_manager = command_manager or WorkspaceCommandManager(bootstrap_workspace.root)
+        self.extension_registry = extension_registry or builtin_extension_registry()
+        if extension_config is not None:
+            self.extension_config = extension_config
+        elif config_snapshot is not None:
+            self.extension_config = config_snapshot.runtime_config
+        else:
+            self.extension_config = RuntimeConfig.defaults(
+                enabled=self.extension_registry.default_enabled
+            )
+        self.config_snapshot = config_snapshot or build_developer_snapshot(
+            runtime_config=self.extension_config,
+            bootstrap_workspace=bootstrap_workspace.root,
+        )
+        host_config = self.config_snapshot.host_config
+        if host_config is not None:
+            host_runtime = host_config.runtime
+            if host_runtime is None:
+                raise ConfigError("HostConfig runtime.bootstrap_workspace is required by Runtime")
+            validate_host_storage_separation(self.config_snapshot, host_runtime)
+            runtime_root = host_runtime.runtime_root or default_runtime_parent_root()
+            self._runtime_storage = RuntimeStoragePolicy(
+                runtime_root=runtime_root,
+                fallback_runtime_root=(
+                    None
+                    if host_runtime.runtime_root is not None
+                    else default_runtime_parent_fallback_root(runtime_root)
+                ),
+                runtime_root_explicit=host_runtime.runtime_root is not None,
+                state_root=host_runtime.state_root,
+                cache_root=host_runtime.cache_root,
+            )
+        else:
+            self._runtime_storage = legacy_runtime_storage_policy()
+        bootstrap_manager = command_manager or WorkspaceCommandManager(
+            bootstrap_workspace.root,
+            storage=self._runtime_storage,
+        )
+        if (
+            host_config is not None
+            and command_manager is not None
+            and command_manager.storage != self._runtime_storage
+        ):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "command_manager runtime storage does not match HostConfig.",
+                category="validation",
+            )
         if bootstrap_manager.workspace != bootstrap_workspace.root:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -1734,14 +1856,6 @@ class Runtime:
             project_context if project_context is not None else load_project_context(bootstrap_workspace.root)
         )
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
-        self.extension_registry = extension_registry or builtin_extension_registry()
-        self.extension_config = extension_config or RuntimeConfig.defaults(
-            enabled=self.extension_registry.default_enabled
-        )
-        self.config_snapshot = config_snapshot or build_developer_snapshot(
-            runtime_config=self.extension_config,
-            bootstrap_workspace=bootstrap_workspace.root,
-        )
         self.workspace_runtime_service = CoreWorkspaceRuntimeService(self)
         try:
             self.extension_host = ExtensionHost.build(
@@ -1770,6 +1884,16 @@ class Runtime:
         owns_command_manager: bool,
     ) -> WorkspaceRuntimeState:
         runtime_dir = command_manager.runtime_dir
+        state_dir = (
+            scoped_storage_dir(self._runtime_storage.state_root, workspace.root)
+            if self._runtime_storage.state_root is not None
+            else runtime_dir
+        )
+        cache_dir = (
+            scoped_storage_dir(self._runtime_storage.cache_root, workspace.root)
+            if self._runtime_storage.cache_root is not None
+            else runtime_dir / "cache"
+        )
         return WorkspaceRuntimeState(
             workspace=workspace,
             command_manager=command_manager,
@@ -1778,7 +1902,10 @@ class Runtime:
             fallback_runtime_dir=command_manager.fallback_runtime_dir,
             home_dir=runtime_dir / "home",
             tmp_dir=runtime_dir / "tmp",
-            cache_dir=runtime_dir / "cache",
+            state_dir=state_dir,
+            cache_dir=cache_dir,
+            state_follows_runtime=self._runtime_storage.state_root is None,
+            cache_follows_runtime=self._runtime_storage.cache_root is None,
         )
 
     def _workspace_state(self) -> WorkspaceRuntimeState:
@@ -1823,6 +1950,10 @@ class Runtime:
     @property
     def tmp_dir(self) -> Path:
         return self._workspace_state().tmp_dir
+
+    @property
+    def state_dir(self) -> Path:
+        return self._workspace_state().state_dir
 
     @property
     def cache_dir(self) -> Path:
@@ -1895,6 +2026,26 @@ class Runtime:
             return f"{runtime_dir}: {exc}"
         return None
 
+    def _create_persistent_storage_dirs(self, state: WorkspaceRuntimeState) -> str | None:
+        """Create host-owned persistent state/cache trees without deleting them on close."""
+
+        paths: list[Path] = []
+        if not state.state_follows_runtime:
+            paths.append(state.state_dir)
+        if not state.cache_follows_runtime and state.cache_dir not in paths:
+            paths.append(state.cache_dir)
+        try:
+            for path in paths:
+                path.mkdir(parents=True, mode=0o700, exist_ok=True)
+                if os.name != "nt":
+                    try:
+                        path.chmod(0o700)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            return f"{path}: {exc}"
+        return None
+
     def _ensure_runtime_dirs(self) -> None:
         """Create the runtime directories, choosing which tree to use only once.
 
@@ -1922,6 +2073,14 @@ class Runtime:
                     if not resolved:
                         state.set_runtime_dir(runtime_dir)
                         state.runtime_dir_resolved = True
+                    storage_error = self._create_persistent_storage_dirs(state)
+                    if storage_error is not None:
+                        raise ToolFailure(
+                            "RUNTIME_DIR_UNWRITABLE",
+                            "Configured runtime state/cache directory could not be created.",
+                            category="runtime",
+                            details={"attempted": [storage_error]},
+                        )
                     return
                 errors.append(error)
             raise ToolFailure(
