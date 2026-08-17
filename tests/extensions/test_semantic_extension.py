@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from coding_tools_mcp.errors import ToolFailure
-from coding_tools_mcp.extensions import builtin_extension_registry
+from coding_tools_mcp.extensions import CORE_CONFIG_SNAPSHOT, RuntimeConfig, builtin_extension_registry
 from coding_tools_mcp.extensions.api import ExtensionContext
 from coding_tools_mcp.extensions.config import ConfigError
 from coding_tools_mcp.extensions.contributions import ContributionRegistry
@@ -33,6 +33,7 @@ from coding_tools_mcp.extensions.semantic.model import (
     SemanticSymbol,
 )
 from coding_tools_mcp.extensions.services import ServiceRegistry
+from coding_tools_mcp.host_config import build_developer_snapshot
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,20 @@ class SemanticExtensionTests(unittest.TestCase):
         services = ServiceRegistry()
         services.provide(PROJECT_REGISTRY, self.registry)
         services.provide(PROJECT_RUNTIMES, self.runtimes)  # type: ignore[arg-type]
+        snapshot = build_developer_snapshot(
+            runtime_config=RuntimeConfig.defaults(
+                enabled=("projects", "semantic"),
+                settings={
+                    "projects": {
+                        "registry": {
+                            "alpha": {"root": str(self.root)},
+                        }
+                    }
+                },
+            ),
+            bootstrap_workspace=self.root,
+        )
+        services.provide(CORE_CONFIG_SNAPSHOT, snapshot)
         contributions = ContributionRegistry()
         extension = SemanticExtension(
             backend_factory=lambda config, registry, runtimes: backend,
@@ -282,6 +297,80 @@ class SemanticExtensionTests(unittest.TestCase):
         self.assertEqual(definition["definitions"][0]["path"], "src/sample.py")
         self.assertEqual(backend.calls[0][2].path, "src/sample.py")
         self.assertEqual(backend.calls[1][2].path, "src/sample.py")
+
+    def test_project_capability_reduction_blocks_only_selected_project_before_backend(self) -> None:
+        blocked = self.root / "blocked"
+        allowed = self.root / "allowed"
+        blocked.mkdir()
+        allowed.mkdir()
+        (blocked / ".coding-tools-mcp.toml").write_text(
+            "\n".join(
+                (
+                    "project_config_version = 1",
+                    "[capabilities]",
+                    'disabled = ["semantic"]',
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        registry = ProjectRegistry(
+            (
+                RegisteredProject("blocked", blocked, (), True),
+                RegisteredProject("allowed", allowed, (), True),
+            )
+        )
+        runtimes = FakeProjectRuntimes(registry)
+        runtime_config = RuntimeConfig.defaults(
+            enabled=("projects", "semantic"),
+            settings={
+                "projects": {
+                    "registry": {
+                        "blocked": {"root": str(blocked)},
+                        "allowed": {"root": str(allowed)},
+                    }
+                }
+            },
+        )
+        snapshot = build_developer_snapshot(
+            runtime_config=runtime_config,
+            bootstrap_workspace=self.root,
+        )
+        backend = FakeBackend()
+        services = ServiceRegistry()
+        services.provide(PROJECT_REGISTRY, registry)
+        services.provide(PROJECT_RUNTIMES, runtimes)  # type: ignore[arg-type]
+        services.provide(CORE_CONFIG_SNAPSHOT, snapshot)
+        contributions = ContributionRegistry()
+        extension = SemanticExtension(backend_factory=lambda config, registry, runtimes: backend)
+        extension.configure({})
+        extension.register(
+            ExtensionContext(
+                services=services,
+                contributions=contributions,
+                extension_name="semantic",
+            )
+        )
+        tools = {tool.name: tool for _owner, tool in contributions.tool_entries()}
+
+        self.assertEqual(
+            set(tools),
+            {"list_symbols", "find_symbol", "find_definition", "find_references"},
+        )
+        with self.assertRaises(ToolFailure) as raised:
+            tools["find_symbol"].handler({"project_id": "blocked", "query": "target"})
+        self.assertEqual(raised.exception.code, "PROJECT_CAPABILITY_DISABLED")
+        self.assertEqual(raised.exception.category, "permission")
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(
+            raised.exception.details,
+            {"project_id": "blocked", "capability": "semantic"},
+        )
+        self.assertEqual(backend.calls, [])
+
+        payload = tools["find_symbol"].handler({"project_id": "allowed", "query": "target"})
+        self.assertEqual(payload["project_id"], "allowed")
+        self.assertEqual([call[:2] for call in backend.calls], [("find_symbol", "allowed")])
 
     def test_find_symbol_empty_path_does_not_require_a_filesystem_lookup(self) -> None:
         backend = FakeBackend()

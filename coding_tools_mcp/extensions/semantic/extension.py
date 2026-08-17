@@ -5,12 +5,14 @@ from importlib import import_module
 from typing import Any, Callable, Mapping, cast
 
 from coding_tools_mcp.errors import ToolFailure
+from coding_tools_mcp.host_config import ConfigSnapshot
 
 from ..api import ExtensionContext, ExtensionManifest
 from ..config import ConfigError, scalar, table
 from ..contributions import ToolAnnotations, ToolContribution
 from ..projects.registry import PROJECT_REGISTRY, ProjectRegistry, ProjectRegistryError, RegisteredProject
 from ..projects.runtime import PROJECT_RUNTIMES, ProjectRuntimeManager
+from ..services import CORE_CONFIG_SNAPSHOT
 from .backend import (
     SEMANTIC_BACKEND,
     SEMANTIC_BACKEND_ERROR,
@@ -223,6 +225,7 @@ class SemanticExtension:
         self._registry: ProjectRegistry | None = None
         self._runtimes: ProjectRuntimeManager | None = None
         self._backend: SemanticBackend | None = None
+        self._snapshot: ConfigSnapshot | None = None
 
     def configure(self, config: Mapping[str, object]) -> None:
         backend = config.get("backend", "serena")
@@ -259,6 +262,7 @@ class SemanticExtension:
     def register(self, context: ExtensionContext) -> None:
         self._registry = context.services.require(PROJECT_REGISTRY)
         self._runtimes = context.services.require(PROJECT_RUNTIMES)
+        self._snapshot = context.services.require(CORE_CONFIG_SNAPSHOT)
         self._backend = self._backend_factory(self._config, self._registry, self._runtimes)
         context.services.provide(SEMANTIC_BACKEND, self._backend)
         context.add_metadata("backend", self._backend.backend_name)
@@ -333,9 +337,27 @@ class SemanticExtension:
     def _project(self, project_id: str) -> RegisteredProject:
         registry, _runtimes, _backend = self._services()
         try:
-            return registry.require_available(project_id)
+            project = registry.require_available(project_id)
         except ProjectRegistryError as exc:
             raise _project_failure(exc) from exc
+        self._require_project_capability(project_id)
+        return project
+
+    def _require_project_capability(self, project_id: str) -> None:
+        snapshot = self._snapshot
+        if snapshot is None:
+            raise RuntimeError("semantic extension config snapshot is unavailable")
+        effective = snapshot.projects.get(project_id)
+        if effective is None:
+            raise RuntimeError(f"project is missing from config snapshot: {project_id}")
+        if "semantic" not in effective.enabled_capabilities:
+            raise ToolFailure(
+                "PROJECT_CAPABILITY_DISABLED",
+                "Semantic navigation is disabled by project policy.",
+                category="permission",
+                retryable=False,
+                details={"project_id": project_id, "capability": "semantic"},
+            )
 
     def _canonical_path(self, project_id: str, raw_path: str, *, require_file: bool) -> str:
         _registry, runtimes, _backend = self._services()

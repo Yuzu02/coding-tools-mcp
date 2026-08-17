@@ -198,6 +198,15 @@ default `projects` extension. The contract states are explicit:
 - projects + semantic with Serena 1.5.3 available at startup: 28 tools
 - semantic enabled but Serena unavailable at startup: process starts without semantic tools
 - runtime semantic worker failure: semantic tools remain in the frozen catalog
+- a project may reduce host authority with `capabilities.disabled = ["semantic"]`
+
+Project capability reduction does not mutate the frozen catalog. When semantic
+is globally enabled and available, all four semantic tools remain published.
+A semantic request for a project that disabled the capability fails before
+path resolution or backend work with `PROJECT_CAPABILITY_DISABLED`, category
+`permission`, `retryable=false`, and bounded details containing only
+`project_id` and `capability`. Other projects in the same runtime remain
+unaffected.
 
 The four optional semantic tools are read-only and project-addressed. Their
 live schemas and annotations are drift-checked against these canonical lines:
