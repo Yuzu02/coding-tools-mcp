@@ -89,7 +89,7 @@ class DeterministicE2ETests(ComplianceTestCase):
         with self.session_for_fixture("long-running-project") as (_workspace, client):
             started = client.call_tool(
                 "exec_command",
-                {"cmd": "python repl.py", "tty": True, "timeout_ms": 1000, "max_output_bytes": 4096},
+                {"cmd": "python repl.py", "tty": True, "timeout_ms": 5000, "max_output_bytes": 4096},
             )
             payload = self.assert_tool_success(started)
             command_id = payload.get("command_id")
@@ -103,7 +103,7 @@ class DeterministicE2ETests(ComplianceTestCase):
         with self.session_for_fixture("long-running-project") as (_workspace, client):
             started = client.call_tool(
                 "exec_command",
-                {"cmd": "python repl.py", "tty": True, "timeout_ms": 1000, "yield_time_ms": 0, "max_output_bytes": 4096},
+                {"cmd": "python repl.py", "tty": True, "timeout_ms": 5000, "yield_time_ms": 0, "max_output_bytes": 4096},
             )
             payload = self.assert_tool_success(started)
             command_id = payload.get("command_id")

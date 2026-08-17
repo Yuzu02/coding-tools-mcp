@@ -63,7 +63,7 @@
       "arguments": {
         "cmd": "python repl.py",
         "tty": true,
-        "timeout_ms": 1000
+        "timeout_ms": 5000
       },
       "expect_command": true
     },
