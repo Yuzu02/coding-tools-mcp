@@ -25,6 +25,7 @@ from .model import (
     SemanticReference,
     SemanticSymbol,
 )
+from .extension import SemanticConfig, SemanticExtension
 
 
 __all__ = [
@@ -47,6 +48,8 @@ __all__ = [
     "SEMANTIC_TIMEOUT",
     "SemanticBackend",
     "SemanticBackendError",
+    "SemanticConfig",
+    "SemanticExtension",
     "SemanticPosition",
     "SemanticRange",
     "SemanticReference",

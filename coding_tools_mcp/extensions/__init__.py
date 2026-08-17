@@ -43,8 +43,12 @@ def builtin_extension_registry() -> ExtensionRegistry:
     """Return the fork's statically registered built-in extensions."""
 
     from .projects import ProjectsExtension
+    from .semantic import SemanticExtension
 
-    return ExtensionRegistry([ProjectsExtension], default_enabled=("projects",))
+    return ExtensionRegistry(
+        [ProjectsExtension, SemanticExtension],
+        default_enabled=("projects",),
+    )
 
 
 __all__ = [

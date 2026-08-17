@@ -4,3 +4,11 @@ config_version = 1
 enabled = ["projects"]
 
 [extensions.projects]
+
+[extensions.semantic]
+backend = "serena"
+max_semantic_projects = 4
+semantic_idle_timeout_seconds = 900
+semantic_start_timeout_seconds = 60
+semantic_request_timeout_seconds = 60
+allow_dependency_install = false
