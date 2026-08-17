@@ -16,7 +16,7 @@ Coding Tools MCP is a **model-neutral coding runtime** served over the
 search, structured multi-file patches, command execution, interactive
 sessions, and git — one server that any MCP client can drive. Claude Desktop,
 Claude Code, Codex, Cursor, Cline, VS Code, Windsurf, Gemini CLI, or an agent
-you build yourself all get the same 18 battle-tested tools, confined to one
+you build yourself all get the same 22 battle-tested tools, confined to one
 workspace, gated by permission modes.
 
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
@@ -74,7 +74,9 @@ capability, and the handshake era `2025-11-25` with `2025-06-18`
 compatibility. Neither has sessions. A one-line installer, per-client
 walkthroughs, and troubleshooting live in
 [docs/quickstart.md](docs/quickstart.md) and
-[docs/mcp-client-config.md](docs/mcp-client-config.md).
+[docs/mcp-client-config.md](docs/mcp-client-config.md). For a cloned checkout
+that should supervise the MCP server and OpenAI tunnel-client together, use the
+[multiplatform services launcher](docs/services-launcher.md).
 
 ## Seven things to try
 
@@ -141,7 +143,8 @@ rollback.
 | Group | Tools |
 | --- | --- |
 | Files & search | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
-| Execution | `exec_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
+| Project skills | `list_skills` · `read_skill` |
+| Execution | `exec_command` · `list_commands` · `get_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
 | Runtime | `server_info` · `check_exec_environment` |
 
@@ -195,7 +198,7 @@ measured. More: [COMPLIANCE.md](COMPLIANCE.md) · [BENCHMARK.md](BENCHMARK.md) �
 
 | | |
 | --- | --- |
-| Getting started | [Quickstart](docs/quickstart.md) · [Client configuration](docs/mcp-client-config.md) · [Troubleshooting](docs/troubleshooting.md) |
+| Getting started | [Quickstart](docs/quickstart.md) · [Services launcher](docs/services-launcher.md) · [Client configuration](docs/mcp-client-config.md) · [Troubleshooting](docs/troubleshooting.md) |
 | Remote & sandboxed | [Remote MCP](docs/remote-mcp.md) · [Docker sandbox](docs/docker.md) · [Cloud sandbox worker](cloudflare/sandbox-control/README.md) |
 | Tools & contract | [Tools and schemas](docs/tools-and-schemas.md) · [Runtime contract](docs/runtime-contract-v0.3.md) · [Migrating to 0.3](docs/migration-0.3.md) · [Permission modes](docs/permission-modes.md) |
 | Execution | [Exec recipes](docs/exec-command-recipes.md) · [Exec troubleshooting](docs/troubleshooting-exec.md) |

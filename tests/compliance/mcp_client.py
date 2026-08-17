@@ -29,6 +29,8 @@ REQUIRED_TOOLS = (
     "list_dir",
     "list_files",
     "search_text",
+    "list_skills",
+    "read_skill",
     "apply_patch",
     "exec_command",
     "write_stdin",

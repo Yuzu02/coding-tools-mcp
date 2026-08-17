@@ -652,6 +652,132 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(env.get("OPENAI_API_KEY"), "sk-test-secret-value")
             self.assertEqual(env.get("LD_PRELOAD"), "/tmp/injected.so")
 
+    def test_command_env_dangerous_all_removes_mcp_uv_bootstrap_but_preserves_cache(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            mcp_venv = workspace / "mcp-venv"
+            runtime = Runtime(workspace, permission_mode="dangerous", shell_env_policy=ShellEnvPolicy(inherit="all"))
+            host_env = {
+                "PATH": os.pathsep.join([str(mcp_venv / "bin"), "/workspace/toolchain/bin", str(mcp_venv / "bin"), "/usr/bin"]),
+                "VIRTUAL_ENV": str(mcp_venv),
+                "UV_PROJECT_ENVIRONMENT": str(mcp_venv),
+                "UV_PYTHON": "3.13.12",
+                "UV_NO_SYNC": "1",
+                "UV_MANAGED_PYTHON": "1",
+                "UV_PYTHON_INSTALL_DIR": "/var/lib/coding-tools-mcp/python",
+                "UV_RUN_RECURSION_DEPTH": "2",
+                "UV_CACHE_DIR": "/var/cache/coding-tools-mcp/uv",
+                "OPENAI_API_KEY": "sk-test-secret-value",
+                "LD_PRELOAD": "/tmp/injected.so",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                env = runtime._command_env({})
+            for name in server_module.MCP_BOOTSTRAP_ENV_NAMES:
+                self.assertNotIn(name, env)
+            self.assertEqual(env.get("UV_CACHE_DIR"), host_env["UV_CACHE_DIR"])
+            self.assertEqual(env.get("OPENAI_API_KEY"), host_env["OPENAI_API_KEY"])
+            self.assertEqual(env.get("LD_PRELOAD"), host_env["LD_PRELOAD"])
+            self.assertEqual(env.get("PATH"), os.pathsep.join(["/workspace/toolchain/bin", "/usr/bin"]))
+
+    def test_command_env_trusted_all_rehomes_inherited_uv_and_xdg_caches_inside_runtime(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            runtime_root = root / "runtime"
+            with patch.dict(
+                server_module.os.environ,
+                {f"{server_module.ENV_PREFIX}_RUNTIME_ROOT": str(runtime_root)},
+            ):
+                runtime = Runtime(workspace, permission_mode="trusted", shell_env_policy=ShellEnvPolicy(inherit="all"))
+            host_env = {
+                "PATH": "/usr/bin",
+                "UV_CACHE_DIR": "/var/cache/coding-tools-mcp-fork/uv",
+                "XDG_CACHE_HOME": "/var/cache/coding-tools-mcp-fork",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                env = runtime._command_env({})
+
+            self.assertEqual(env.get("UV_CACHE_DIR"), str(runtime.cache_dir / "uv"))
+            self.assertEqual(env.get("XDG_CACHE_HOME"), str(runtime.cache_dir))
+
+    def test_command_env_dangerous_core_removes_mcp_venv_from_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            mcp_venv = workspace / "mcp-venv"
+            runtime = Runtime(workspace, permission_mode="dangerous", shell_env_policy=ShellEnvPolicy(inherit="core"))
+            host_env = {
+                "PATH": os.pathsep.join([str(mcp_venv / "bin"), "/workspace/toolchain/bin", str(mcp_venv / "bin"), "/usr/bin"]),
+                "VIRTUAL_ENV": str(mcp_venv),
+                "UV_PROJECT_ENVIRONMENT": str(mcp_venv),
+                "UV_PYTHON": "3.13.12",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                env = runtime._command_env({})
+            self.assertNotIn("VIRTUAL_ENV", env)
+            self.assertNotIn("UV_PROJECT_ENVIRONMENT", env)
+            self.assertEqual(env.get("PATH"), os.pathsep.join(["/workspace/toolchain/bin", "/usr/bin"]))
+
+    def test_command_env_allows_explicit_uv_overrides_after_bootstrap_sanitization(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            mcp_venv = workspace / "mcp-venv"
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=ShellEnvPolicy(inherit="all", set={"UV_PYTHON": "3.14.6"}),
+            )
+            with patch.dict(
+                server_module.os.environ,
+                {"PATH": str(mcp_venv / "bin"), "VIRTUAL_ENV": str(mcp_venv), "UV_PYTHON": "3.13.12"},
+                clear=True,
+            ):
+                env = runtime._command_env({"UV_NO_SYNC": "0"})
+            self.assertNotIn("VIRTUAL_ENV", env)
+            self.assertEqual(env.get("PATH"), "")
+            self.assertEqual(env.get("UV_PYTHON"), "3.14.6")
+            self.assertEqual(env.get("UV_NO_SYNC"), "0")
+
+    def test_exec_command_uses_workspace_uv_after_mcp_bootstrap_is_removed(self) -> None:
+        if os.name == "nt":
+            self.skipTest("The deterministic fake uv fixture uses a POSIX shell script")
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            mcp_venv = workspace / "mcp-venv"
+            fake_bin = workspace / "workspace-toolchain" / "bin"
+            workspace_python = workspace / ".venv" / "bin" / "python3"
+            fake_bin.mkdir(parents=True)
+            workspace_python.parent.mkdir(parents=True)
+            fake_uv = fake_bin / "uv"
+            fake_uv.write_text(
+                "#!/bin/sh\n"
+                'if [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${UV_PROJECT_ENVIRONMENT:-}" ] || [ -n "${UV_PYTHON:-}" ] || [ -n "${UV_NO_SYNC:-}" ]; then\n'
+                '  echo "MCP bootstrap leaked" >&2\n'
+                "  exit 41\n"
+                "fi\n"
+                f"printf '%s\\n' '{workspace_python}'\n",
+                encoding="utf-8",
+            )
+            fake_uv.chmod(0o755)
+            runtime = Runtime(workspace, permission_mode="dangerous", shell_env_policy=ShellEnvPolicy(inherit="all"))
+            host_env = {
+                "PATH": os.pathsep.join([str(mcp_venv / "bin"), str(fake_bin), str(mcp_venv / "bin"), "/usr/bin"]),
+                "VIRTUAL_ENV": str(mcp_venv),
+                "UV_PROJECT_ENVIRONMENT": str(mcp_venv),
+                "UV_PYTHON": "3.13.12",
+                "UV_NO_SYNC": "1",
+                "UV_MANAGED_PYTHON": "1",
+                "UV_PYTHON_INSTALL_DIR": str(workspace / "mcp-python"),
+                "UV_RUN_RECURSION_DEPTH": "2",
+                "UV_CACHE_DIR": str(workspace / "uv-cache"),
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                result = runtime.exec_command(
+                    {"cmd": "uv run --no-sync python -c 'import sys; print(sys.executable)'", "timeout_ms": 5000, "yield_time_ms": 5000}
+                )
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertEqual(result.get("stdout"), f"{workspace_python}\n")
+
     def test_runtime_root_stays_posix_tmp_when_process_tmpdir_is_workspace_local(self) -> None:
         if os.name == "nt":
             self.skipTest("POSIX /tmp semantics do not apply on Windows")
@@ -795,16 +921,20 @@ class RuntimeHelperTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             java_home = Path(tmp) / "jdk"
             explicit_root = Path(tmp) / "explicit-root"
+            explicit_file = Path(tmp) / "explicit-file"
             private_path_dir = Path(tmp) / "bin"
             java_home.mkdir()
             explicit_root.mkdir()
+            explicit_file.write_text("ok\n", encoding="utf-8")
             private_path_dir.mkdir()
             with patch.dict(
                 server_module.os.environ,
                 {
                     "PATH": str(private_path_dir),
                     "JAVA_HOME": str(java_home),
-                    "CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS": str(explicit_root),
+                    "CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS": os.pathsep.join(
+                        (str(explicit_root), str(explicit_file))
+                    ),
                 },
                 clear=True,
             ):
@@ -817,6 +947,7 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertIn("/etc/gitconfig.d", roots)
         self.assertIn(str(java_home.resolve()), roots)
         self.assertIn(str(explicit_root.resolve()), roots)
+        self.assertIn(str(explicit_file.resolve()), roots)
         self.assertNotIn(str(private_path_dir.resolve()), roots)
 
     def test_safe_exec_git_init_and_local_config_reads_system_git_config_roots(self) -> None:
@@ -1230,7 +1361,9 @@ Maven home: /usr/share/maven
             self.assertIn("Run the focused test suite.", instructions)
             self.assertIn("packages/api/AGENTS.md", instructions)
             self.assertNotIn("API-only nested rule.", instructions)
-            self.assertIn("apply_patch", instructions)
+            self.assertIn("exec_command may modify files inside the configured workspace", instructions)
+            self.assertIn("canonical workspace tools", instructions)
+            self.assertNotIn("do not modify files through exec_command", instructions)
 
     def test_exec_command_compact_preview_and_read_output(self) -> None:
         with TemporaryDirectory() as tmp:

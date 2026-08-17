@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import functools
+import ntpath
 import os
 import signal
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
@@ -19,6 +22,154 @@ COMMAND_BUFFER_BYTES = 524_288
 # agent runtimes.
 COMMAND_HEAD_BUFFER_DIVISOR = 8
 HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+PWSH_PATH_ENV = "CODING_TOOLS_MCP_PWSH_PATH"
+
+
+def _environment_value(env: Mapping[str, str], target: str) -> str | None:
+    target_upper = target.upper()
+    for name, value in env.items():
+        if name.upper() == target_upper:
+            return value
+    return None
+
+
+def _pwsh_probe_environment() -> dict[str, str]:
+    """Build a minimal host-derived environment without server secrets."""
+
+    allowed = ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "COMSPEC")
+    result: dict[str, str] = {}
+    for name in allowed:
+        value = _environment_value(os.environ, name)
+        if value is not None:
+            result[name] = value
+    return result
+
+
+def _find_windows_executable_on_path(filename: str, path: str | None) -> str | None:
+    """Search absolute PATH entries without Windows' implicit current-directory lookup."""
+
+    if not path:
+        return None
+    current_dir = ntpath.normcase(ntpath.abspath(os.getcwd()))
+    for raw_entry in path.split(";"):
+        entry = ntpath.expandvars(raw_entry.strip().strip('"'))
+        if not entry or not ntpath.isabs(entry):
+            continue
+        normalized_entry = ntpath.normcase(ntpath.abspath(entry))
+        try:
+            if ntpath.commonpath((current_dir, normalized_entry)) == current_dir:
+                continue
+        except ValueError:
+            pass
+        candidate = ntpath.normpath(ntpath.join(entry, filename))
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def resolve_pwsh() -> str:
+    """Resolve PowerShell 7 only from the trusted server process environment."""
+
+    executable: str | None
+    configured = (_environment_value(os.environ, PWSH_PATH_ENV) or "").strip().strip('"')
+    if configured:
+        executable = ntpath.normpath(ntpath.expandvars(configured))
+        if (
+            not ntpath.isabs(executable)
+            or ntpath.basename(executable).lower() != "pwsh.exe"
+            or not os.path.isfile(executable)
+        ):
+            raise ToolFailure(
+                "SHELL_NOT_FOUND",
+                f"{PWSH_PATH_ENV} must point to an existing absolute pwsh.exe path.",
+                category="runtime",
+                details={"executable": executable, "environment_variable": PWSH_PATH_ENV},
+            )
+    else:
+        executable = _find_windows_executable_on_path(
+            "pwsh.exe",
+            _environment_value(os.environ, "PATH"),
+        )
+    if executable is None:
+        raise ToolFailure(
+            "SHELL_NOT_FOUND",
+            "PowerShell 7 is required for Windows string commands, but pwsh was not found on PATH.",
+            category="runtime",
+            details={
+                "executable": "pwsh",
+                "retry_hint": (
+                    "Install PowerShell 7 and add pwsh to PATH, or set "
+                    f"{PWSH_PATH_ENV} to its absolute path."
+                ),
+            },
+        )
+    major = pwsh_major_version(executable)
+    if major < 7:
+        raise ToolFailure(
+            "SHELL_VERSION_UNSUPPORTED",
+            f"PowerShell 7 or newer is required; resolved major version {major}.",
+            category="runtime",
+            details={"executable": executable, "major_version": major, "required_major_version": 7},
+        )
+    return executable
+
+
+@functools.lru_cache(maxsize=16)
+def pwsh_major_version(executable: str) -> int:
+    """Return and cache the major version reported by a pwsh executable."""
+
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.Major",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+            env=_pwsh_probe_environment(),
+            cwd=ntpath.dirname(executable) or None,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ToolFailure(
+            "SHELL_VERSION_UNSUPPORTED",
+            "PowerShell version could not be verified.",
+            category="runtime",
+            details={"executable": executable, "reason": str(exc)},
+        ) from exc
+    stdout = completed.stdout.strip()
+    if completed.returncode != 0 or not stdout.isdigit():
+        raise ToolFailure(
+            "SHELL_VERSION_UNSUPPORTED",
+            "PowerShell version could not be verified.",
+            category="runtime",
+            details={
+                "executable": executable,
+                "exit_code": completed.returncode,
+                "stderr": completed.stderr.strip()[:500],
+            },
+        )
+    return int(stdout)
+
+
+def build_pwsh_argv(executable: str, command: str) -> list[str]:
+    """Build a deterministic non-interactive PowerShell invocation."""
+
+    return [
+        executable,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        command,
+    ]
 
 
 def terminate_process_group(
@@ -73,6 +224,9 @@ def spawn_process(
     """Spawn a pipe-backed or true POSIX PTY-backed process."""
 
     if not tty:
+        if os.name == "nt" and shell and isinstance(command, str):
+            command = build_pwsh_argv(resolve_pwsh(), command)
+            shell = False
         process = subprocess.Popen(
             command,
             cwd=cwd,
@@ -94,7 +248,10 @@ def spawn_process(
     try:
         import pty
 
-        master_fd, slave_fd = pty.openpty()
+        openpty = getattr(pty, "openpty", None)
+        if openpty is None:
+            raise ImportError("pty.openpty is unavailable")
+        master_fd, slave_fd = openpty()
     except (ImportError, OSError) as exc:
         raise ToolFailure(
             "TTY_UNSUPPORTED",
@@ -124,6 +281,7 @@ def spawn_process(
 class CommandRun:
     command_id: str
     process: subprocess.Popen[bytes]
+    client_request_id: str | None = None
     timeout_at: float | None = None
     warnings: list[str] = field(default_factory=list)
     stdout: bytearray = field(default_factory=bytearray)
@@ -230,30 +388,29 @@ class CommandRun:
             except OSError:
                 pass
 
-    def snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
-        self.refresh_status()
-        with self.lock:
-            stdout_omitted = max(0, self.stdout_start_offset - self.stdout_cursor)
-            stderr_omitted = max(0, self.stderr_start_offset - self.stderr_cursor)
-            stdout_start = max(0, self.stdout_cursor - self.stdout_start_offset)
-            stderr_start = max(0, self.stderr_cursor - self.stderr_start_offset)
-            stdout_bytes = bytes(self.stdout[stdout_start:])
-            stderr_bytes = bytes(self.stderr[stderr_start:])
-            self.stdout_cursor = self.stdout_total_bytes
-            self.stderr_cursor = self.stderr_total_bytes
+    def current_status(self) -> str:
+        if self.timed_out:
+            return "timeout"
+        if self.terminating and self.process.poll() is None:
+            return "running"
+        if self.signal_name is not None:
+            return "terminated"
+        return "running" if self.process.poll() is None else "exited"
+
+    def _snapshot_payload(
+        self,
+        stdout_bytes: bytes,
+        stderr_bytes: bytes,
+        *,
+        stdout_omitted: int,
+        stderr_omitted: int,
+        max_output_bytes: int,
+    ) -> dict[str, Any]:
         stdout_truncation = truncate_output_bytes_tail(stdout_bytes, max_output_bytes)
         stderr_truncation = truncate_output_bytes_tail(stderr_bytes, max_output_bytes)
-        if self.timed_out:
-            status = "timeout"
-        elif self.terminating and self.process.poll() is None:
-            status = "running"
-        elif self.signal_name is not None:
-            status = "terminated"
-        else:
-            status = "running" if self.process.poll() is None else "exited"
         payload: dict[str, Any] = {
             "command_id": self.command_id,
-            "status": status,
+            "status": self.current_status(),
             "exit_code": self.exit_code,
             "signal": self.signal_name,
             "timed_out": self.timed_out,
@@ -279,6 +436,8 @@ class CommandRun:
             ),
             "ok": True,
         }
+        if self.client_request_id is not None:
+            payload["client_request_id"] = self.client_request_id
         warnings: list[str] = list(self.warnings)
         if stdout_truncation.truncated:
             warnings.append(f"stdout truncated from tail by {stdout_truncation.truncated_by}")
@@ -291,6 +450,42 @@ class CommandRun:
         if warnings:
             payload["warnings"] = warnings
         return payload
+
+    def snapshot_since_cursor(self, max_output_bytes: int) -> dict[str, Any]:
+        self.refresh_status()
+        with self.lock:
+            stdout_omitted = max(0, self.stdout_start_offset - self.stdout_cursor)
+            stderr_omitted = max(0, self.stderr_start_offset - self.stderr_cursor)
+            stdout_start = max(0, self.stdout_cursor - self.stdout_start_offset)
+            stderr_start = max(0, self.stderr_cursor - self.stderr_start_offset)
+            stdout_bytes = bytes(self.stdout[stdout_start:])
+            stderr_bytes = bytes(self.stderr[stderr_start:])
+            self.stdout_cursor = self.stdout_total_bytes
+            self.stderr_cursor = self.stderr_total_bytes
+        return self._snapshot_payload(
+            stdout_bytes,
+            stderr_bytes,
+            stdout_omitted=stdout_omitted,
+            stderr_omitted=stderr_omitted,
+            max_output_bytes=max_output_bytes,
+        )
+
+    def snapshot_retained(self, max_output_bytes: int) -> dict[str, Any]:
+        """Return retained output without advancing the polling cursors."""
+
+        self.refresh_status()
+        with self.lock:
+            stdout_bytes = bytes(self.stdout)
+            stderr_bytes = bytes(self.stderr)
+            stdout_omitted = self.stdout_start_offset
+            stderr_omitted = self.stderr_start_offset
+        return self._snapshot_payload(
+            stdout_bytes,
+            stderr_bytes,
+            stdout_omitted=stdout_omitted,
+            stderr_omitted=stderr_omitted,
+            max_output_bytes=max_output_bytes,
+        )
 
     def refresh_status(self) -> None:
         if self.timeout_at is not None and not self.timed_out and self.process.poll() is None and time.time() >= self.timeout_at:

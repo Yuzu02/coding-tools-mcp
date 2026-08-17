@@ -6,7 +6,7 @@ properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The default catalog contains exactly 18 tools:
+The default catalog contains exactly 22 tools:
 
 - `server_info`: server, workspace, automatic project context, policy, runtime,
   auth, protocol, and fixed-catalog metadata.
@@ -16,8 +16,15 @@ The default catalog contains exactly 18 tools:
 - `list_files`: iterate files with glob, ignore, hidden-file, sort, and cap
   controls.
 - `search_text`: literal or regex search; ripgrep stops after the result cap.
+- `list_skills`: list effective project-scoped skills for an explicit workdir.
+- `read_skill`: load the effective named skill for an explicit workdir.
 - `apply_patch`: stage and atomically commit add/update/delete/move envelopes.
-- `exec_command`: run a bounded command and wait up to 10 seconds by default.
+- `exec_command`: run a bounded command and wait up to 10 seconds by default;
+  an optional stable `client_request_id` deduplicates an uncertain retry.
+- `list_commands`: list bounded metadata for workspace-owned commands; it can
+  filter by `client_request_id` without exposing command text or environment.
+- `get_command`: recover one workspace-owned command by `command_id` or
+  `client_request_id` without consuming its output cursor.
 - `write_stdin`: poll or interact with a running command.
 - `kill_command`: terminate one runtime-owned command.
 - `read_output`: page retained stdout or stderr using absolute byte offsets.
@@ -30,7 +37,7 @@ The default catalog contains exactly 18 tools:
 - `view_image`: one MCP image content block plus structured metadata.
 
 `view_image` may be disabled when an installation cannot accept binary image
-content. That capability gate is not a tool profile. The other 17 tools are
+content. That capability gate is not a tool profile. The other 21 tools are
 always advertised, and `listChanged` is `false`.
 
 ## Result envelope
@@ -108,8 +115,9 @@ Page a truncated stream using the returned reference:
 {"output_ref":"command:abc:stdout","offset":0,"limit":4096}
 ```
 
-`exec_command.workdir` and each file/Git tool's `path` argument are how a call
-targets a subdirectory; both are still confined to the workspace.
+`exec_command.workdir`, each Git tool's `workdir`, and each file/Git tool's
+`path` argument are how a call targets a subdirectory; all remain confined to
+the workspace.
 
 ## Command and output behavior
 
@@ -117,6 +125,15 @@ targets a subdirectory; both are still confined to the workspace.
 commands ordinarily return `status: "exited"` in one call. A still-running
 command returns a `command_id` and a machine-readable `next_action` for
 `write_stdin` with empty `chars`.
+
+For an execution whose outcome is uncertain, pass one stable, non-secret
+`client_request_id` to `exec_command`. Retrying the same request either
+returns the existing command or reports `COMMAND_STARTING`/
+`COMMAND_START_FAILED` while its launch state is being resolved. Reusing that
+identifier for different command inputs returns `IDEMPOTENCY_CONFLICT`.
+`list_commands` can find the command by that identifier, and `get_command`
+recovers its metadata and output references by exactly one of `command_id` or
+`client_request_id`.
 
 Only truncated terminal output returns a `read_output` next action by default.
 `output_ref` values are `command:<id>:stdout` or `command:<id>:stderr`; offsets

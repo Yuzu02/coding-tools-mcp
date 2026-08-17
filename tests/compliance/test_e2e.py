@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+import binascii
 import json
+import struct
+import zlib
 
 from tests.compliance.mcp_client import MCPError
 from tests.compliance.test_support import ComplianceTestCase
+
+
+def write_test_png(path, *, width: int = 32, height: int = 24) -> None:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", binascii.crc32(body) & 0xFFFFFFFF)
+
+    rows = []
+    for y in range(height):
+        row = bytearray([0])
+        for x in range(width):
+            row.extend(((x * 7) % 256, (y * 11) % 256, ((x + y) * 5) % 256))
+        rows.append(bytes(row))
+    data = b"\x89PNG\r\n\x1a\n"
+    data += chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    data += chunk(b"IDAT", zlib.compress(b"".join(rows), level=9))
+    data += chunk(b"IEND", b"")
+    path.write_bytes(data)
 
 
 class DeterministicE2ETests(ComplianceTestCase):
@@ -122,14 +143,20 @@ class DeterministicE2ETests(ComplianceTestCase):
         self.assert_denied_or_permission_required("exec_command", {"cmd": "cat ../outside-secret.txt"})
 
     def test_view_image_optional_p1_contract_when_exposed(self) -> None:
-        with self.session_for_fixture("image-project") as (_workspace, client):
+        with self.session_for_fixture("image-project") as (workspace, client):
             names = {tool.get("name") for tool in client.list_tools()}
             if "view_image" not in names:
                 self.skipTest("view_image is P1 and not exposed by this server")
-            image = client.call_tool("view_image", {"path": "assets/screenshot.png"})
+            generated = workspace.root / "assets" / "generated.png"
+            write_test_png(generated)
+            image = client.call_tool("view_image", {"path": "assets/generated.png"})
             payload = self.assert_tool_success(image)
             blob = self.tool_text(image)
             self.assertIn("image/png", blob)
+            self.assertEqual(payload.get("width"), 32)
+            self.assertEqual(payload.get("height"), 24)
+            self.assertEqual(payload.get("original", {}).get("width"), 32)
+            self.assertEqual(payload.get("original", {}).get("height"), 24)
             image_blocks = [item for item in image.get("content", []) if item.get("type") == "image"]
             self.assertEqual(len(image_blocks), 1)
             encoded = image_blocks[0].get("data")
@@ -137,5 +164,18 @@ class DeterministicE2ETests(ComplianceTestCase):
             self.assertEqual(json.dumps(image).count(str(encoded)), 1)
             self.assertNotIn("base64", payload)
             self.assertNotIn("data_url", payload)
+
+            resized = self.assert_tool_success(
+                client.call_tool(
+                    "view_image",
+                    {"path": "assets/generated.png", "max_width": 8, "max_height": 8, "auto_resize": True},
+                )
+            )
+            if resized.get("resized"):
+                self.assertLessEqual(resized.get("width", 99), 8)
+                self.assertLessEqual(resized.get("height", 99), 8)
+            else:
+                self.assertTrue(resized.get("warnings"), resized)
+
             bad = client.call_tool("view_image", {"path": "assets/not-image.txt"})
             self.assertTrue(bad.get("isError"), f"non-image input must fail: {bad!r}")

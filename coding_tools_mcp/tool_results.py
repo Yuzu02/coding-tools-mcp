@@ -169,6 +169,38 @@ def _render_search(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_list_skills(payload: dict[str, Any]) -> str:
+    skills = payload.get("skills")
+    if not isinstance(skills, list) or not skills:
+        return "No skills found."
+    lines: list[str] = []
+    for item in skills:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name", "")
+        description = item.get("description", "")
+        source = item.get("source", "")
+        if description:
+            lines.append(f"{name}: {description} ({source})")
+        else:
+            lines.append(f"{name} ({source})")
+    return "\n".join(lines)
+
+
+def _render_read_skill(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return ""
+    if not payload.get("truncated"):
+        return content
+    total_bytes = payload.get("total_bytes", "?")
+    returned_bytes = payload.get("returned_bytes", "?")
+    return (
+        f"[showing {returned_bytes} of {total_bytes} bytes; skill body truncated]\n"
+        f"{content}"
+    )
+
+
 def _render_patch(payload: dict[str, Any]) -> str:
     prefix = "Patch validated" if payload.get("dry_run") else "Patch applied"
     files = payload.get("affected_files")
@@ -402,6 +434,8 @@ _RENDERERS = {
     "list_dir": _render_list,
     "list_files": _render_list,
     "search_text": _render_search,
+    "list_skills": _render_list_skills,
+    "read_skill": _render_read_skill,
     "apply_patch": _render_patch,
     "exec_command": _render_exec,
     "write_stdin": _render_exec,

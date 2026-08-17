@@ -14,7 +14,7 @@ to 0.2.3 to get that fix alone; upgrade to 0.3.0 for the protocol work.
 
 ## Breaking changes
 
-### The two cwd tools are gone; the catalog is 18 tools
+### The two cwd tools are gone; the current catalog is 22 tools
 
 `get_default_cwd` and `set_default_cwd` are removed. There is no session to hold
 a working directory, so there is nothing to set or read: a relative `path`
@@ -23,6 +23,12 @@ always resolves against the workspace root.
 - Pass a workspace-relative `path` to the file and Git tools.
 - Pass `exec_command`'s `workdir` (also workspace-relative) to run somewhere
   else. It defaults to the workspace root.
+- Use `list_skills(workdir=".")` and `read_skill(workdir=".", skill=...)` to
+  discover project-scoped `SKILL.md` instructions for an explicit
+  workspace-relative directory.
+- Use `list_commands` and `get_command` to discover or recover workspace-owned
+  commands across stateless requests, including by `client_request_id` when an
+  `exec_command` outcome was uncertain.
 - `read_file`'s `next_action` continuation now repeats the workspace-relative
   path it was given. A client that fed the continuation back unchanged keeps
   working; one that re-based it against a session cwd must stop doing that.

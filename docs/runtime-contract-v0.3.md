@@ -293,7 +293,7 @@ Retry: This command_id has expired or never existed; …
 Known tool error codes include:
 
 ```json
-["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
+["ABSOLUTE_PATH_DENIED", "BINARY_FILE", "COMMAND_CLOSED", "COMMAND_LIMIT_REACHED", "COMMAND_NOT_FOUND", "COMMAND_START_FAILED", "COMMAND_STARTING", "ELICITATION_UNSUPPORTED", "GIT_ERROR", "IDEMPOTENCY_CONFLICT", "INTERNAL_ERROR", "INVALID_ARGUMENT", "IS_DIRECTORY", "NOT_A_DIRECTORY", "NOT_FOUND", "OUTPUT_TOO_LARGE", "PATCH_CONFLICT", "PATCH_CONTEXT_AMBIGUOUS", "PATCH_CONTEXT_NOT_FOUND", "PATCH_FAILED", "PATCH_HUNKS_OVERLAP", "PATCH_ROLLBACK_FAILED", "PATH_OUTSIDE_WORKSPACE", "PERMISSION_REQUIRED", "PROJECT_NOT_FOUND", "RUNTIME_DIR_UNWRITABLE", "SANDBOX_UNAVAILABLE", "SHELL_NOT_FOUND", "SHELL_VERSION_UNSUPPORTED", "SKILL_INVALID", "SKILL_NOT_FOUND", "SYMLINK_ESCAPE", "TTY_UNSUPPORTED", "UNSUPPORTED_ENCODING"]
 ```
 
 Error categories are `validation`, `security`, `permission`, `runtime`,
@@ -357,7 +357,7 @@ survive tunnel churn. Forwarded headers are ignored unless
 
 ## Stable tool inventory
 
-The default catalog has 18 tools, including `view_image`. Setting
+The default catalog has 22 tools, including `view_image`. Setting
 `CODING_TOOLS_MCP_ENABLE_VIEW_IMAGE=0` is the sole installation capability gate
 and removes only that optional binary-content tool. It is not a tool profile.
 
@@ -421,6 +421,28 @@ Annotations: `{"title":"Search text","readOnlyHint":true,"destructiveHint":false
 Ripgrep output is consumed incrementally and the process stops once the result
 cap is known to be exceeded. `context_lines=0` does not reread matching files.
 
+### list_skills
+
+Inputs: `"workdir"`.
+
+Annotations: `{"title":"List skills","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Returns the effective project-scoped skill catalog for the explicit
+workspace-relative `"workdir"`: the containing main project, nested subprojects,
+instruction files on the active scope chain, effective root-over-nested skill
+records, and bounded warnings.
+
+### read_skill
+
+Inputs: `"workdir"`, `"skill"`.
+
+Annotations: `{"title":"Read skill","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Reads only the effective named skill for the explicit workspace-relative
+`"workdir"`. It does not accept arbitrary source paths. Missing projects return
+`PROJECT_NOT_FOUND`; unknown names return `SKILL_NOT_FOUND` with the effective
+available names.
+
 ### apply_patch
 
 Inputs: `"patch"`, `"dry_run"`.
@@ -441,16 +463,40 @@ Supports `*** Add File`, `*** Update File`, `*** Delete File`, and
 
 ### exec_command
 
-Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`.
+Inputs: `"cmd"`, `"workdir"`, `"cwd"`, `"timeout_ms"`, `"yield_time_ms"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`, `"stdin"`, `"tty"`, `"env"`, `"client_request_id"`.
 
 Annotations: `{"title":"Execute command","readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}`.
 
 Statuses are `exited`, `running`, `timeout`, `terminated`, or `failed`.
 Launch/policy failures use the error envelope with `status: "failed"`; signal
 exits use `terminated`. Ordinary non-zero exit codes still use `exited`.
-`"workdir"` is workspace-relative and defaults to the workspace root.
+`"workdir"` is workspace-relative and defaults to the workspace root. A
+stable, non-secret `"client_request_id"` makes an uncertain retry idempotent:
+the same request returns the existing command, a different request returns
+`IDEMPOTENCY_CONFLICT`, and a still-resolving launch returns `COMMAND_STARTING`
+or `COMMAND_START_FAILED` with recovery guidance.
 
-Example: `{"cmd":"pytest -q","workdir":".","yield_time_ms":30000}`.
+Example: `{"cmd":"pytest -q","workdir":".","yield_time_ms":30000,"client_request_id":"test-run-1"}`.
+
+### list_commands
+
+Inputs: `"status"`, `"client_request_id"`, `"limit"`.
+
+Annotations: `{"title":"List commands","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Lists bounded metadata for retained workspace-owned commands across stateless
+requests. Filter by `"client_request_id"` to discover an uncertain execution;
+the response never exposes command text or environment values.
+
+### get_command
+
+Inputs: `"command_id"`, `"client_request_id"`, `"max_output_bytes"`, `"verbosity"`, `"preview_bytes"`.
+
+Annotations: `{"title":"Get command","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
+
+Recovers one retained workspace-owned command by exactly one of `"command_id"`
+or `"client_request_id"`, without consuming its output cursor. Returned output
+references remain page-able with `read_output`.
 
 ### write_stdin
 
@@ -493,31 +539,31 @@ Example: `{"output_ref":"command:abc:stdout","offset":0,"limit":4096}`.
 
 ### git_status
 
-Inputs: `"path"`, `"include_untracked"`, `"max_entries"`.
+Inputs: `"workdir"`, `"path"`, `"include_untracked"`, `"max_entries"`.
 
 Annotations: `{"title":"Git status","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
 ### git_diff
 
-Inputs: `"path"`, `"paths"`, `"staged"`, `"unstaged"`, `"context_lines"`, `"max_bytes"`.
+Inputs: `"workdir"`, `"path"`, `"paths"`, `"staged"`, `"unstaged"`, `"context_lines"`, `"max_bytes"`.
 
 Annotations: `{"title":"Git diff","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
 ### git_log
 
-Inputs: `"path"`, `"ref"`, `"max_count"`, `"skip"`.
+Inputs: `"workdir"`, `"path"`, `"ref"`, `"max_count"`, `"skip"`.
 
 Annotations: `{"title":"Git log","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
 ### git_show
 
-Inputs: `"rev"`, `"path"`, `"paths"`, `"include_diff"`, `"context_lines"`, `"max_bytes"`.
+Inputs: `"workdir"`, `"rev"`, `"path"`, `"paths"`, `"include_diff"`, `"context_lines"`, `"max_bytes"`.
 
 Annotations: `{"title":"Git show","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 
 ### git_blame
 
-Inputs: `"path"`, `"rev"`, `"start_line"`, `"end_line"`, `"max_lines"`.
+Inputs: `"workdir"`, `"path"`, `"rev"`, `"start_line"`, `"end_line"`, `"max_lines"`.
 
 Annotations: `{"title":"Git blame","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}`.
 

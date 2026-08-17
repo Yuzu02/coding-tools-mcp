@@ -235,8 +235,12 @@ class MCPContractTests(ComplianceTestCase):
             "list_dir": (True, False, True, False),
             "list_files": (True, False, True, False),
             "search_text": (True, False, True, False),
+            "list_skills": (True, False, True, False),
+            "read_skill": (True, False, True, False),
             "apply_patch": (False, True, False, False),
             "exec_command": (False, True, False, True),
+            "list_commands": (True, False, True, False),
+            "get_command": (True, False, True, False),
             "write_stdin": (False, False, False, False),
             "kill_command": (False, True, False, False),
             "read_output": (True, False, True, False),
@@ -248,8 +252,9 @@ class MCPContractTests(ComplianceTestCase):
             "request_permissions": (True, False, False, False),
             "view_image": (True, False, True, False),
         }
-        for tool in self.client.list_tools():
-            name = str(tool.get("name"))
+        tools = {str(tool.get("name")): tool for tool in self.client.list_tools()}
+        self.assertEqual(set(tools), set(expected))
+        for name, tool in tools.items():
             annotations = tool.get("annotations")
             with self.subTest(tool=name):
                 self.assertIsInstance(annotations, dict)
@@ -1503,7 +1508,7 @@ class MCPContractTests(ComplianceTestCase):
 
             tools = result.get("tools")
             self.assertIsInstance(tools, list)
-            self.assertEqual(len(tools), 18)
+            self.assertEqual(len(tools), 22)
             self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
             for tool in tools:
                 # The cache hints describe the catalog, not the entries in it;

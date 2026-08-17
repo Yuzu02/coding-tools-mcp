@@ -26,6 +26,13 @@ Local development mode. It allows dependency downloads, shell expansion, and inl
 
 `HOME`, `TMPDIR`, and `cache_dir` use the same external runtime directory layout as safe mode. Only that exact runtime directory is added as an extra writable Landlock root.
 
+`apply_patch` remains the direct file-edit primitive for deliberate agent
+edits. `exec_command` may also cause workspace-local writes when it runs the
+project's canonical tools, such as formatters in write mode, linters with
+autofix, code generators, package managers, migrations, or build tools. Those
+writes remain subject to the active command policy and filesystem sandbox; the
+caller should inspect the resulting diff and run the relevant checks.
+
 ```bash
 coding-tools-mcp --permission-mode trusted --workspace /path/to/repo
 ```
@@ -92,3 +99,11 @@ On Windows, the parent is the platform temp directory instead of `/tmp`. The ser
 The server does not create workspace-local `.coding-tools/` directories by default. Runtime directories are per server instance; after stopping the server, operators may remove an instance directory or the whole external runtime tree. Normal OS temp cleanup may also remove stale directories.
 
 Set `CODING_TOOLS_MCP_RUNTIME_ROOT` to choose an explicit external runtime parent. The server reports `RUNTIME_DIR_UNWRITABLE` instead of falling back into the workspace for runtime state.
+
+If workspace commands use package managers, code generators, build systems, or
+test fixtures that execute generated files, the configured runtime parent and
+the process `TMPDIR` must be on an execute-capable filesystem. A `noexec`
+runtime can still hold ordinary cache files, but generated shims such as
+`node_modules/.bin/*` or `npx` package binaries will fail at execution time.
+For hardened systemd deployments, use an isolated `CacheDirectory` rather than
+a `noexec` runtime mount when this behavior is required.

@@ -5,13 +5,20 @@ This repository uses a local compliance runner plus GitHub Actions.
 ## One-Command Gates
 
 ```bash
-make compliance
-make ci
+uv run --locked --extra dev make compliance
+uv run --locked --extra dev make ci
 ```
 
 `make compliance` runs the full compliance suite and writes `reports/compliance/latest.json` and `reports/compliance/latest.md`.
 
 `make ci` mirrors the main CI workflow: lint, typecheck, unittest discovery, npm launcher checks, protocol tests, integration/security tests, required docs checks, schema drift checks, dogfood smoke, and SWE-bench smoke preflight. It requires Python 3.11 or newer plus Node.js 18 or newer and npm; GitHub Actions uses Node.js 22.
+
+The development-only tools used by these gates (`ruff`, `mypy`, the official
+MCP SDK, and related test dependencies) live in the `dev` extra. From a clean
+checkout, include that extra in `uv run` as shown above. If you already ran
+`mise run setup-dev`, use `uv run --no-sync make ci` (or `make ci` from the
+activated `.venv`) to avoid re-synchronizing the environment without the dev
+extra.
 
 Report files are overwritten by whichever suite or benchmark was run most recently. Check `suite` in compliance reports and `conclusion` in benchmark reports before citing them.
 

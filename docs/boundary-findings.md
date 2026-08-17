@@ -17,22 +17,20 @@ Rust/Cargo, Python, FFmpeg downloads, interactive sessions, images, and git.
 - Security policy correctly blocks workspace escapes, secret-looking environment
   variables, and destructive commands.
 
-## Issues found and fixes planned
+## Issues found and current status
 
-### 1. Git helper tools can falsely report `is_repo: false`
+### 1. Git helper tools can falsely report `is_repo: false` — resolved
 
 The workspace is a valid git repository and native `git` works under
 `exec_command`, but `git_status`, `git_log`, and `git_diff` can report a
 non-repository fallback. Reproducing native git without the configured global git
 config produces Git's `dubious ownership` error for `/workspace`.
 
-Root cause: git helper methods call `subprocess.run` without the command
-environment used by `exec_command`, so they can miss `GIT_CONFIG_GLOBAL` and the
-configured `safe.directory=/workspace` entry.
-
-Fix: route git helper subprocesses through a shared git environment based on
-`_command_env({})`, pass it to git subprocesses, and surface rev-parse stderr as
-warnings instead of silently returning `is_repo: false`.
+The runtime now routes Git helper subprocesses through `_git_env()`, which is
+derived from `_command_env({})`. This keeps the helper tools aligned with the
+command environment, including `GIT_CONFIG_GLOBAL` when it is intentionally
+inherited. The helper methods also preserve explicit repository `workdir`
+semantics.
 
 ### 2. Python package installation is blocked by Landlock read roots
 
@@ -51,33 +49,44 @@ to the whole subtree, so it would have allowed listing directory names across
 metadata files remains a follow-up item that requires a deliberate security
 review.
 
-### 3. Common argument aliases are rejected by strict schemas
+### 3. Common argument aliases are rejected by strict schemas — resolved
 
 The schemas intentionally use `additionalProperties: false`, which is good for
 contract clarity but brittle for common coding-agent parameter names.
 
-Examples hit during dogfooding:
+Examples originally hit during dogfooding:
 
-- `exec_command` accepts `workdir`, not `cwd`.
-- `read_file` accepts `start_line`/`end_line`, not `max_lines`.
+- `exec_command` originally accepted `workdir`, not `cwd`.
+- `read_file` originally accepted `start_line`/`end_line`, not `max_lines`.
 - `git_status` accepts `path`/`include_untracked`/`max_entries`, not `short`.
 
-Fix: support safe aliases (`cwd`, `max_lines`) while keeping canonical fields,
-rejecting conflicting values. `git_status` intentionally does not accept
-`short`: its output is already structured entries, so the flag would have no
-effect and silently accepting it would mislead clients.
+`exec_command` now accepts `cwd` as an alias of `workdir`, and `read_file`
+accepts `max_lines`; conflicting canonical/alias values are rejected.
+`git_status` intentionally still does not accept `short`: its output is already
+structured entries, so silently accepting the flag would be misleading.
 
-### 4. Heredoc XML can be misclassified as an escaping path
+### 4. Heredoc XML can be misclassified as an escaping path — resolved
 
 Shell tokenization of a heredoc containing XML such as `<modelVersion>` can
 produce tokens like `/modelVersion`, which the path scanner treats as an absolute
 path escape.
 
-Fix: strip heredoc body lines from the command before path scanning, since the
-body is stdin data rather than shell code. Everything that remains live shell
-code stays visible to the scanner: redirection targets on the heredoc operator's
-own line (e.g. `cat <<EOF > /path`), and commands after the closing delimiter or
-chained after a `<<<` here-string.
+`_check_command_paths()` now scans `strip_heredoc_payloads(cmd)` instead of the
+raw command. Heredoc bodies are treated as stdin data, while redirection targets
+on the operator line and live commands after the closing delimiter remain
+visible to policy checks.
+
+### 5. Service-level UV caches can be outside Landlock write roots — resolved
+
+Long-running systemd units intentionally keep bootstrap caches under
+`/var/cache/coding-tools-mcp*/uv`. A trusted/safe child command that inherited
+that `UV_CACHE_DIR` could then fail under Landlock because command write access
+is confined to the per-runtime tree under `/run/.../runtime/...`.
+
+The runtime now rehomes inherited `UV_CACHE_DIR` to `<runtime>/cache/uv` and
+inherited `XDG_CACHE_HOME` to `<runtime>/cache` for non-dangerous child commands.
+Explicit per-command overrides remain intentional. `dangerous` mode preserves
+its existing unrestricted environment semantics.
 
 ## Remaining known limitations
 
@@ -87,3 +96,13 @@ chained after a `<<<` here-string.
   image.
 - The system lacks an `xz` executable; Python's `lzma` can still extract `.xz`
   archives as a fallback.
+- A full `make ci` launched *through another trusted, Landlocked
+  coding-tools-mcp instance* is not equivalent to the normal host/CI gate. The
+  outer sandbox remains authoritative over every nested runtime. In particular,
+  a service-level `CODING_TOOLS_MCP_RUNTIME_ROOT` must not be reused by nested
+  test workspaces; executable temporary fixtures need an execute-capable outer
+  path; host Git configuration can reference files such as
+  `/etc/git/gitignore_global` that are outside the outer instance's read roots;
+  and host PTY exhaustion is inherited. Run the canonical full suite from the
+  host shell or CI. Focused tests that do not depend on those outer resources
+  remain valid when dogfooding through the connector.

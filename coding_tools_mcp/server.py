@@ -86,6 +86,8 @@ from .protocol import (
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
+from .project_catalog import build_project_catalog
+from .skill_catalog import ProjectNotFoundError, SkillCatalog, SkillInvalidError, SkillNotFoundError
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
@@ -130,6 +132,18 @@ RISKY_ENV_NAMES = {
     "RUBYOPT",
     "RUBYLIB",
 }
+# These values bootstrap the MCP server itself, not commands it runs in a workspace.
+MCP_BOOTSTRAP_ENV_NAMES = frozenset(
+    {
+        "VIRTUAL_ENV",
+        "UV_PROJECT_ENVIRONMENT",
+        "UV_PYTHON",
+        "UV_NO_SYNC",
+        "UV_MANAGED_PYTHON",
+        "UV_PYTHON_INSTALL_DIR",
+        "UV_RUN_RECURSION_DEPTH",
+    }
+)
 SHELL_ENV_INHERIT_CHOICES = ("core", "all", "none")
 
 
@@ -187,9 +201,20 @@ NETWORK_RE = re.compile(
     r"(https?://|urllib\.request|urllib3|requests\.|http\.client|\bHTTPConnection\b|\bHTTPSConnection\b|socket\.|aiohttp|httpx|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bssh\b|\bscp\b|\bftp\b)",
     re.I,
 )
+POWERSHELL_NETWORK_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|"
+    r"Test-NetConnection|Test-Connection|Resolve-DnsName|iwr|irm|tnc|ping(?:\.exe)?|"
+    r"nslookup(?:\.exe)?|tracert(?:\.exe)?)\b|(?:System\.)?Net\.",
+    re.I,
+)
 SHELL_EXPANSION_RE = re.compile(r"(`|\$\(|\$\{)")
 DESTRUCTIVE_RE = re.compile(
     r"(^|\s)(sudo|su|chmod\s+-R|chown\s+-R|mkfs|mount|umount|find\b[^;&|]*\s-delete\b|git\b[^;&|]*\breset\s+--hard\b|git\b[^;&|]*\bclean\s+-[^\s]*[fx][^\s]*|rm\s+-[^\s]*r[^\s]*f|rm\s+-[^\s]*f[^\s]*r)\b",
+    re.I,
+)
+POWERSHELL_DESTRUCTIVE_RE = re.compile(
+    r"(?:^|[;&|{}\r\n])\s*(?:Remove-Item|rm|ri|del|erase|rmdir|rd)\b"
+    r"(?=[^;&|{}\r\n]*\s-(?:r|re|rec|recu|recur|recurs|recurse)\b)",
     re.I,
 )
 MAX_HTTP_REQUEST_BYTES = 1_048_576
@@ -198,6 +223,9 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+CLIENT_REQUEST_ID_MAX_LENGTH = 128
+CLIENT_REQUEST_START_WAIT_SECONDS = 5.0
+CLIENT_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -392,6 +420,61 @@ def is_risky_env_name(name: str) -> bool:
 
 def is_filtered_env_var(name: str, value: str) -> bool:
     return bool(SENSITIVE_ENV_RE.search(name) or is_risky_env_name(name) or SENSITIVE_VALUE_RE.search(value))
+
+
+def _environment_key(environment: dict[str, str], target: str) -> str | None:
+    """Find an environment key, honoring Windows' case-insensitive names."""
+
+    if os.name != "nt":
+        return target if target in environment else None
+    target_upper = target.upper()
+    return next((name for name in environment if name.upper() == target_upper), None)
+
+
+def _normalized_path_entry(value: str) -> str:
+    return os.path.normcase(os.path.normpath(value.strip().strip('"')))
+
+
+def mcp_bootstrap_venv_roots(environment: dict[str, str]) -> tuple[str, ...]:
+    """Return the MCP venv roots before an inheritance policy narrows env."""
+
+    roots: list[str] = []
+    for name in ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
+        key = _environment_key(environment, name)
+        if key is not None and environment[key] and environment[key] not in roots:
+            roots.append(environment[key])
+    return tuple(roots)
+
+
+def sanitize_mcp_bootstrap_environment(
+    environment: dict[str, str], *, venv_roots: tuple[str, ...] | None = None
+) -> dict[str, str]:
+    """Remove inherited MCP Python/uv bootstrap state from workspace child commands.
+
+    Explicit policy and per-command values are applied afterwards and remain
+    intentional overrides.  This removal is independent of permission mode:
+    dangerous mode may inherit sensitive values, but not the MCP's own venv.
+    """
+
+    sanitized = dict(environment)
+    roots = venv_roots if venv_roots is not None else mcp_bootstrap_venv_roots(sanitized)
+    for name in MCP_BOOTSTRAP_ENV_NAMES:
+        key = _environment_key(sanitized, name)
+        if key is not None:
+            del sanitized[key]
+    path_key = _environment_key(sanitized, "PATH")
+    if path_key is None or not roots:
+        return sanitized
+    venv_bin_entries = {
+        _normalized_path_entry(os.path.join(root, executable_dir))
+        for root in roots
+        for executable_dir in ("bin", "Scripts")
+    }
+    sanitized[path_key] = os.pathsep.join(
+        entry for entry in sanitized[path_key].split(os.pathsep)
+        if _normalized_path_entry(entry) not in venv_bin_entries
+    )
+    return sanitized
 
 
 def is_core_command_env_name(name: str) -> bool:
@@ -604,6 +687,19 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         read_only=True,
         idempotent=True,
     ),
+    "list_skills": ToolSpec(
+        title="List skills",
+        description="List project-scoped skills and instruction files for the explicit workspace-relative workdir.",
+        read_only=True,
+        idempotent=True,
+    ),
+    "read_skill": ToolSpec(
+        title="Read skill",
+        description="Read the effective named skill for the explicit workspace-relative workdir.",
+        read_only=True,
+        idempotent=True,
+        error_status="failed",
+    ),
     "apply_patch": ToolSpec(
         title="Apply patch",
         description=(
@@ -616,14 +712,34 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Execute command",
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
-            "A still-running command returns command_id. Example: "
-            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
+            "A still-running command returns command_id. Supply one stable non-secret client_request_id to "
+            "deduplicate an uncertain retry. Example: "
+            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000,"
+            "\"client_request_id\":\"test-run-1\"}. "
             "Retained output is bounded per stream; for very large output redirect to a file "
             "(cmd > out.log 2>&1) and page it with read_file or search_text."
         ),
         destructive=True,
         open_world=True,
         error_status="failed",
+    ),
+    "list_commands": ToolSpec(
+        title="List commands",
+        description=(
+            "List bounded metadata for workspace-owned commands across stateless MCP requests. Filter by "
+            "client_request_id to discover an uncertain execution without exposing command text or environment values."
+        ),
+        read_only=True,
+        idempotent=True,
+    ),
+    "get_command": ToolSpec(
+        title="Get command",
+        description=(
+            "Recover one workspace-owned command by command_id or client_request_id without consuming its output cursor. "
+            "Use returned output_refs with read_output for stable paging."
+        ),
+        read_only=True,
+        idempotent=True,
     ),
     "write_stdin": ToolSpec(
         title="Write stdin",
@@ -653,31 +769,31 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "git_status": ToolSpec(
         title="Git status",
-        description="Return git working tree status for the workspace.",
+        description="Return git working tree status for an explicit repository workdir.",
         read_only=True,
         idempotent=True,
     ),
     "git_diff": ToolSpec(
         title="Git diff",
-        description="Return unified git diff for workspace changes.",
+        description="Return unified git diff for a repository selected by explicit workdir.",
         read_only=True,
         idempotent=True,
     ),
     "git_log": ToolSpec(
         title="Git log",
-        description="Return recent git commits with bounded structured metadata.",
+        description="Return recent commits for a repository selected by explicit workdir.",
         read_only=True,
         idempotent=True,
     ),
     "git_show": ToolSpec(
         title="Git show",
-        description="Return bounded git show output for a revision.",
+        description="Return bounded git show output from a repository selected by explicit workdir.",
         read_only=True,
         idempotent=True,
     ),
     "git_blame": ToolSpec(
         title="Git blame",
-        description="Return bounded git blame metadata for a workspace file.",
+        description="Return bounded git blame metadata relative to an explicit repository workdir.",
         read_only=True,
         idempotent=True,
     ),
@@ -1107,8 +1223,12 @@ class Workspace:
         return pure
 
     def resolve_existing(self, raw_path: str = ".") -> ResolvedPath:
+        return self.resolve_existing_at(self.root, raw_path)
+
+    def resolve_existing_at(self, base: Path, raw_path: str = ".") -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path or ".")
-        candidate = self.root.joinpath(*pure.parts)
+        base = self._validate_base(base)
+        candidate = base.joinpath(*pure.parts)
         try:
             resolved = candidate.resolve(strict=True)
         except FileNotFoundError as exc:
@@ -1119,10 +1239,14 @@ class Workspace:
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
+        return self.resolve_for_write_at(self.root, raw_path)
+
+    def resolve_for_write_at(self, base: Path, raw_path: str) -> ResolvedPath:
         pure = self._reject_unsafe_text(raw_path)
         if pure.name in {"", ".", ".."}:
             raise ToolFailure("INVALID_ARGUMENT", "Invalid write target.", category="validation")
-        candidate = self.root.joinpath(*pure.parts)
+        base = self._validate_base(base)
+        candidate = base.joinpath(*pure.parts)
         if candidate.exists() or candidate.is_symlink():
             resolved = candidate.resolve(strict=True)
             if not is_relative_to(resolved, self.root):
@@ -1133,7 +1257,7 @@ class Workspace:
         missing: list[Path] = []
         while not parent.exists():
             missing.append(parent)
-            if parent == self.root or parent.parent == parent:
+            if parent == base or parent.parent == parent:
                 break
             parent = parent.parent
         try:
@@ -1144,6 +1268,17 @@ class Workspace:
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
         return ResolvedPath(normalize_rel_display(target, self.root), target, False)
+
+    def _validate_base(self, base: Path) -> Path:
+        try:
+            resolved = base.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ToolFailure("NOT_FOUND", "Default cwd path no longer exists.", category="not_found") from exc
+        if not resolved.is_dir():
+            raise ToolFailure("NOT_A_DIRECTORY", "Default cwd is not a directory.", category="validation")
+        if not is_relative_to(resolved, self.root):
+            raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Default cwd escapes the configured workspace.", category="security")
+        return resolved
 
     def reject_write_symlink(self, raw_path: str) -> None:
         pure = self._reject_unsafe_text(raw_path)
@@ -1204,6 +1339,13 @@ class Workspace:
         return {path for path in completed.stdout.split("\0") if path}
 
 
+@dataclass
+class ClientRequestBinding:
+    fingerprint: str
+    command_id: str | None = None
+    ready: threading.Event = field(default_factory=threading.Event)
+
+
 class WorkspaceCommandManager:
     """Own commands for one workspace independently of MCP transport sessions."""
 
@@ -1216,7 +1358,9 @@ class WorkspaceCommandManager:
         )
         self.commands: dict[str, CommandRun] = {}
         self.output_commands: dict[str, CommandRun] = {}
-        self.lock = threading.Lock()
+        self.client_requests: dict[str, ClientRequestBinding] = {}
+        self.command_client_requests: dict[str, str] = {}
+        self.lock = threading.RLock()
         self.starting_commands = 0
         self.closed = False
         # Retention observability: how often output is evicted past the head
@@ -1251,8 +1395,13 @@ class WorkspaceCommandManager:
                 return
             self.closed = True
             commands = list(self.commands.values())
+            bindings = list(self.client_requests.values())
             self.commands.clear()
             self.output_commands.clear()
+            self.client_requests.clear()
+            self.command_client_requests.clear()
+        for binding in bindings:
+            binding.ready.set()
         for command in commands:
             command.refresh_status()
             if command.process.poll() is None:
@@ -1261,6 +1410,49 @@ class WorkspaceCommandManager:
         shutil.rmtree(self.runtime_dir, ignore_errors=True)
         if self.fallback_runtime_dir is not None:
             shutil.rmtree(self.fallback_runtime_dir, ignore_errors=True)
+
+    def reserve_client_request(
+        self, client_request_id: str, fingerprint: str
+    ) -> tuple[bool, ClientRequestBinding]:
+        with self.lock:
+            if self.closed:
+                raise ToolFailure("COMMAND_CLOSED", "Workspace command manager is closed.", category="runtime")
+            existing = self.client_requests.get(client_request_id)
+            if existing is not None:
+                if existing.fingerprint != fingerprint:
+                    raise ToolFailure(
+                        "IDEMPOTENCY_CONFLICT",
+                        "client_request_id is already bound to a different command request.",
+                        category="validation",
+                        details={"client_request_id": client_request_id},
+                    )
+                return False, existing
+            binding = ClientRequestBinding(fingerprint=fingerprint)
+            self.client_requests[client_request_id] = binding
+            return True, binding
+
+    def publish_client_request(
+        self, client_request_id: str, binding: ClientRequestBinding, command_id: str
+    ) -> None:
+        with self.lock:
+            if self.client_requests.get(client_request_id) is binding:
+                binding.command_id = command_id
+                self.command_client_requests[command_id] = client_request_id
+                binding.ready.set()
+
+    def release_client_request(self, client_request_id: str, binding: ClientRequestBinding) -> None:
+        with self.lock:
+            if self.client_requests.get(client_request_id) is binding:
+                self.client_requests.pop(client_request_id, None)
+            binding.ready.set()
+
+    def remove_command_binding_locked(self, command_id: str) -> None:
+        client_request_id = self.command_client_requests.pop(command_id, None)
+        if client_request_id is None:
+            return
+        binding = self.client_requests.get(client_request_id)
+        if binding is not None and binding.command_id == command_id:
+            self.client_requests.pop(client_request_id, None)
 
 
 class Runtime:
@@ -1342,6 +1534,7 @@ class Runtime:
         self.project_context: ProjectContext = (
             project_context if project_context is not None else load_project_context(self.workspace.root)
         )
+        self.skill_catalog = SkillCatalog(build_project_catalog(self.workspace.root))
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self._tool_handlers = {name: getattr(self, name) for name in TOOL_REGISTRY}
 
@@ -1368,7 +1561,7 @@ class Runtime:
         return self.command_manager.output_commands
 
     @property
-    def commands_lock(self) -> threading.Lock:
+    def commands_lock(self) -> threading.RLock:
         return self.command_manager.lock
 
     @property
@@ -2110,6 +2303,39 @@ class Runtime:
             "warnings": ["result limit reached"] if total > len(matches) else [],
         }
 
+    def list_skills(self, args: dict[str, Any]) -> dict[str, Any]:
+        workdir = self._resolve_skill_workdir(str(args.get("workdir", ".")))
+        try:
+            context = self.skill_catalog.list_for(workdir.path)
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        return {"ok": True, **context.payload()}
+
+    def read_skill(self, args: dict[str, Any]) -> dict[str, Any]:
+        workdir = self._resolve_skill_workdir(str(args.get("workdir", ".")))
+        skill = str(args.get("skill", ""))
+        if not skill:
+            raise ToolFailure("INVALID_ARGUMENT", "skill is required.", category="validation")
+        try:
+            loaded = self.skill_catalog.read(workdir.path, skill)
+        except ValueError as exc:
+            raise ToolFailure("INVALID_ARGUMENT", str(exc), category="validation") from exc
+        except ProjectNotFoundError as exc:
+            raise ToolFailure("PROJECT_NOT_FOUND", str(exc), category="not_found") from exc
+        except SkillNotFoundError as exc:
+            raise ToolFailure(
+                "SKILL_NOT_FOUND", str(exc), category="not_found", details={"available": list(exc.available)}
+            ) from exc
+        except SkillInvalidError as exc:
+            raise ToolFailure("SKILL_INVALID", str(exc), category="invalid_state") from exc
+        return {"ok": True, **loaded.payload()}
+
+    def _resolve_skill_workdir(self, raw_workdir: str) -> ResolvedPath:
+        resolved = self.resolve_existing(raw_workdir or ".")
+        if not resolved.path.is_dir():
+            raise ToolFailure("NOT_A_DIRECTORY", "workdir must be a directory.", category="validation")
+        return resolved
+
     def _search_text_with_rg(
         self,
         resolved: ResolvedPath,
@@ -2346,6 +2572,71 @@ class Runtime:
                 None if change.baseline.data is None else change.baseline.data.decode("utf-8", errors="replace")
             )
 
+    def _validated_client_request_id(self, raw: Any) -> str | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, str) or not CLIENT_REQUEST_ID_RE.fullmatch(raw):
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                "client_request_id must be 1-128 characters using letters, digits, '.', '_', ':', or '-'.",
+                category="validation",
+            )
+        return raw
+
+    def _command_request_fingerprint(
+        self,
+        *,
+        cmd: str,
+        workdir: ResolvedPath,
+        timeout_ms: int,
+        tty: bool,
+        stdin_text: str,
+        explicit_env: Any,
+    ) -> str:
+        env_items = (
+            sorted((str(key), str(value)) for key, value in explicit_env.items())
+            if isinstance(explicit_env, dict)
+            else []
+        )
+        canonical = json.dumps(
+            {
+                "cmd": cmd,
+                "workdir": workdir.display,
+                "timeout_ms": timeout_ms,
+                "tty": tty,
+                "stdin": stdin_text,
+                "env": env_items,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _recover_deduplicated_command(
+        self, binding: ClientRequestBinding, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not binding.ready.wait(CLIENT_REQUEST_START_WAIT_SECONDS):
+            raise ToolFailure(
+                "COMMAND_STARTING",
+                "The idempotent command is still starting; retry with the same client_request_id.",
+                category="runtime",
+                retryable=True,
+            )
+        if binding.command_id is None:
+            raise ToolFailure(
+                "COMMAND_START_FAILED",
+                "The original idempotent command did not finish starting; retry with the same client_request_id.",
+                category="runtime",
+                retryable=True,
+            )
+        command = self._get_command(binding.command_id)
+        payload = command.snapshot_retained(int(args.get("max_output_bytes", 65536)))
+        payload["elapsed_ms"] = int((time.time() - command.started_at) * 1000)
+        payload["deduplicated"] = True
+        self._add_exec_diagnostics(payload)
+        return self._format_command_output(command, payload, args)
+
     def exec_command(self, args: dict[str, Any]) -> dict[str, Any]:
         self._prune_commands()
         cmd = str(args.get("cmd", ""))
@@ -2363,7 +2654,24 @@ class Runtime:
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
-        env = self._command_env(args.get("env", {}))
+        explicit_env = args.get("env", {})
+        env = self._command_env(explicit_env)
+        client_request_id = self._validated_client_request_id(args.get("client_request_id"))
+        client_binding: ClientRequestBinding | None = None
+        if client_request_id is not None:
+            fingerprint = self._command_request_fingerprint(
+                cmd=cmd,
+                workdir=workdir,
+                timeout_ms=timeout_ms,
+                tty=tty,
+                stdin_text=stdin_text,
+                explicit_env=explicit_env,
+            )
+            owns_client_binding, client_binding = self.command_manager.reserve_client_request(
+                client_request_id, fingerprint
+            )
+            if not owns_client_binding:
+                return self._recover_deduplicated_command(client_binding, args)
         start = time.time()
         deadline = start + (timeout_ms / 1000.0)
         landlock_fd: int | None = None
@@ -2389,10 +2697,14 @@ class Runtime:
             if self._closed or self.command_manager.closed:
                 if landlock_fd is not None:
                     os.close(landlock_fd)
+                if client_request_id is not None and client_binding is not None:
+                    self.command_manager.release_client_request(client_request_id, client_binding)
                 raise ToolFailure("COMMAND_CLOSED", "Workspace command manager is closed.", category="runtime")
             if len(self.commands) + self.starting_commands >= MAX_ACTIVE_COMMANDS:
                 if landlock_fd is not None:
                     os.close(landlock_fd)
+                if client_request_id is not None and client_binding is not None:
+                    self.command_manager.release_client_request(client_request_id, client_binding)
                 raise ToolFailure(
                     "COMMAND_LIMIT_REACHED",
                     "Too many commands are already running or starting.",
@@ -2405,6 +2717,7 @@ class Runtime:
         command: CommandRun | None = None
         registered = False
         slot_released = False
+        binding_published = False
         try:
             process, pty_master_fd = spawn_process(
                 popen_cmd,
@@ -2419,6 +2732,7 @@ class Runtime:
                 timeout_at=deadline,
                 warnings=[landlock_warning] if landlock_warning else None,
                 pty_master_fd=pty_master_fd,
+                client_request_id=client_request_id,
             )
             with self.commands_lock:
                 self.starting_commands -= 1
@@ -2428,12 +2742,17 @@ class Runtime:
                     registered = True
             if not registered:
                 raise ToolFailure("COMMAND_CLOSED", "Runtime closed while the command was starting.", category="runtime")
+            if client_request_id is not None and client_binding is not None:
+                self.command_manager.publish_client_request(client_request_id, client_binding, command.command_id)
+                binding_published = True
         except Exception:
             with self.commands_lock:
                 if not registered and not slot_released:
                     self.starting_commands -= 1
             if process is not None and process.poll() is None:
                 terminate_process_group(process, signal.SIGTERM)
+            if client_request_id is not None and client_binding is not None and not binding_published:
+                self.command_manager.release_client_request(client_request_id, client_binding)
             raise
         finally:
             if landlock_fd is not None:
@@ -2522,14 +2841,15 @@ class Runtime:
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if DESTRUCTIVE_RE.search(cmd):
+        if DESTRUCTIVE_RE.search(cmd) or POWERSHELL_DESTRUCTIVE_RE.search(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Destructive commands are blocked without explicit permission.",
                 category="permission",
                 details={"permission": "destructive_command", "command": compact},
             )
-        if not self.allow_network and NETWORK_RE.search(cmd) and not is_literal_network_reference_command(cmd):
+        network_command = NETWORK_RE.search(cmd) or POWERSHELL_NETWORK_RE.search(cmd)
+        if not self.allow_network and network_command and not is_literal_network_reference_command(cmd):
             raise ToolFailure(
                 "PERMISSION_REQUIRED",
                 "Network access is denied by default.",
@@ -2622,7 +2942,13 @@ class Runtime:
             )
 
     def _command_env(self, extra: Any) -> dict[str, str]:
+        inherited_bootstrap_roots = (
+            mcp_bootstrap_venv_roots({str(key): str(value) for key, value in os.environ.items()})
+            if self.shell_env_policy.inherit != "none"
+            else ()
+        )
         env = self._base_command_env()
+        env = sanitize_mcp_bootstrap_environment(env, venv_roots=inherited_bootstrap_roots)
         if not self.dangerously_skip_all_permissions:
             env = {key: value for key, value in env.items() if not is_filtered_env_var(key, value)}
             env = {key: value for key, value in env.items() if key not in ECOSYSTEM_CACHE_ENV_NAMES}
@@ -2643,6 +2969,11 @@ class Runtime:
         tmp_dir = self.command_tmp_dir()
         env["HOME"] = str(self.command_home_dir())
         env["TMPDIR"] = str(tmp_dir)
+        if not self.dangerously_skip_all_permissions:
+            if "UV_CACHE_DIR" in env and "UV_CACHE_DIR" not in self.shell_env_policy.set:
+                env["UV_CACHE_DIR"] = str(self.cache_dir / "uv")
+            if "XDG_CACHE_HOME" in env and "XDG_CACHE_HOME" not in self.shell_env_policy.set:
+                env["XDG_CACHE_HOME"] = str(self.cache_dir)
         if os.name == "nt":
             env["TEMP"] = str(tmp_dir)
             env["TMP"] = str(tmp_dir)
@@ -2699,13 +3030,61 @@ class Runtime:
         completed = self._run_git_text([require_git(), "-C", str(path), "rev-parse", rev], env=env)
         return completed.stdout.strip() if completed.returncode == 0 else ""
 
-    def _git_path_filters(self, args: dict[str, Any]) -> list[str]:
+    def _resolve_git_workdir(self, args: dict[str, Any], *, path_alias: bool = False) -> ResolvedPath:
+        raw_workdir = args.get("workdir")
+        raw_alias = args.get("path") if path_alias else None
+        if raw_workdir is not None and raw_alias is not None:
+            if str(raw_alias) == ".":
+                resolved = self.resolve_existing(str(raw_workdir))
+            elif str(raw_workdir) == ".":
+                resolved = self.resolve_existing(str(raw_alias))
+            else:
+                workdir = self.resolve_existing(str(raw_workdir))
+                alias = self.resolve_existing(str(raw_alias))
+                if workdir.path != alias.path:
+                    raise ToolFailure("INVALID_ARGUMENT", "workdir and path refer to different repositories.", category="validation")
+                resolved = workdir
+        else:
+            raw = raw_workdir if raw_workdir is not None else raw_alias if raw_alias is not None else "."
+            resolved = self.resolve_existing(str(raw))
+        if not resolved.path.is_dir():
+            raise ToolFailure("NOT_A_DIRECTORY", "Git workdir must be a directory.", category="validation")
+        return resolved
+
+    def _git_repository_root(self, workdir: Path, *, env: dict[str, str] | None = None) -> Path | None:
+        completed = self._run_git_text([require_git(), "-C", str(workdir), "rev-parse", "--show-toplevel"], env=env)
+        if completed.returncode != 0:
+            return None
+        raw_root = completed.stdout.strip()
+        if not raw_root:
+            return None
+        try:
+            repo_root = Path(raw_root).resolve(strict=True)
+        except OSError as exc:
+            raise ToolFailure("GIT_ERROR", f"Git repository root could not be resolved: {raw_root}", category="runtime") from exc
+        if not is_relative_to(repo_root, self.workspace.root):
+            raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Git repository root escapes the configured workspace.", category="security")
+        return repo_root
+
+    def _raw_git_path_filters(self, args: dict[str, Any]) -> list[str]:
         path_filters: list[str] = []
         if isinstance(args.get("path"), str):
             path_filters.append(str(args["path"]))
         if isinstance(args.get("paths"), list):
             path_filters.extend(str(item) for item in args["paths"])
-        return [self.git_path_filter(path) for path in path_filters]
+        return path_filters
+
+    def _git_path_filters(self, args: dict[str, Any], *, workdir: Path, repo_root: Path) -> list[str]:
+        filters: list[str] = []
+        for raw_path in self._raw_git_path_filters(args):
+            resolved = self.workspace.resolve_for_write_at(workdir, raw_path)
+            if not is_relative_to(resolved.path, repo_root):
+                raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Git path filter escapes the selected repository.", category="security")
+            filters.append(Path(os.path.relpath(resolved.path, workdir)).as_posix())
+        return filters
+
+    def _git_fallback_path_filters(self, args: dict[str, Any], *, workdir: Path) -> list[str]:
+        return [self.workspace.resolve_for_write_at(workdir, raw_path).display for raw_path in self._raw_git_path_filters(args)]
 
     def _base_command_env(self) -> dict[str, str]:
         if self.shell_env_policy.inherit == "none":
@@ -2725,10 +3104,12 @@ class Runtime:
         timeout_at: float | None = None,
         warnings: list[str] | None = None,
         pty_master_fd: int | None = None,
+        client_request_id: str | None = None,
     ) -> CommandRun:
         return CommandRun(
             command_id=secrets.token_urlsafe(18),
             process=process,
+            client_request_id=client_request_id,
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
@@ -2754,6 +3135,7 @@ class Runtime:
             or retained > MAX_RUNTIME_OUTPUT_BYTES
         ):
             oldest = self.output_commands.pop(next(iter(self.output_commands)))
+            self.command_manager.remove_command_binding_locked(oldest.command_id)
             retained -= oldest.retained_bytes
 
     def _complete_command(self, command: CommandRun) -> None:
@@ -2780,6 +3162,7 @@ class Runtime:
             ]
             for command_id in expired:
                 self.output_commands.pop(command_id, None)
+                self.command_manager.remove_command_binding_locked(command_id)
             self._evict_retained_locked()
 
     def _get_output_command(self, command_id: str) -> CommandRun:
@@ -2794,6 +3177,96 @@ class Runtime:
                 details={"retry_hint": _COMMAND_RECOVERY_HINT},
             )
         return command
+
+    def _command_metadata(self, command: CommandRun) -> dict[str, Any]:
+        command.refresh_status()
+        if command.process.poll() is not None:
+            self._complete_command(command)
+        stdout_head, stdout, stdout_start, stdout_total, stdout_dropped = command.retained_stream_segments("stdout")
+        stderr_head, stderr, stderr_start, stderr_total, stderr_dropped = command.retained_stream_segments("stderr")
+        finished_at = command.completed_at or time.time()
+        metadata: dict[str, Any] = {
+            "command_id": command.command_id,
+            "status": command.current_status(),
+            "exit_code": command.exit_code,
+            "signal": command.signal_name,
+            "timed_out": command.timed_out,
+            "started_at": datetime.fromtimestamp(command.started_at, tz=timezone.utc).isoformat(),
+            "completed_at": None if command.completed_at is None else datetime.fromtimestamp(command.completed_at, tz=timezone.utc).isoformat(),
+            "elapsed_ms": int((finished_at - command.started_at) * 1000),
+            "stdout_total_bytes": stdout_total,
+            "stderr_total_bytes": stderr_total,
+            "stdout_retained_bytes": len(stdout_head) + len(stdout),
+            "stderr_retained_bytes": len(stderr_head) + len(stderr),
+            "stdout_retained_start_offset": stdout_start,
+            "stderr_retained_start_offset": stderr_start,
+            "stdout_dropped_bytes": stdout_dropped,
+            "stderr_dropped_bytes": stderr_dropped,
+            "output_refs": {
+                "stdout": f"command:{command.command_id}:stdout",
+                "stderr": f"command:{command.command_id}:stderr",
+            },
+        }
+        if command.client_request_id is not None:
+            metadata["client_request_id"] = command.client_request_id
+        return metadata
+
+    def list_commands(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._prune_commands()
+        status_filter = str(args.get("status", "all"))
+        if status_filter not in {"all", "running", "completed"}:
+            raise ToolFailure("INVALID_ARGUMENT", "status must be one of: all, running, completed.", category="validation")
+        limit = max(1, min(int(args.get("limit", 20)), 100))
+        client_request_id = self._validated_client_request_id(args.get("client_request_id"))
+        pending = False
+        with self.commands_lock:
+            if client_request_id is not None:
+                binding = self.command_manager.client_requests.get(client_request_id)
+                pending = binding is not None and binding.command_id is None
+                command_ids = [] if binding is None or binding.command_id is None else [binding.command_id]
+                commands = [
+                    command
+                    for command_id in command_ids
+                    if (command := self.commands.get(command_id) or self.output_commands.get(command_id)) is not None
+                ]
+            else:
+                commands = list({**self.output_commands, **self.commands}.values())
+        metadata = [self._command_metadata(command) for command in commands]
+        if status_filter == "running":
+            metadata = [item for item in metadata if item["status"] == "running"]
+        elif status_filter == "completed":
+            metadata = [item for item in metadata if item["status"] != "running"]
+        metadata.sort(key=lambda item: str(item["started_at"]), reverse=True)
+        total = len(metadata)
+        return {"commands": metadata[:limit], "count": min(total, limit), "total": total, "truncated": total > limit, "pending": pending, "ok": True, "warnings": []}
+
+    def get_command(self, args: dict[str, Any]) -> dict[str, Any]:
+        command_id_arg = args.get("command_id")
+        client_request_arg = args.get("client_request_id")
+        if (command_id_arg is None) == (client_request_arg is None):
+            raise ToolFailure("INVALID_ARGUMENT", "Provide exactly one of command_id or client_request_id.", category="validation")
+        recovered_by = "command_id"
+        if client_request_arg is not None:
+            client_request_id = self._validated_client_request_id(client_request_arg)
+            assert client_request_id is not None
+            with self.commands_lock:
+                binding = self.command_manager.client_requests.get(client_request_id)
+            if binding is None:
+                raise ToolFailure("COMMAND_NOT_FOUND", "No command is retained for client_request_id.", category="not_found")
+            if not binding.ready.is_set() or binding.command_id is None:
+                raise ToolFailure("COMMAND_STARTING", "The command is still starting; retry get_command with the same client_request_id.", category="runtime", retryable=True)
+            command_id = binding.command_id
+            recovered_by = "client_request_id"
+        else:
+            command_id = str(command_id_arg or "")
+            if not command_id:
+                raise ToolFailure("INVALID_ARGUMENT", "command_id is required.", category="validation")
+        command = self._get_command(command_id)
+        payload = command.snapshot_retained(int(args.get("max_output_bytes", 65536)))
+        payload["elapsed_ms"] = int((time.time() - command.started_at) * 1000)
+        payload["recovered_by"] = recovered_by
+        self._add_exec_diagnostics(payload)
+        return self._format_command_output(command, payload, args)
 
     def _format_command_output(self, command: CommandRun, payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
         terminal = payload.get("status") != "running"
@@ -3069,6 +3542,7 @@ class Runtime:
         if evict:
             with self.commands_lock:
                 self.commands.pop(command_id, None)
+                self.command_manager.remove_command_binding_locked(command_id)
         return payload
 
     def _get_command(self, command_id: str) -> CommandRun:
@@ -3085,7 +3559,7 @@ class Runtime:
         return command
 
     def git_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self.resolve_existing(str(args.get("path", ".")))
+        resolved = self._resolve_git_workdir(args, path_alias=True)
         max_entries = int(args.get("max_entries", 1000))
         include_untracked = bool(args.get("include_untracked", True))
         git = require_git()
@@ -3129,6 +3603,7 @@ class Runtime:
                 break
         return {
             "is_repo": True,
+            "workdir": resolved.display,
             "branch": branch,
             "head": self._git_rev_parse(resolved.path, "HEAD", env=git_env),
             "upstream": upstream,
@@ -3142,18 +3617,20 @@ class Runtime:
     def git_diff(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
+        workdir = self._resolve_git_workdir(args)
         staged = bool(args.get("staged", False))
         unstaged = bool(args.get("unstaged", True))
         context = int(args.get("context_lines", 3))
         max_bytes = int(args.get("max_bytes", 262144))
-        path_filters = self._git_path_filters(args)
-        if not self._is_git_repo(self.workspace.root, env=git_env):
-            return self._fallback_diff(path_filters, max_bytes)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
+        if repo_root is None:
+            return self._fallback_diff(self._git_fallback_path_filters(args, workdir=workdir.path), max_bytes)
+        path_filters = self._git_path_filters(args, workdir=workdir.path, repo_root=repo_root)
         chunks: list[bytes] = []
         if unstaged:
-            chunks.append(self._run_git_diff(git, context, path_filters, cached=False, env=git_env))
+            chunks.append(self._run_git_diff(git, workdir.path, context, path_filters, cached=False, env=git_env))
         if staged:
-            chunks.append(self._run_git_diff(git, context, path_filters, cached=True, env=git_env))
+            chunks.append(self._run_git_diff(git, workdir.path, context, path_filters, cached=True, env=git_env))
         combined = b""
         for chunk in chunks:
             if combined and chunk and not combined.endswith(b"\n"):
@@ -3163,6 +3640,7 @@ class Runtime:
         diff_text = diff_truncation.content
         truncated = diff_truncation.truncated
         return {
+            "workdir": workdir.display,
             "diff": diff_text,
             "files": parse_diff_files(diff_text),
             **truncation_fields(diff_truncation),
@@ -3170,9 +3648,9 @@ class Runtime:
         }
 
     def _run_git_diff(
-        self, git: str, context: int, path_filters: list[str], *, cached: bool, env: dict[str, str] | None = None
+        self, git: str, workdir: Path, context: int, path_filters: list[str], *, cached: bool, env: dict[str, str] | None = None
     ) -> bytes:
-        cmd = [git, "-C", str(self.workspace.root), "diff", f"--unified={context}"]
+        cmd = [git, "-C", str(workdir), "diff", f"--unified={context}"]
         if cached:
             cmd.append("--cached")
         if path_filters:
@@ -3225,18 +3703,19 @@ class Runtime:
     def git_log(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
-        requested_path = str(args.get("path", "."))
-        resolved = self.resolve_existing(requested_path)
-        if not self._is_git_repo(resolved.path, env=git_env):
+        workdir = self._resolve_git_workdir(args)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
+        if repo_root is None:
             return {"is_repo": False, "commits": [], "truncated": False, "warnings": []}
         ref = validate_git_ref(str(args.get("ref", "HEAD")))
         max_count = int(args.get("max_count", 20))
         skip = int(args.get("skip", 0))
-        path_filter = resolved.display
+        path_filters = self._git_path_filters(args, workdir=workdir.path, repo_root=repo_root)
+        path_filter = path_filters[0] if path_filters else "."
         cmd = [
             git,
             "-C",
-            str(self.workspace.root),
+            str(workdir.path),
             "log",
             f"--max-count={max_count + 1}",
             f"--skip={skip}",
@@ -3244,8 +3723,8 @@ class Runtime:
             "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s%x1e",
             ref,
         ]
-        if path_filter != ".":
-            cmd.extend(["--", path_filter])
+        if path_filters:
+            cmd.extend(["--", *path_filters])
         completed = self._run_git_text(cmd, timeout=10, env=git_env)
         if completed.returncode != 0:
             raise ToolFailure("GIT_ERROR", completed.stderr.strip() or "git log failed", category="runtime")
@@ -3267,6 +3746,7 @@ class Runtime:
         truncated = len(commits) > max_count
         result = {
             "is_repo": True,
+            "workdir": workdir.display,
             "ref": ref,
             "path": path_filter,
             "max_count": max_count,
@@ -3279,7 +3759,8 @@ class Runtime:
             result["next_action"] = {
                 "tool": "git_log",
                 "arguments": {
-                    "path": requested_path,
+                    "workdir": workdir.display,
+                    **({"path": path_filter} if path_filters else {}),
                     "ref": ref,
                     "max_count": max_count,
                     "skip": skip + max_count,
@@ -3290,17 +3771,19 @@ class Runtime:
     def git_show(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
-        if not self._is_git_repo(self.workspace.root, env=git_env):
+        workdir = self._resolve_git_workdir(args)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
+        if repo_root is None:
             return {"is_repo": False, "content": "", "files": [], "truncated": False, "warnings": []}
         rev = validate_git_ref(str(args.get("rev", "HEAD")))
         context = int(args.get("context_lines", 3))
         max_bytes = int(args.get("max_bytes", 262144))
         include_diff = bool(args.get("include_diff", True))
-        normalized_filters = self._git_path_filters(args)
+        normalized_filters = self._git_path_filters(args, workdir=workdir.path, repo_root=repo_root)
         cmd = [
             git,
             "-C",
-            str(self.workspace.root),
+            str(workdir.path),
             "show",
             "--no-ext-diff",
             "--format=fuller",
@@ -3319,6 +3802,7 @@ class Runtime:
         content = truncation.content
         return {
             "is_repo": True,
+            "workdir": workdir.display,
             "rev": rev,
             "content": content,
             "files": parse_diff_files(content),
@@ -3329,12 +3813,17 @@ class Runtime:
     def git_blame(self, args: dict[str, Any]) -> dict[str, Any]:
         git = require_git()
         git_env = self._git_env()
+        workdir = self._resolve_git_workdir(args)
+        repo_root = self._git_repository_root(workdir.path, env=git_env)
         requested_path = str(args.get("path", ""))
-        resolved = self.resolve_existing(requested_path)
+        resolved = self.workspace.resolve_existing_at(workdir.path, requested_path)
         if resolved.path.is_dir():
             raise ToolFailure("IS_DIRECTORY", "Path is a directory.", category="validation")
-        if not self._is_git_repo(self.workspace.root, env=git_env):
+        if repo_root is None:
             return {"is_repo": False, "path": resolved.display, "lines": [], "truncated": False, "warnings": []}
+        if not is_relative_to(resolved.path, repo_root):
+            raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Blame path escapes the selected repository.", category="security")
+        blame_path = Path(os.path.relpath(resolved.path, workdir.path)).as_posix()
         ref_arg = args.get("rev")
         ref = validate_git_ref(str(ref_arg)) if isinstance(ref_arg, str) and ref_arg else None
         start_line = int(args.get("start_line", 1))
@@ -3352,7 +3841,7 @@ class Runtime:
         cmd = [
             git,
             "-C",
-            str(self.workspace.root),
+            str(workdir.path),
             "blame",
             "--line-porcelain",
             "-L",
@@ -3360,7 +3849,7 @@ class Runtime:
         ]
         if ref:
             cmd.append(ref)
-        cmd.extend(["--", resolved.display])
+        cmd.extend(["--", blame_path])
         completed = self._run_git_text(cmd, timeout=10, env=git_env)
         if completed.returncode != 0:
             raise ToolFailure("GIT_ERROR", completed.stderr.strip() or "git blame failed", category="runtime")
@@ -3370,6 +3859,7 @@ class Runtime:
             truncated = True
         result = {
             "is_repo": True,
+            "workdir": workdir.display,
             "path": resolved.display,
             "rev": ref,
             "start_line": start_line,
@@ -3381,6 +3871,7 @@ class Runtime:
         }
         if truncated and final_line < requested_final_line:
             next_arguments: dict[str, Any] = {
+                "workdir": workdir.display,
                 "path": requested_path,
                 "start_line": final_line + 1,
                 "end_line": requested_final_line,
@@ -4268,7 +4759,7 @@ def _guard_allow_roots_cached(java_home: str, path_env: str, extra_roots: str) -
             resolved = Path(item).expanduser().resolve()
         except OSError:
             continue
-        if resolved.is_dir():
+        if resolved.is_dir() or resolved.is_file():
             roots.add(str(resolved))
     return tuple(sorted(root for root in roots if root and Path(root).is_absolute()))
 
@@ -4635,6 +5126,10 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             },
             ["query"],
         ),
+        "list_skills": object_schema({"workdir": {**string, "default": "."}}),
+        "read_skill": object_schema(
+            {"workdir": {**string, "default": "."}, "skill": {**string, "minLength": 1}}, ["skill"]
+        ),
         "apply_patch": object_schema({"patch": {**string, "minLength": 1}, "dry_run": {**boolean, "default": False}}, ["patch"]),
         "exec_command": object_schema(
             {
@@ -4649,8 +5144,40 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "stdin": {**string, "default": ""},
                 "tty": {**boolean, "default": False},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "default": {}},
+                "client_request_id": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": CLIENT_REQUEST_ID_MAX_LENGTH,
+                    "pattern": CLIENT_REQUEST_ID_RE.pattern,
+                },
             },
             ["cmd"],
+        ),
+        "list_commands": object_schema(
+            {
+                "status": {**string, "enum": ["all", "running", "completed"], "default": "all"},
+                "client_request_id": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": CLIENT_REQUEST_ID_MAX_LENGTH,
+                    "pattern": CLIENT_REQUEST_ID_RE.pattern,
+                },
+                "limit": {**integer, "minimum": 1, "maximum": 100, "default": 20},
+            }
+        ),
+        "get_command": object_schema(
+            {
+                "command_id": {**string, "minLength": 1},
+                "client_request_id": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": CLIENT_REQUEST_ID_MAX_LENGTH,
+                    "pattern": CLIENT_REQUEST_ID_RE.pattern,
+                },
+                "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
+                "verbosity": {**string, "enum": ["summary", "preview", "full"]},
+                "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
+            }
         ),
         "write_stdin": object_schema(
             {
@@ -4686,6 +5213,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_status": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": {**string, "default": "."},
                 "include_untracked": {**boolean, "default": True},
                 "max_entries": {**integer, "minimum": 1, "maximum": 10000, "default": 1000},
@@ -4693,6 +5221,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_diff": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": string,
                 "paths": string_array,
                 "staged": {**boolean, "default": False},
@@ -4703,6 +5232,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_log": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": {**string, "default": "."},
                 "ref": {**string, "default": "HEAD"},
                 "max_count": {**integer, "minimum": 1, "maximum": 100, "default": 20},
@@ -4711,6 +5241,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_show": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "rev": {**string, "default": "HEAD"},
                 "path": string,
                 "paths": string_array,
@@ -4721,6 +5252,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         ),
         "git_blame": object_schema(
             {
+                "workdir": {**string, "default": "."},
                 "path": {**string, "minLength": 1},
                 "rev": string,
                 "start_line": {**integer, "minimum": 1, "default": 1},

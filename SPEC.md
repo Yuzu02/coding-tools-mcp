@@ -17,12 +17,13 @@ no dynamic `tools/list_changed`, and no required `open_workspace` call.
 `apply_patch` is the only direct file-write tool. `safe`, `trusted`, and
 `dangerous` are command permission policies and never alter `tools/list`.
 
-The default catalog contains 18 tools:
+The default catalog contains 22 tools:
 
 - runtime/context: `server_info`, `check_exec_environment`
 - workspace inspection: `read_file`, `list_dir`, `list_files`, `search_text`
+- project skills: `list_skills`, `read_skill`
 - mutation: `apply_patch`
-- processes: `exec_command`, `write_stdin`, `read_output`, `kill_command`
+- processes: `exec_command`, `list_commands`, `get_command`, `write_stdin`, `read_output`, `kill_command`
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`
 - policy/image: `request_permissions`, `view_image`
 

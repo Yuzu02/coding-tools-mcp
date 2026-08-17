@@ -2,6 +2,13 @@
 
 ## 0.3.0 - 2026-08-13
 
+### Added
+
+- Add a Python multiplatform services launcher with pinned `mise` toolchains,
+  locked `uv` synchronization, OpenAI tunnel profile generation/validation,
+  cross-platform process-tree supervision, redacted run manifests, diagnostic
+  capture, and a documented non-root `systemd` deployment.
+
 ### Changed
 
 - **Breaking:** command handles are now named `command_id`; `kill_session` is
@@ -25,14 +32,17 @@
   `id: 1` could cancel each other's commands. Terminate a command with
   `kill_command`; the reduced cancellation responsiveness is tracked in issue
   #48.
-- **Breaking:** `get_default_cwd` and `set_default_cwd` are removed and the
-  default catalog is now 18 tools. A relative `path` always resolves against
-  the workspace root, so there is no session-scoped working directory to set,
-  read, or lose on reconnect. Pass a workspace-relative `path`, or
-  `exec_command`'s `workdir`, to target a subdirectory. The `read_file`
-  `next_action` continuation now repeats the workspace-relative path it was
-  given rather than one relative to a session cwd, and `server_info` no longer
-  reports `default_cwd`.
+- **Breaking:** `get_default_cwd` and `set_default_cwd` are removed. A
+  relative `path` always resolves against the workspace root, so there is no
+  session-scoped working directory to set, read, or lose on reconnect. Pass a
+  workspace-relative `path`, or `exec_command`'s `workdir`, to target a
+  subdirectory. The `read_file` `next_action` continuation now repeats the
+  workspace-relative path it was given rather than one relative to a session
+  cwd, and `server_info` no longer reports `default_cwd`.
+- The current default catalog is 22 tools: the cwd tools are gone, the
+  stateless runtime exposes project-scoped `list_skills` / `read_skill`, and
+  workspace-owned command recovery is exposed through `list_commands` /
+  `get_command`.
 - Tool descriptions now direct remote clients to pass explicit `path`/`workdir`
   arguments and include concrete examples for patching and command
   continuation.
