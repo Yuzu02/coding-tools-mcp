@@ -4,10 +4,32 @@ from dataclasses import dataclass, field
 from typing import Mapping, Protocol
 
 from .config import ConfigNode, table
+from .contributions import (
+    ContributionRegistry,
+    ServerMetadataContribution,
+    ToolContribution,
+    ToolDecorator,
+)
+from .services import ServiceRegistry
 
 
-class ExtensionContext(Protocol):
-    """Registration context contract completed by the contribution layer in Task 4."""
+@dataclass(frozen=True)
+class ExtensionContext:
+    services: ServiceRegistry
+    contributions: ContributionRegistry
+    extension_name: str
+
+    def add_tool(self, tool: ToolContribution) -> None:
+        self.contributions.add_tool(self.extension_name, tool)
+
+    def add_decorator(self, decorator: ToolDecorator) -> None:
+        self.contributions.add_decorator(self.extension_name, decorator)
+
+    def add_metadata(self, key: str, value: object) -> None:
+        self.contributions.add_metadata(
+            self.extension_name,
+            ServerMetadataContribution(key=key, value=value),
+        )
 
 
 @dataclass(frozen=True)
