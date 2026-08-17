@@ -1048,7 +1048,7 @@ Maven home: /usr/share/maven
             (workspace / "large.txt").write_text(content, encoding="utf-8")
             result = Runtime(workspace).call_tool(
                 "read_file",
-                {"path": "large.txt", "max_bytes": 60_000},
+                {"path": "large.txt", "max_bytes": 60_000, "project_id": "default"},
             )
 
             payload = result["structuredContent"]
@@ -1102,7 +1102,11 @@ Maven home: /usr/share/maven
         with TemporaryDirectory() as tmp:
             result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
                 "exec_command",
-                {"cmd": "echo All checks completed.; exit 7", "timeout_ms": 10000},
+                {
+                    "cmd": "echo All checks completed.; exit 7",
+                    "timeout_ms": 10000,
+                    "project_id": "default",
+                },
             )
             model_text = self.agent_text(result)
             self.assertIn("Status: exited", model_text)
@@ -1114,7 +1118,12 @@ Maven home: /usr/share/maven
             command = f"{sys.executable} -c \"print('x' * 5000)\""
             result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
                 "exec_command",
-                {"cmd": command, "timeout_ms": 10000, "max_output_bytes": 512},
+                {
+                    "cmd": command,
+                    "timeout_ms": 10000,
+                    "max_output_bytes": 512,
+                    "project_id": "default",
+                },
             )
             model_text = self.agent_text(result)
             self.assertIn('read_output(output_ref="command:', model_text)
@@ -1129,6 +1138,7 @@ Maven home: /usr/share/maven
                     "cmd": "printf ok; printf 12345678901234567890 >&2",
                     "timeout_ms": 10000,
                     "max_output_bytes": 5,
+                    "project_id": "default",
                 },
             )
             payload = result["structuredContent"]
@@ -1153,6 +1163,7 @@ Maven home: /usr/share/maven
                     "cmd": "printf 1234567890; printf abcdefghij >&2",
                     "timeout_ms": 10000,
                     "max_output_bytes": 5,
+                    "project_id": "default",
                 },
             )
             payload = result["structuredContent"]
@@ -1178,7 +1189,12 @@ Maven home: /usr/share/maven
         with TemporaryDirectory() as tmp:
             result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
                 "exec_command",
-                {"cmd": "sleep 1", "timeout_ms": 10000, "yield_time_ms": 0},
+                {
+                    "cmd": "sleep 1",
+                    "timeout_ms": 10000,
+                    "yield_time_ms": 0,
+                    "project_id": "default",
+                },
             )
             model_text = self.agent_text(result)
             self.assertIn("Status: running", model_text)
@@ -1189,7 +1205,10 @@ Maven home: /usr/share/maven
             workspace = Path(tmp)
             content = "\n".join(f"line-{index}" for index in range(1, 2501)) + "\n"
             (workspace / "long.txt").write_text(content, encoding="utf-8")
-            result = Runtime(workspace).call_tool("read_file", {"path": "long.txt"})
+            result = Runtime(workspace).call_tool(
+                "read_file",
+                {"path": "long.txt", "project_id": "default"},
+            )
             model_text = self.agent_text(result)
             self.assertIn("Showing lines 1-2000 of 2500", model_text)
             self.assertIn(
@@ -1211,7 +1230,7 @@ Maven home: /usr/share/maven
             runtime = Runtime(workspace)
             first = runtime.call_tool(
                 "read_file",
-                {"path": "nested/long.txt", "max_bytes": 16},
+                {"path": "nested/long.txt", "max_bytes": 16, "project_id": "default"},
             )
             first_payload = first["structuredContent"]
             action = first_payload.get("next_action")
@@ -1231,7 +1250,7 @@ Maven home: /usr/share/maven
             (workspace / "single-line.txt").write_text("x" * 100, encoding="utf-8")
             result = Runtime(workspace).call_tool(
                 "read_file",
-                {"path": "single-line.txt", "max_bytes": 16},
+                {"path": "single-line.txt", "max_bytes": 16, "project_id": "default"},
             )
             payload = result["structuredContent"]
             self.assertIs(payload.get("truncated"), True)
@@ -1261,7 +1280,7 @@ Maven home: /usr/share/maven
             self.assertEqual(committed.returncode, 0, committed.stderr)
             runtime = Runtime(workspace)
 
-            log_result = runtime.call_tool("git_log", {"max_count": 1})
+            log_result = runtime.call_tool("git_log", {"max_count": 1, "project_id": "default"})
             log_payload = log_result["structuredContent"]
             self.assertIs(log_payload.get("truncated"), True)
             self.assertEqual(
@@ -1280,6 +1299,7 @@ Maven home: /usr/share/maven
                     "start_line": 1,
                     "end_line": 3,
                     "max_lines": 1,
+                    "project_id": "default",
                 },
             )
             blame_payload = blame_result["structuredContent"]
@@ -1299,7 +1319,7 @@ Maven home: /usr/share/maven
             (workspace / "data.txt").write_text("needle\n" * 5, encoding="utf-8")
             result = Runtime(workspace).call_tool(
                 "search_text",
-                {"query": "needle", "max_results": 2},
+                {"query": "needle", "max_results": 2, "project_id": "default"},
             )
             model_text = self.agent_text(result)
             self.assertIn("showing 2 of", model_text)
@@ -1309,7 +1329,7 @@ Maven home: /usr/share/maven
         with TemporaryDirectory() as tmp:
             result = Runtime(Path(tmp), permission_mode="trusted").call_tool(
                 "exec_command",
-                {"cmd": "pwd", "workdir": "missing"},
+                {"cmd": "pwd", "workdir": "missing", "project_id": "default"},
             )
             self.assertIs(result.get("isError"), True)
             self.assertEqual(result.get("structuredContent", {}).get("status"), "failed")
@@ -1349,7 +1369,7 @@ Maven home: /usr/share/maven
                         pass
                 runtime.close()
 
-    def test_initialize_injects_root_instructions_and_indexes_nested_instructions(self) -> None:
+    def test_initialize_is_project_neutral_when_projects_extension_is_enabled(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "AGENTS.md").write_text("Run the focused test suite.\n", encoding="utf-8")
@@ -1359,12 +1379,12 @@ Maven home: /usr/share/maven
 
             initialized = Runtime(workspace).initialize()
             instructions = initialized.get("instructions", "")
-            self.assertIn("Run the focused test suite.", instructions)
-            self.assertIn("packages/api/AGENTS.md", instructions)
+            self.assertIn("list_projects", instructions)
+            self.assertIn("project_id", instructions)
+            self.assertIn("No previous request selects a current project", instructions)
+            self.assertNotIn("Run the focused test suite.", instructions)
+            self.assertNotIn("packages/api/AGENTS.md", instructions)
             self.assertNotIn("API-only nested rule.", instructions)
-            self.assertIn("exec_command may modify files inside the configured workspace", instructions)
-            self.assertIn("canonical workspace tools", instructions)
-            self.assertNotIn("do not modify files through exec_command", instructions)
 
     def test_exec_command_compact_preview_and_read_output(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1982,8 +2002,7 @@ class ErrorTextTerminalityTests(unittest.TestCase):
                     self.assertIn("Retryable: no", text)
                     self.assertIn("Do not repeat this call unchanged.", text)
                     self.assertIn("exec_command", text)
-                    self.assertIn(str(server_module.COMPLETED_COMMAND_TTL_SECONDS), text)
-                    self.assertIn(str(server_module.MAX_RETAINED_OUTPUT_COMMANDS), text)
+                    self.assertIn("project_id", text)
                     self.assertIs(result["structuredContent"]["error"]["retryable"], False)
 
 

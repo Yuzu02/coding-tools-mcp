@@ -12,6 +12,13 @@ from .registry import PROJECT_REGISTRY, ProjectRegistry, ProjectRegistryError, R
 from .skill_catalog import SkillCatalog
 
 
+_COMMAND_RECOVERY_HINT = (
+    "This command_id has expired or never existed in the configured project runtimes. "
+    "Retrying the same command_id cannot succeed. Start the work again with exec_command "
+    "for the intended project_id and use the command_id it returns."
+)
+
+
 class CommandOwnershipIndex:
     def __init__(self) -> None:
         self._owners: dict[str, str] = {}
@@ -37,6 +44,7 @@ class CommandOwnershipIndex:
                 "COMMAND_NOT_FOUND",
                 "Command is not retained by any configured project.",
                 category="not_found",
+                details={"retry_hint": _COMMAND_RECOVERY_HINT},
             )
         return owner
 

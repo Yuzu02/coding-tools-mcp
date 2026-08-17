@@ -1,18 +1,19 @@
 # Project Addressing + Semantic Navigation Design
 
 **Date:** 2026-08-16
-**Status:** Phase 0 extension foundation and Phase A project addressing are implemented; Phase A final acceptance/documentation verification is in progress, Phase B semantic navigation is pending
+**Status:** Phase 0 extension foundation and Phase A project addressing are implemented and verified; Phase B semantic navigation is pending
 **Target:** fork-owned multi-project and semantic extensions composed through the internal ExtensionHost
 
 **Repository validation snapshot (2026-08-17, refreshed after Phase A implementation):**
 
 - fork `main`: `da89d81` after the four-project integration checkpoint
 - current original upstream `xyTom/main`: `66b3f19`
-- upstream remained an ancestor through the Phase A implementation sequence; Task 11 reconfirms the live remote/ref before final acceptance
+- upstream was revalidated during final acceptance: remote and local `xyTom/main` both resolve to `66b3f19`, and upstream remains an ancestor of fork `main`
 - Phase 0 is implemented: layered TOML config, static extension registry/DAG, typed services, contributions/decorators, `ExtensionHost`, mother-core bridge, and the first `projects` extension are live and verified
 - Phase A now provides immutable stable configured project IDs, structural `scope_id` separation, lazy project runtimes, nested registered-root boundaries, explicit project-scoped core/skill routing, command ownership recovery, global project discovery, and project-neutral handshake/discovery instructions
 - the default composed catalog exposes 24 tools (`projects` contributes four); disabling `projects` exposes the 20 mother-core tools
-- the real-server Phase A integration checkpoint passes four-project stdio/HTTP routing, concurrent reads, and stateless command recovery; the runtime-contract v0.4/docs and final full acceptance gates are the remaining Phase A closure work
+- Phase A final acceptance passed on 2026-08-17: extension tests 141/141, project/skills regressions 16/16, full unit discovery 517 tests with 7 skips and 0 failures, full compliance 129/129, protocol/schema-drift/dispatch-input gates, Ruff, mypy, integration suites, npm launcher checks, and `mise run verify`
+- real-server acceptance covers four-project stdio/HTTP routing, concurrent reads, stateless command recovery, project-neutral discovery, nested project boundaries, and the normative runtime contract v0.4
 
 ## 1. Objective
 

@@ -131,8 +131,8 @@ class OffMeansOffTests(unittest.TestCase):
                     with tempfile.TemporaryDirectory() as tmp:
                         runtime = Runtime(Path(tmp))
                         _initialize(runtime)
-                        runtime.call_tool("check_exec_environment", {})
-                        runtime.call_tool("read_file", {"path": "missing.txt"})
+                        runtime.call_tool("check_exec_environment", {"project_id": "default"})
+                        runtime.call_tool("read_file", {"path": "missing.txt", "project_id": "default"})
                         runtime.close()
                 get_sender.assert_not_called()
 
@@ -186,9 +186,15 @@ def _run_probe_session() -> _CapturingSender:
             (workspace / f"{marker}.txt").write_text("leakprobe-content\n", encoding="utf-8")
             runtime = Runtime(workspace)
             _initialize(runtime, client_name="clientinfo-probe")
-            runtime.call_tool("check_exec_environment", {})
-            runtime.call_tool("read_file", {"path": f"{marker}-missing.txt"})
-            runtime.call_tool("read_file", {"path": f"{marker}-missing.txt"})
+            runtime.call_tool("check_exec_environment", {"project_id": "default"})
+            runtime.call_tool(
+                "read_file",
+                {"path": f"{marker}-missing.txt", "project_id": "default"},
+            )
+            runtime.call_tool(
+                "read_file",
+                {"path": f"{marker}-missing.txt", "project_id": "default"},
+            )
             runtime.close()
     return sender
 
@@ -262,8 +268,8 @@ class SessionEventTests(unittest.TestCase):
         with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
             with tempfile.TemporaryDirectory() as tmp:
                 runtime = Runtime(Path(tmp))
-                runtime.call_tool("check_exec_environment", {})
-                runtime.call_tool("read_file", {"path": "missing.txt"})
+                runtime.call_tool("check_exec_environment", {"project_id": "default"})
+                runtime.call_tool("read_file", {"path": "missing.txt", "project_id": "default"})
                 runtime.close()
         self.assertEqual(sender.events, [])
 
@@ -288,7 +294,10 @@ class SessionEventTests(unittest.TestCase):
                 _modern_request(
                     runtime,
                     "tools/call",
-                    {"name": "read_file", "arguments": {"path": "missing.txt"}},
+                    {
+                        "name": "read_file",
+                        "arguments": {"path": "missing.txt", "project_id": "default"},
+                    },
                     client_info={"name": "modern-probe", "version": "2.0"},
                 )
                 _modern_request(runtime, "tools/list")
@@ -351,7 +360,10 @@ class SessionEventTests(unittest.TestCase):
                         _modern_request(
                             runtime,
                             "tools/call",
-                            {"name": "read_file", "arguments": {"path": "missing.txt"}},
+                            {
+                                "name": "read_file",
+                                "arguments": {"path": "missing.txt", "project_id": "default"},
+                            },
                             client_info=client_info,
                         )
                         runtime.close()
