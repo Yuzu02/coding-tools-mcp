@@ -65,11 +65,11 @@ The built-in `semantic` extension is disabled by default and depends on
 `projects`. When it is enabled and exact-pinned `serena-agent==1.5.3` is
 available at startup, the frozen catalog grows from 24 to 28 tools:
 
-- `list_symbols`: list normalized semantic symbols in one project file;
-- `find_symbol`: locate symbols by semantic name path, optionally returning a
+- **`list_symbols`** — list normalized semantic symbols in one project file;
+- **`find_symbol`** — locate symbols by semantic name path, optionally returning a
   bounded body;
-- `find_definition`: resolve a one-based project-relative source position;
-- `find_references`: return project-relative one-based references, optionally
+- **`find_definition`** — resolve a one-based project-relative source position;
+- **`find_references`** — return project-relative one-based references, optionally
   including the declaration.
 
 All four are `readOnlyHint=true`, `destructiveHint=false`,
