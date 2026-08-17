@@ -1221,8 +1221,38 @@ def resolve_workspace_root(root: Path, *, require_exists: bool = True) -> Path:
 class Workspace:
     def __init__(self, root: Path, *, excluded_roots: tuple[Path, ...] = ()) -> None:
         self.root = resolve_workspace_root(root)
-        self.excluded_roots = tuple(path.expanduser().resolve(strict=True) for path in excluded_roots)
+        normalized_exclusions: set[Path] = set()
+        for raw_exclusion in excluded_roots:
+            exclusion = raw_exclusion.expanduser().resolve(strict=True)
+            if exclusion == self.root or not is_relative_to(exclusion, self.root):
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "Excluded project root must be strictly inside the workspace root.",
+                    category="validation",
+                )
+            normalized_exclusions.add(exclusion)
+        self.excluded_roots = tuple(
+            sorted(normalized_exclusions, key=lambda path: len(path.parts), reverse=True)
+        )
         self.git_path = shutil.which("git")
+
+    def _is_excluded(self, path: Path) -> bool:
+        if not self.excluded_roots:
+            return False
+        try:
+            resolved = path.resolve(strict=path.exists() or path.is_symlink())
+        except OSError:
+            resolved = path.resolve(strict=False)
+        return any(is_relative_to(resolved, excluded) for excluded in self.excluded_roots)
+
+    def _require_allowed(self, path: Path) -> Path:
+        if self._is_excluded(path):
+            raise ToolFailure(
+                "PATH_OUTSIDE_WORKSPACE",
+                "Path enters a separately registered project.",
+                category="security",
+            )
+        return path
 
     def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
         if not isinstance(raw_path, str) or not raw_path:
@@ -1250,6 +1280,7 @@ class Workspace:
         if not is_relative_to(resolved, self.root):
             code = "SYMLINK_ESCAPE" if candidate.is_symlink() else "PATH_OUTSIDE_WORKSPACE"
             raise ToolFailure(code, "Path escapes the configured workspace.", category="security")
+        self._require_allowed(resolved)
         return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
     def resolve_for_write(self, raw_path: str) -> ResolvedPath:
@@ -1265,6 +1296,7 @@ class Workspace:
             resolved = candidate.resolve(strict=True)
             if not is_relative_to(resolved, self.root):
                 raise ToolFailure("SYMLINK_ESCAPE", "Path escapes the configured workspace.", category="security")
+            self._require_allowed(resolved)
             return ResolvedPath(normalize_rel_display(resolved, self.root), resolved, True)
 
         parent = candidate.parent
@@ -1280,6 +1312,7 @@ class Workspace:
             raise ToolFailure("NOT_FOUND", f"Parent directory not found: {raw_path}", category="not_found") from exc
         if not is_relative_to(resolved_parent, self.root):
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Path escapes the configured workspace.", category="security")
+        self._require_allowed(resolved_parent)
         target = resolved_parent.joinpath(*reversed([p.name for p in missing]), candidate.name)
         return ResolvedPath(normalize_rel_display(target, self.root), target, False)
 
@@ -1292,6 +1325,7 @@ class Workspace:
             raise ToolFailure("NOT_A_DIRECTORY", "Default cwd is not a directory.", category="validation")
         if not is_relative_to(resolved, self.root):
             raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Default cwd escapes the configured workspace.", category="security")
+        self._require_allowed(resolved)
         return resolved
 
     def reject_write_symlink(self, raw_path: str) -> None:
@@ -1308,6 +1342,8 @@ class Workspace:
         include_ignored: bool = False,
         git_ignored: set[str] | None = None,
     ) -> bool:
+        if self._is_excluded(path):
+            return True
         try:
             rel = path.relative_to(self.root)
         except ValueError:
@@ -1329,7 +1365,7 @@ class Workspace:
             resolved = path.resolve(strict=True)
         except FileNotFoundError:
             return False
-        return is_relative_to(resolved, self.root)
+        return is_relative_to(resolved, self.root) and not self._is_excluded(resolved)
 
     def git_ignored_paths(self, rel_paths: list[str]) -> set[str]:
         if not rel_paths:
@@ -2607,12 +2643,15 @@ class Runtime:
                 line_text = data.get("lines", {}).get("text") if isinstance(data.get("lines"), dict) else ""
                 if not isinstance(path_text, str) or not isinstance(line_number, int):
                     continue
+                matched_path = self.workspace.root / path_text
+                if self.workspace._is_excluded(matched_path):
+                    continue
                 total += 1
                 if len(matches) >= max_results:
                     truncated = True
                     process.terminate()
                     break
-                rel = normalize_rel_display((self.workspace.root / path_text).resolve(), self.workspace.root)
+                rel = normalize_rel_display(matched_path.resolve(), self.workspace.root)
                 submatches = data.get("submatches") if isinstance(data.get("submatches"), list) else []
                 first_submatch = submatches[0] if submatches and isinstance(submatches[0], dict) else {}
                 column = int(first_submatch.get("start", 0)) + 1
