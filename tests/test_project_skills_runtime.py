@@ -54,9 +54,11 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
                 list_schema = tools["list_skills"]["inputSchema"]
                 read_schema = tools["read_skill"]["inputSchema"]
 
-                self.assertEqual(list_schema.get("required", []), [])
+                self.assertEqual(list_schema.get("required", []), ["project_id"])
+                self.assertEqual(list_schema["properties"]["project_id"]["minLength"], 1)
                 self.assertEqual(list_schema["properties"]["workdir"]["default"], ".")
-                self.assertEqual(read_schema["required"], ["skill"])
+                self.assertEqual(read_schema["required"], ["project_id", "skill"])
+                self.assertEqual(read_schema["properties"]["project_id"]["minLength"], 1)
                 self.assertEqual(read_schema["properties"]["workdir"]["default"], ".")
                 self.assertNotIn("path", read_schema["properties"])
                 self.assertNotIn("source", read_schema["properties"])
@@ -71,16 +73,25 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
             write_skill(nested, "jsdocs", "Nested JSDoc guidance", "NESTED SKILL BODY")
             runtime = Runtime(root)
             try:
-                listed_result = runtime.call_tool("list_skills", {"workdir": "sdk/repos/effect"})
+                listed_result = runtime.call_tool(
+                    "list_skills",
+                    {"project_id": "default", "workdir": "sdk/repos/effect"},
+                )
                 loaded_result = runtime.call_tool(
                     "read_skill",
-                    {"workdir": "sdk/repos/effect", "skill": "effect-ts"}
+                    {
+                        "project_id": "default",
+                        "workdir": "sdk/repos/effect",
+                        "skill": "effect-ts",
+                    },
                 )
                 listed = listed_result["structuredContent"]
                 loaded = loaded_result["structuredContent"]
 
                 self.assertFalse(listed_result["isError"])
                 self.assertFalse(loaded_result["isError"])
+                self.assertEqual(listed["project_id"], "default")
+                self.assertEqual(loaded["project_id"], "default")
 
                 self.assertEqual(listed["main_project"], "sdk")
                 self.assertEqual(listed["subprojects"], ["sdk/repos/effect"])
@@ -104,7 +115,11 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
             try:
                 result = runtime.call_tool(
                     "read_skill",
-                    {"workdir": "sdk/repos/effect", "skill": "missing"},
+                    {
+                        "project_id": "default",
+                        "workdir": "sdk/repos/effect",
+                        "skill": "missing",
+                    },
                 )
 
                 payload = result["structuredContent"]
@@ -120,10 +135,13 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
             write_skill(sdk, "effect-ts", "Root Effect guidance", "ROOT SKILL BODY")
             runtime = Runtime(root)
             try:
-                listed = runtime.call_tool("list_skills", {"workdir": "sdk"})
+                listed = runtime.call_tool(
+                    "list_skills",
+                    {"project_id": "default", "workdir": "sdk"},
+                )
                 loaded = runtime.call_tool(
                     "read_skill",
-                    {"workdir": "sdk", "skill": "effect-ts"},
+                    {"project_id": "default", "workdir": "sdk", "skill": "effect-ts"},
                 )
 
                 listed_text = "\n".join(
@@ -148,7 +166,10 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
             write_skill(sdk, "effect-ts", "Root Effect guidance", "root")
             runtime = Runtime(root)
             try:
-                result = runtime.call_tool("read_skill", {"workdir": ".", "skill": "effect-ts"})
+                result = runtime.call_tool(
+                    "read_skill",
+                    {"project_id": "default", "workdir": ".", "skill": "effect-ts"},
+                )
 
                 payload = result["structuredContent"]
                 self.assertEqual(payload["error"]["code"], "PROJECT_NOT_FOUND")
@@ -161,10 +182,17 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
             write_skill(sdk, "effect-ts", "Root Effect guidance", "root")
             runtime = Runtime(root)
             try:
-                absolute = runtime.call_tool("list_skills", {"workdir": str(sdk)})
+                absolute = runtime.call_tool(
+                    "list_skills",
+                    {"project_id": "default", "workdir": str(sdk)},
+                )
                 file_path = runtime.call_tool(
                     "read_skill",
-                    {"workdir": "sdk/package.json", "skill": "effect-ts"},
+                    {
+                        "project_id": "default",
+                        "workdir": "sdk/package.json",
+                        "skill": "effect-ts",
+                    },
                 )
 
                 absolute_payload = absolute["structuredContent"]
@@ -180,8 +208,14 @@ class ProjectSkillsRuntimeTests(unittest.TestCase):
             write_skill(sdk, "effect-ts", "Root Effect guidance", "root")
             runtime = Runtime(root)
             try:
-                traversal = runtime.call_tool("list_skills", {"workdir": "../sdk"})
-                nul = runtime.call_tool("list_skills", {"workdir": "sdk\x00"})
+                traversal = runtime.call_tool(
+                    "list_skills",
+                    {"project_id": "default", "workdir": "../sdk"},
+                )
+                nul = runtime.call_tool(
+                    "list_skills",
+                    {"project_id": "default", "workdir": "sdk\x00"},
+                )
 
                 traversal_payload = traversal["structuredContent"]
                 nul_payload = nul["structuredContent"]

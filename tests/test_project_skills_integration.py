@@ -67,18 +67,31 @@ class ProjectSkillsIntegrationTests(unittest.TestCase):
 
             with StdioMCPClient(workspace) as client:
                 root_context = structured_payload(
-                    client.call_tool("list_skills", {"workdir": "sdk"})
+                    client.call_tool(
+                        "list_skills",
+                        {"project_id": "default", "workdir": "sdk"},
+                    )
                 )
                 nested_context = structured_payload(
-                    client.call_tool("list_skills", {"workdir": "sdk/repos/effect"})
+                    client.call_tool(
+                        "list_skills",
+                        {"project_id": "default", "workdir": "sdk/repos/effect"},
+                    )
                 )
                 other_context = structured_payload(
-                    client.call_tool("list_skills", {"workdir": "other"})
+                    client.call_tool(
+                        "list_skills",
+                        {"project_id": "default", "workdir": "other"},
+                    )
                 )
                 loaded = structured_payload(
                     client.call_tool(
                         "read_skill",
-                        {"workdir": "sdk/repos/effect", "skill": "effect-ts"},
+                        {
+                            "project_id": "default",
+                            "workdir": "sdk/repos/effect",
+                            "skill": "effect-ts",
+                        },
                     )
                 )
 

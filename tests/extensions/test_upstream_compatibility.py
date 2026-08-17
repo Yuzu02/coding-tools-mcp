@@ -15,9 +15,10 @@ class UpstreamBridgeCompatibilityTests(unittest.TestCase):
         self.assertNotIn("extensions.projects", SERVER)
         self.assertNotIn("extensions.semantic", SERVER)
 
-    def test_projects_skill_tools_are_not_authored_in_core_tool_registry(self) -> None:
-        self.assertNotRegex(SERVER, r'\n\s+"list_skills": ToolSpec\(')
-        self.assertNotRegex(SERVER, r'\n\s+"read_skill": ToolSpec\(')
+    def test_projects_tools_are_not_authored_in_core_tool_registry(self) -> None:
+        for name in ("list_projects", "resolve_project", "list_skills", "read_skill"):
+            with self.subTest(name=name):
+                self.assertNotRegex(SERVER, rf'\n\s+"{name}": ToolSpec\(')
 
     def test_projects_skill_renderers_are_not_authored_in_core_tool_results(self) -> None:
         self.assertNotIn("def _render_list_skills", TOOL_RESULTS)
@@ -43,7 +44,8 @@ class UpstreamBridgeCompatibilityTests(unittest.TestCase):
             try:
                 self.assertEqual(
                     set(default_runtime.exposed_tool_names()),
-                    set(TOOL_REGISTRY) | {"list_skills", "read_skill"},
+                    set(TOOL_REGISTRY)
+                    | {"list_projects", "resolve_project", "list_skills", "read_skill"},
                 )
             finally:
                 default_runtime.close()

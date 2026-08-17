@@ -47,9 +47,11 @@ class ProjectsExtensionTests(unittest.TestCase):
 
     def test_default_runtime_still_exposes_list_and_read_skill(self) -> None:
         with runtime_fixture() as runtime:
+            self.assertIn("list_projects", runtime.exposed_tool_names())
+            self.assertIn("resolve_project", runtime.exposed_tool_names())
             self.assertIn("list_skills", runtime.exposed_tool_names())
             self.assertIn("read_skill", runtime.exposed_tool_names())
-            self.assertEqual(len(runtime.exposed_tool_names()), 22)
+            self.assertEqual(len(runtime.exposed_tool_names()), 24)
 
     def test_disabled_projects_extension_contributes_neither_skill_tool(self) -> None:
         config = RuntimeConfig.defaults(enabled=())
