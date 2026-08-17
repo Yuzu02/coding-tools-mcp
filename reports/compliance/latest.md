@@ -1,11 +1,11 @@
 # Compliance Report
 
 - contract: `coding-tools-mcp-v0.3`
-- commit: `a03882dab098d2f0ed49afa4430054712d415e2b+dirty`
+- commit: `4957da3700dff7efd4a93e872672743893b3e2bf`
 - suite: `all`
 - passed: `true`
-- tests_run: `127`
-- elapsed_seconds: `100.168`
+- tests_run: `129`
+- elapsed_seconds: `138.498`
 
 ## Required Tools
 
@@ -15,6 +15,8 @@
 - `list_dir`: passed
 - `list_files`: passed
 - `search_text`: passed
+- `list_skills`: passed
+- `read_skill`: passed
 - `apply_patch`: passed
 - `exec_command`: passed
 - `write_stdin`: passed
