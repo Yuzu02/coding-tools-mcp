@@ -786,10 +786,11 @@ class RuntimeHelperTests(unittest.TestCase):
             drifted_tmp = workspace / ".coding-tools" / "tmp"
             drifted_tmp.mkdir(parents=True)
             with patch.dict(server_module.os.environ, {"TMPDIR": str(drifted_tmp)}, clear=True):
+                expected_root = runtime_parent_root()
                 safe = Runtime(workspace)
                 trusted = Runtime(workspace, permission_mode="trusted")
-            self.assertEqual(safe.runtime_dir.parent.parent, runtime_parent_root())
-            self.assertEqual(trusted.runtime_dir.parent.parent, runtime_parent_root())
+            self.assertEqual(safe.runtime_dir.parent.parent, expected_root)
+            self.assertEqual(trusted.runtime_dir.parent.parent, expected_root)
             self.assertEqual(safe.command_tmp_dir().parent, safe.runtime_dir)
             self.assertEqual(trusted.command_tmp_dir().parent, trusted.runtime_dir)
 
