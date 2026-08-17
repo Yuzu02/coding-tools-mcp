@@ -6,7 +6,7 @@ properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The default catalog contains exactly 22 tools:
+The committed/default composition contains exactly 22 tools:
 
 - `server_info`: server, workspace, automatic project context, policy, runtime,
   auth, protocol, and fixed-catalog metadata.
@@ -36,9 +36,17 @@ The default catalog contains exactly 22 tools:
 - `request_permissions`: report elicitation status without silently granting.
 - `view_image`: one MCP image content block plus structured metadata.
 
-`view_image` may be disabled when an installation cannot accept binary image
-content. That capability gate is not a tool profile. The other 21 tools are
-always advertised, and `listChanged` is `false`.
+The fork composes mother-core definitions plus enabled internal extension
+contributions once during process startup. `tools/list`, argument validation,
+and `tools/call` all consume the same frozen composed catalog, so
+`listChanged` remains `false` for the lifetime of that process. There is no
+runtime profile switching or dynamic extension activation.
+
+The default `projects` extension contributes `list_skills` and `read_skill`.
+Starting the fork with `--extensions ''` intentionally removes those two tools
+for that process. `view_image` remains independently gated by installation
+capability. V1 tool decorators are deterministic and may add schema properties
+and wrap handlers, but may not replace existing schema properties.
 
 ## Result envelope
 

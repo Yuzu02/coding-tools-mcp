@@ -44,6 +44,29 @@ Use stdio for MCP clients:
 uvx coding-tools-mcp --stdio --workspace /path/to/repo
 ```
 
+## Extension configuration
+
+When running this fork from a checkout, `coding-tools.toml` is safe to commit
+and defines public/default composition. `coding-tools.local.toml` is
+host-specific, ignored by Git, and overrides only declared fields.
+
+Configuration precedence is:
+
+```text
+CLI > environment > local TOML > public TOML > built-in defaults
+```
+
+The default configuration enables the internal `projects` extension and keeps
+the current 22-tool catalog. Override the enabled list for one process with:
+
+```bash
+coding-tools-mcp --stdio --workspace /path/to/repo --extensions projects
+coding-tools-mcp --stdio --workspace /path/to/repo --extensions ''
+```
+
+See [extensions.md](extensions.md) for config file selection, lifecycle,
+capabilities, and the upstream synchronization boundary.
+
 When working from this checkout instead of a published package, start Streamable HTTP with:
 
 ```bash

@@ -10,12 +10,15 @@ apply structured patches, run and interact with commands, and inspect Git. It is
 not an agent wrapper and does not expose accounts, memory, cloud tasks, web
 search, model routing, plugins, image generation, or subagent orchestration.
 
-## Fixed tool model
+## Stable process tool model
 
-There is one stable catalog. The runtime has no tool profiles, no `edit_file`,
-no dynamic `tools/list_changed`, and no required `open_workspace` call.
-`apply_patch` is the only direct file-write tool. `safe`, `trusted`, and
-`dangerous` are command permission policies and never alter `tools/list`.
+The fork composes one catalog during startup from mother-core definitions plus
+enabled internal extensions. Once startup succeeds, that catalog is stable for
+the process: there are no runtime tool profiles, no dynamic
+`tools/list_changed`, no required `open_workspace` call, and no runtime
+extension enable/disable operation. `apply_patch` is the structured direct
+file-edit primitive. `safe`, `trusted`, and `dangerous` are command permission
+policies and never alter `tools/list`.
 
 The default catalog contains 22 tools:
 
@@ -27,8 +30,11 @@ The default catalog contains 22 tools:
 - Git: `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`
 - policy/image: `request_permissions`, `view_image`
 
-`view_image` can be disabled as an installation capability. All other tools are
-fixed.
+`projects` is enabled in the default composition and contributes
+`list_skills`/`read_skill`; disabling that extension before startup removes
+those two tools for that process. `view_image` can independently be disabled as
+an installation capability. Neither mechanism mutates the catalog after
+startup.
 
 ## Protocol
 

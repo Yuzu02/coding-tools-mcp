@@ -16,8 +16,10 @@ Coding Tools MCP is a **model-neutral coding runtime** served over the
 search, structured multi-file patches, command execution, interactive
 sessions, and git — one server that any MCP client can drive. Claude Desktop,
 Claude Code, Codex, Cursor, Cline, VS Code, Windsurf, Gemini CLI, or an agent
-you build yourself all get the same 22 battle-tested tools, confined to one
-workspace, gated by permission modes.
+you build yourself all get the default 22 battle-tested tools, confined to one
+workspace, gated by permission modes. This fork composes its own internal
+extensions once at startup; the resulting catalog is then frozen for that
+process.
 
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -31,9 +33,10 @@ workspace, gated by permission modes.
   Permission modes gate network access, shell expansion, inline scripts, and
   destructive commands. On Linux, [Landlock](docs/security-boundary.md) adds
   kernel-level filesystem confinement.
-- **It is model- and vendor-neutral.** A fixed, truthfully annotated catalog —
-  no profile switching, no annotation games. Swap models or clients freely;
-  the runtime and its behavior stay put.
+- **It is model- and vendor-neutral.** A truthfully annotated catalog is
+  composed at startup and remains fixed for the process — no runtime profile
+  switching and no annotation games. Swap models or clients freely; the
+  runtime contract stays explicit.
 - **It is engineered for context windows.** Results are summarized, paginated,
   and capped by design; serialized tool-result bytes dropped 37%
   release-over-release on the deterministic dogfood workload with unchanged
@@ -76,7 +79,8 @@ walkthroughs, and troubleshooting live in
 [docs/quickstart.md](docs/quickstart.md) and
 [docs/mcp-client-config.md](docs/mcp-client-config.md). For a cloned checkout
 that should supervise the MCP server and OpenAI tunnel-client together, use the
-[multiplatform services launcher](docs/services-launcher.md).
+[multiplatform services launcher](docs/services-launcher.md). Fork developers
+can also see the [internal extension runtime](docs/extensions.md).
 
 ## Seven things to try
 

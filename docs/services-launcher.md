@@ -8,6 +8,14 @@ It uses `mise` only to provision pinned tools and `uv` to synchronize and run
 the Python checkout. It does not install the package globally, embed secrets in
 the repository, or construct child commands through a shell.
 
+The launcher is deployment/composition infrastructure, not the extension
+configuration parser. It starts the MCP process with the MCP checkout as its
+working directory, so the runtime can discover that checkout's
+`coding-tools.toml`. The runtime package remains the sole parser/source of truth
+for `coding-tools.toml`, `coding-tools.local.toml`, and extension-specific
+configuration. The launcher may pass normal CLI/environment startup inputs but
+does not interpret extension TOML itself.
+
 ## Clean clone setup
 
 Install `mise`, clone the required branch, and trust the checked-in toolchain
