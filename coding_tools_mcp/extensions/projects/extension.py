@@ -48,6 +48,7 @@ class ProjectsExtension:
                         {
                             "root": scalar(str),
                             "allow_unavailable": scalar(bool),
+                            "project_config": scalar(str),
                         }
                     )
                 )
