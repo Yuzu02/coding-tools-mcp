@@ -1954,7 +1954,9 @@ class Runtime:
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": self.server_identity(),
-            "instructions": self.project_context.server_instructions(),
+            "instructions": self.extension_host.server_instructions(
+                self.project_context.server_instructions()
+            ),
         }
 
     def discover_payload(self) -> dict[str, Any]:
@@ -1971,7 +1973,9 @@ class Runtime:
         return {
             "supportedVersions": list(MODERN_PROTOCOL_VERSIONS),
             "capabilities": {"tools": {"listChanged": False}},
-            "instructions": self.project_context.server_instructions(),
+            "instructions": self.extension_host.server_instructions(
+                self.project_context.server_instructions()
+            ),
         }
 
     def server_identity(self) -> dict[str, Any]:

@@ -6,6 +6,7 @@ from typing import Mapping, Protocol
 from .config import ConfigNode, table
 from .contributions import (
     ContributionRegistry,
+    ServerInstructionsContribution,
     ServerMetadataContribution,
     ToolContribution,
     ToolDecorator,
@@ -29,6 +30,12 @@ class ExtensionContext:
         self.contributions.add_metadata(
             self.extension_name,
             ServerMetadataContribution(key=key, value=value),
+        )
+
+    def add_server_instructions(self, text: str, *, replace_default: bool = False) -> None:
+        self.contributions.add_server_instructions(
+            self.extension_name,
+            ServerInstructionsContribution(text=text, replace_default=replace_default),
         )
 
 

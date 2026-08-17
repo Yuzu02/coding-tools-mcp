@@ -25,6 +25,7 @@ from tests.compliance.mcp_client import (
     FORBIDDEN_TOOL_TERMS,
     MCPClient,
     MCPError,
+    PROJECT_SCOPED_TOOL_NAMES,
     REQUIRED_TOOLS,
     default_server_command,
     free_port,
@@ -67,6 +68,10 @@ def modern_request(
     meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     body = dict(params or {})
+    if method == "tools/call" and body.get("name") in PROJECT_SCOPED_TOOL_NAMES:
+        arguments = dict(body.get("arguments") or {})
+        arguments.setdefault("project_id", "default")
+        body["arguments"] = arguments
     body["_meta"] = modern_meta() if meta is None else meta
     return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": body}
 
@@ -163,7 +168,11 @@ class MCPContractTests(ComplianceTestCase):
             self.assertIn(killed.get("status"), {"killed", "exited"})
 
     def test_http_client_disconnect_does_not_terminate_workspace_command(self) -> None:
-        with MCPClient(self.workspace.root, url=self.client.url) as owner:
+        with MCPClient(
+            self.workspace.root,
+            url=self.client.url,
+            default_project_id="default",
+        ) as owner:
             started = self.assert_tool_success(
                 owner.call_tool(
                     "exec_command",
@@ -235,6 +244,8 @@ class MCPContractTests(ComplianceTestCase):
             "list_dir": (True, False, True, False),
             "list_files": (True, False, True, False),
             "search_text": (True, False, True, False),
+            "list_projects": (True, False, True, False),
+            "resolve_project": (True, False, True, False),
             "list_skills": (True, False, True, False),
             "read_skill": (True, False, True, False),
             "apply_patch": (False, True, False, False),
@@ -320,7 +331,10 @@ class MCPContractTests(ComplianceTestCase):
                         "tool_name": "exec_command",
                         "permission": "sensitive_env",
                         "reason": "trace redaction check",
-                        "arguments": {"token": "COMPLIANCE_SHOULD_NOT_LEAK"},
+                        "arguments": {
+                            "project_id": "default",
+                            "token": "COMPLIANCE_SHOULD_NOT_LEAK",
+                        },
                     },
                 )
                 stderr = traced.stderr_snapshot()
@@ -1508,7 +1522,7 @@ class MCPContractTests(ComplianceTestCase):
 
             tools = result.get("tools")
             self.assertIsInstance(tools, list)
-            self.assertEqual(len(tools), 22)
+            self.assertEqual(len(tools), 24)
             self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
             for tool in tools:
                 # The cache hints describe the catalog, not the entries in it;
@@ -1678,8 +1692,10 @@ class MCPContractTests(ComplianceTestCase):
             instructions = result.get("instructions")
             self.assertIsInstance(instructions, str)
             self.assertTrue(instructions)
-            self.assertIn("only for coding operations inside the configured workspace", instructions)
-            self.assertIn(instructions_file, instructions)
+            self.assertIn("project_id", instructions)
+            self.assertIn("list_projects", instructions)
+            self.assertIn("project-scoped", instructions)
+            self.assertNotIn(instructions_file, instructions)
             self.assertEqual(result.get("ttlMs"), 0)
             self.assertEqual(result.get("cacheScope"), "private")
         finally:
@@ -1751,7 +1767,7 @@ class MCPContractTests(ComplianceTestCase):
                     "method": "tools/call",
                     "params": {
                         "name": "read_file",
-                        "arguments": {"path": "src/math.js"},
+                        "arguments": {"project_id": "default", "path": "src/math.js"},
                         "_meta": {"progressToken": "token-1"},
                     },
                 },

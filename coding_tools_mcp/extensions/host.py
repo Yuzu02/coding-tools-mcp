@@ -95,6 +95,9 @@ class ExtensionHost:
             "metadata": self._contributions.metadata_snapshot(),
         }
 
+    def server_instructions(self, default_text: str) -> str:
+        return self._contributions.compose_server_instructions(default_text, self._order)
+
     def _stop_names(self, names: Iterable[str]) -> tuple[str, ...]:
         warnings: list[str] = []
         for name in names:

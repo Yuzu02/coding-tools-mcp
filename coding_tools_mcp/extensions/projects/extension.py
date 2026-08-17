@@ -82,11 +82,24 @@ class ProjectsExtension:
         context.add_tool(self._resolve_project_tool())
         context.add_tool(self._list_skills_tool())
         context.add_tool(self._read_skill_tool())
+        context.add_server_instructions(
+            (
+                "This endpoint serves multiple explicitly registered projects. "
+                "Call list_projects to discover stable IDs. Every project-scoped filesystem, Git, process, "
+                "image, environment, or skill request must include project_id; paths and workdirs remain "
+                "relative to that selected project. No previous request selects a current project. "
+                "Read project-scoped instruction files returned by list_skills/read_file before modifying "
+                "that scope."
+            ),
+            replace_default=True,
+        )
         context.add_decorator(self._project_routing_decorator())
         context.add_decorator(self._command_id_routing_decorator())
         context.add_decorator(self._read_output_routing_decorator())
         context.add_decorator(self._get_command_routing_decorator())
         context.add_decorator(self._list_commands_routing_decorator())
+        context.add_decorator(self._server_info_routing_decorator())
+        context.add_decorator(self._request_permissions_routing_decorator())
 
     def start(self) -> None:
         return None
@@ -229,6 +242,20 @@ class ProjectsExtension:
             targets=("list_commands",),
             schema_patch=SchemaPatch(properties={"project_id": self._project_id_schema()}),
             wrap_handler=self._wrap_list_commands_handler,
+        )
+
+    def _server_info_routing_decorator(self) -> ToolDecorator:
+        return ToolDecorator(
+            targets=("server_info",),
+            schema_patch=SchemaPatch(),
+            wrap_handler=self._wrap_server_info_handler,
+        )
+
+    def _request_permissions_routing_decorator(self) -> ToolDecorator:
+        return ToolDecorator(
+            targets=("request_permissions",),
+            schema_patch=SchemaPatch(),
+            wrap_handler=self._wrap_request_permissions_handler,
         )
 
     @staticmethod
@@ -380,6 +407,82 @@ class ProjectsExtension:
             }
 
         return routed
+
+    def _wrap_server_info_handler(self, next_handler: ToolHandler) -> ToolHandler:
+        def routed(args: dict[str, Any]) -> dict[str, Any]:
+            payload = dict(next_handler(args))
+            for field in (
+                "workspace",
+                "runtime_dir",
+                "home",
+                "tmpdir",
+                "cache_dir",
+                "project_context",
+            ):
+                payload.pop(field, None)
+            projects = self._require_registry().projects()
+            payload["projects"] = {
+                "count": len(projects),
+                "ids": [project.project_id for project in projects],
+                "available": sum(1 for project in projects if project.available),
+            }
+            return payload
+
+        return routed
+
+    def _wrap_request_permissions_handler(self, next_handler: ToolHandler) -> ToolHandler:
+        def routed(args: dict[str, Any]) -> dict[str, Any]:
+            raw_target = args.get("arguments")
+            if not isinstance(raw_target, dict):
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "arguments must be an object.",
+                    category="validation",
+                )
+            project_id = raw_target.get("project_id")
+            if not isinstance(project_id, str) or not project_id:
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    "arguments.project_id is required for project-scoped permission requests.",
+                    category="validation",
+                )
+            clean_target = dict(raw_target)
+            clean_target.pop("project_id", None)
+            clean_outer = dict(args)
+            clean_outer["arguments"] = clean_target
+            payload = self._require_runtimes().invoke(project_id, next_handler, clean_outer)
+            return self._restore_permission_target(payload, project_id)
+
+        return routed
+
+    @staticmethod
+    def _restore_permission_target(payload: dict[str, Any], project_id: str) -> dict[str, Any]:
+        restored = dict(payload)
+
+        def restore_requested(container: object) -> object:
+            if not isinstance(container, dict):
+                return container
+            copied = dict(container)
+            raw_requested = copied.get("requested")
+            if isinstance(raw_requested, dict):
+                requested = dict(raw_requested)
+                raw_arguments = requested.get("arguments")
+                if isinstance(raw_arguments, dict):
+                    arguments = dict(raw_arguments)
+                    arguments["project_id"] = project_id
+                    requested["arguments"] = arguments
+                copied["requested"] = requested
+            return copied
+
+        if "constraints" in restored:
+            restored["constraints"] = restore_requested(restored["constraints"])
+        raw_error = restored.get("error")
+        if isinstance(raw_error, dict):
+            error = dict(raw_error)
+            if "details" in error:
+                error["details"] = restore_requested(error["details"])
+            restored["error"] = error
+        return restored
 
     def _require_registry_project(self, project_id: str) -> None:
         try:

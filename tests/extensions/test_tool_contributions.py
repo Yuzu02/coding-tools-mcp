@@ -6,6 +6,7 @@ from coding_tools_mcp.extensions.contributions import (
     ComposedTool,
     ContributionError,
     ContributionRegistry,
+    ServerInstructionsContribution,
     ServerMetadataContribution,
     ToolAnnotations,
     ToolContribution,
@@ -111,6 +112,57 @@ class ToolContributionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ContributionError, "duplicate metadata contribution: a.status"):
             registry.add_metadata("a", ServerMetadataContribution(key="status", value="again"))
+
+    def test_server_instruction_contributions_replace_and_append_in_order(self) -> None:
+        registry = ContributionRegistry()
+        registry.add_server_instructions(
+            "a",
+            ServerInstructionsContribution(text="A replacement", replace_default=True),
+        )
+        registry.add_server_instructions(
+            "b",
+            ServerInstructionsContribution(text="B append"),
+        )
+
+        self.assertEqual(
+            registry.compose_server_instructions("core default", ("a", "b")),
+            "A replacement\n\nB append",
+        )
+
+    def test_server_instruction_append_preserves_core_default_without_replacement(self) -> None:
+        registry = ContributionRegistry()
+        registry.add_server_instructions(
+            "a",
+            ServerInstructionsContribution(text="A append"),
+        )
+
+        self.assertEqual(
+            registry.compose_server_instructions("core default", ("a",)),
+            "core default\n\nA append",
+        )
+
+    def test_multiple_server_instruction_replacements_are_rejected(self) -> None:
+        registry = ContributionRegistry()
+        registry.add_server_instructions(
+            "a",
+            ServerInstructionsContribution(text="A", replace_default=True),
+        )
+
+        with self.assertRaisesRegex(ContributionError, "multiple extensions replace default server instructions"):
+            registry.add_server_instructions(
+                "b",
+                ServerInstructionsContribution(text="B", replace_default=True),
+            )
+
+    def test_server_instruction_registry_freezes_with_other_contributions(self) -> None:
+        registry = ContributionRegistry()
+        registry.freeze()
+
+        with self.assertRaisesRegex(ContributionError, "contribution registry is frozen"):
+            registry.add_server_instructions(
+                "a",
+                ServerInstructionsContribution(text="late"),
+            )
 
     def test_invalid_composed_schema_is_rejected(self) -> None:
         invalid = ComposedTool(

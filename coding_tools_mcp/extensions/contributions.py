@@ -54,6 +54,12 @@ class ServerMetadataContribution:
 
 
 @dataclass(frozen=True)
+class ServerInstructionsContribution:
+    text: str
+    replace_default: bool = False
+
+
+@dataclass(frozen=True)
 class ComposedTool:
     name: str
     title: str
@@ -78,6 +84,8 @@ class ContributionRegistry:
         self._tool_names: set[str] = set()
         self._decorators: list[tuple[str, ToolDecorator]] = []
         self._metadata: dict[str, dict[str, object]] = {}
+        self._server_instructions: list[tuple[str, ServerInstructionsContribution]] = []
+        self._instruction_replacement_owner: str | None = None
         self._frozen = False
 
     def _require_mutable(self) -> None:
@@ -102,6 +110,29 @@ class ContributionRegistry:
             raise ContributionError(f"duplicate metadata contribution: {extension}.{contribution.key}")
         namespace[contribution.key] = contribution.value
 
+    def add_server_instructions(
+        self,
+        extension: str,
+        contribution: ServerInstructionsContribution,
+    ) -> None:
+        self._require_mutable()
+        text = contribution.text.strip()
+        if not text:
+            raise ContributionError("server instructions contribution cannot be empty")
+        if contribution.replace_default:
+            if self._instruction_replacement_owner is not None:
+                raise ContributionError("multiple extensions replace default server instructions")
+            self._instruction_replacement_owner = extension
+        self._server_instructions.append(
+            (
+                extension,
+                ServerInstructionsContribution(
+                    text=text,
+                    replace_default=contribution.replace_default,
+                ),
+            )
+        )
+
     def freeze(self) -> None:
         self._frozen = True
 
@@ -113,6 +144,40 @@ class ContributionRegistry:
 
     def metadata_snapshot(self) -> dict[str, dict[str, object]]:
         return {extension: dict(values) for extension, values in self._metadata.items()}
+
+    def instruction_entries(self) -> tuple[tuple[str, ServerInstructionsContribution], ...]:
+        return tuple(self._server_instructions)
+
+    def compose_server_instructions(
+        self,
+        default_text: str,
+        extension_order: Sequence[str],
+    ) -> str:
+        rank = {name: index for index, name in enumerate(extension_order)}
+        unknown_owners = [
+            extension
+            for extension, _contribution in self._server_instructions
+            if extension not in rank
+        ]
+        if unknown_owners:
+            raise ContributionError(
+                f"server instructions owner not in extension order: {unknown_owners[0]}"
+            )
+        ordered = sorted(self._server_instructions, key=lambda item: rank[item[0]])
+        replacement = next(
+            (
+                contribution.text
+                for _extension, contribution in ordered
+                if contribution.replace_default
+            ),
+            default_text.strip(),
+        )
+        appended = [
+            contribution.text
+            for _extension, contribution in ordered
+            if not contribution.replace_default
+        ]
+        return "\n\n".join(part for part in (replacement, *appended) if part)
 
 
 def _validate_composed_tool(tool: ComposedTool) -> None:
