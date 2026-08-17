@@ -7,14 +7,15 @@ from pathlib import Path
 
 from coding_tools_mcp.extensions import (
     CORE_WORKSPACE,
+    CORE_WORKSPACE_RUNTIMES,
     ContributionRegistry,
     ExtensionContext,
     RuntimeConfig,
     ServiceRegistry,
     builtin_extension_registry,
 )
-from coding_tools_mcp.extensions.projects import PROJECT_CATALOG, ProjectsExtension
-from coding_tools_mcp.server import Runtime, Workspace
+from coding_tools_mcp.extensions.projects import PROJECT_CATALOG, PROJECT_REGISTRY, ProjectsExtension
+from coding_tools_mcp.server import Runtime
 
 
 @contextlib.contextmanager
@@ -56,24 +57,70 @@ class ProjectsExtensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "package.json").write_text("{}", encoding="utf-8")
+            runtime = Runtime(root, extension_config=RuntimeConfig.defaults(enabled=()))
             services = ServiceRegistry()
             contributions = ContributionRegistry()
-            workspace = Workspace(root)
-            services.provide(CORE_WORKSPACE, workspace)
-            extension = ProjectsExtension()
-            extension.configure({})
-            extension.register(
-                ExtensionContext(
-                    services=services,
-                    contributions=contributions,
-                    extension_name="projects",
+            try:
+                services.provide(CORE_WORKSPACE, runtime.workspace)
+                services.provide(CORE_WORKSPACE_RUNTIMES, runtime.workspace_runtime_service)
+                extension = ProjectsExtension()
+                extension.configure({})
+                extension.register(
+                    ExtensionContext(
+                        services=services,
+                        contributions=contributions,
+                        extension_name="projects",
+                    )
                 )
-            )
 
-            catalog = services.require(PROJECT_CATALOG)
+                catalog = services.require(PROJECT_CATALOG)
+                registry = services.require(PROJECT_REGISTRY)
 
-            self.assertEqual(catalog.workspace, root.resolve())
-            self.assertEqual(catalog.main_projects[0].project_id, ".")
+                self.assertEqual(catalog.workspace, root.resolve())
+                self.assertEqual(catalog.main_projects[0].scope_id, ".")
+                self.assertEqual(registry.ids(), ("default",))
+                self.assertEqual(registry.get("default").root, root.resolve())
+            finally:
+                runtime.close()
+
+    def test_projects_extension_accepts_explicit_registered_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap = root / "bootstrap"
+            alpha = root / "alpha"
+            bootstrap.mkdir()
+            alpha.mkdir()
+            (bootstrap / "package.json").write_text("{}", encoding="utf-8")
+            (alpha / "pyproject.toml").write_text("", encoding="utf-8")
+            runtime = Runtime(bootstrap, extension_config=RuntimeConfig.defaults(enabled=()))
+            services = ServiceRegistry()
+            contributions = ContributionRegistry()
+            try:
+                services.provide(CORE_WORKSPACE, runtime.workspace)
+                services.provide(CORE_WORKSPACE_RUNTIMES, runtime.workspace_runtime_service)
+                extension = ProjectsExtension()
+                extension.configure(
+                    {
+                        "registry": {
+                            "alpha": {
+                                "root": str(alpha),
+                            }
+                        }
+                    }
+                )
+                extension.register(
+                    ExtensionContext(
+                        services=services,
+                        contributions=contributions,
+                        extension_name="projects",
+                    )
+                )
+
+                registry = services.require(PROJECT_REGISTRY)
+                self.assertEqual(registry.ids(), ("alpha",))
+                self.assertEqual(registry.get("alpha").root, alpha.resolve())
+            finally:
+                runtime.close()
 
 
 if __name__ == "__main__":

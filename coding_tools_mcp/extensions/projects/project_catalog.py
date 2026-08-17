@@ -43,20 +43,20 @@ MAX_PROJECT_WARNINGS = 128
 
 @dataclass(frozen=True)
 class ProjectRecord:
-    project_id: str
+    scope_id: str
     root: Path
     display_root: str
     markers: tuple[str, ...]
     kind: Literal["main", "subproject"]
-    parent_project_id: str | None
+    parent_scope_id: str | None
 
     def summary(self) -> dict[str, object]:
         return {
-            "id": self.project_id,
+            "scope_id": self.scope_id,
             "root": self.display_root,
             "markers": list(self.markers),
             "kind": self.kind,
-            "parent_project_id": self.parent_project_id,
+            "parent_scope_id": self.parent_scope_id,
         }
 
 
@@ -116,7 +116,7 @@ class ProjectCatalog:
         if not relative.parts:
             return ()
         discovered: list[ProjectRecord] = []
-        parent_id = main.project_id
+        parent_scope_id = main.scope_id
         current = main.root
         for part in relative.parts:
             current /= part
@@ -125,18 +125,18 @@ class ProjectCatalog:
             markers = _project_markers(current)
             if not markers:
                 continue
-            project_id = _display_path(current, self.workspace)
+            scope_id = _display_path(current, self.workspace)
             discovered.append(
                 ProjectRecord(
-                    project_id=project_id,
+                    scope_id=scope_id,
                     root=current,
-                    display_root=project_id,
+                    display_root=scope_id,
                     markers=markers,
                     kind="subproject",
-                    parent_project_id=parent_id,
+                    parent_scope_id=parent_scope_id,
                 )
             )
-            parent_id = project_id
+            parent_scope_id = scope_id
             if len(discovered) >= MAX_SUBPROJECTS_PER_MAIN:
                 break
         return tuple(discovered)
@@ -156,12 +156,12 @@ def build_project_catalog(workspace: Path) -> ProjectCatalog:
     if root_markers:
         root_projects = (
             ProjectRecord(
-                project_id=".",
+                scope_id=".",
                 root=root,
                 display_root=".",
                 markers=root_markers,
                 kind="main",
-                parent_project_id=None,
+                parent_scope_id=None,
             ),
         )
         return ProjectCatalog(root, root_projects)
@@ -190,19 +190,22 @@ def build_project_catalog(workspace: Path) -> ProjectCatalog:
         display = _display_path(child, root)
         main_projects.append(
             ProjectRecord(
-                project_id=display,
+                scope_id=display,
                 root=child.resolve(strict=True),
                 display_root=display,
                 markers=markers,
                 kind="main",
-                parent_project_id=None,
+                parent_scope_id=None,
             )
         )
     return ProjectCatalog(root, tuple(main_projects), tuple(warnings))
 
 
-def _project_markers(path: Path) -> tuple[str, ...]:
+def project_markers(path: Path) -> tuple[str, ...]:
     return tuple(marker for marker in PROJECT_MARKERS if (path / marker).exists())
+
+
+_project_markers = project_markers
 
 
 def _display_path(path: Path, root: Path) -> str:

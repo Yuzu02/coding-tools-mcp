@@ -139,8 +139,10 @@ class SkillCatalog:
 
         return EffectiveSkillContext(
             workdir=workdir_display,
-            main_project=selection.main_project.project_id,
-            subprojects=tuple(project.project_id for project in selection.subprojects),
+            # Historical response field names are preserved for compatibility;
+            # these values identify structural scopes, not configured project IDs.
+            main_project=selection.main_project.scope_id,
+            subprojects=tuple(project.scope_id for project in selection.subprojects),
             instruction_files=tuple(instruction_files),
             skills=tuple(effective.values()),
             warnings=tuple(warnings),
@@ -281,7 +283,8 @@ class SkillCatalog:
                     SkillRecord(
                         name=name,
                         description=description,
-                        owner_project=scope.project_id,
+                        # Historical field name: this is the structural scope owner.
+                        owner_project=scope.scope_id,
                         scope_root=scope.display_root,
                         source=_display_path(skill_file, self.workspace),
                         source_format=source_format,

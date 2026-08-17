@@ -15,9 +15,19 @@ class ProjectCatalogTests(unittest.TestCase):
 
             catalog = build_project_catalog(root)
 
-            self.assertEqual([project.project_id for project in catalog.main_projects], ["."])
+            self.assertEqual([project.scope_id for project in catalog.main_projects], ["."])
             self.assertEqual(catalog.main_projects[0].display_root, ".")
             self.assertEqual(catalog.main_projects[0].markers, ("pyproject.toml",))
+            self.assertEqual(
+                catalog.main_projects[0].summary(),
+                {
+                    "scope_id": ".",
+                    "root": ".",
+                    "markers": ["pyproject.toml"],
+                    "kind": "main",
+                    "parent_scope_id": None,
+                },
+            )
 
     def test_direct_children_are_main_projects_when_workspace_is_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -32,7 +42,7 @@ class ProjectCatalogTests(unittest.TestCase):
 
             catalog = build_project_catalog(root)
 
-            self.assertEqual([project.project_id for project in catalog.main_projects], ["api", "data"])
+            self.assertEqual([project.scope_id for project in catalog.main_projects], ["api", "data"])
             self.assertEqual(catalog.warnings, ())
 
     def test_nested_project_is_only_selected_for_contained_workdir(self) -> None:
@@ -61,9 +71,10 @@ class ProjectCatalogTests(unittest.TestCase):
             self.assertEqual(main_selection.subprojects, ())
             self.assertEqual(sibling_selection.subprojects, ())
             self.assertEqual(
-                [project.project_id for project in nested_selection.scope_chain],
+                [project.scope_id for project in nested_selection.scope_chain],
                 ["sdk", "sdk/repos/effect"],
             )
+            self.assertEqual(nested_selection.subprojects[0].parent_scope_id, "sdk")
 
     def test_file_path_resolves_using_its_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -78,7 +89,7 @@ class ProjectCatalogTests(unittest.TestCase):
 
             self.assertIsNotNone(selection)
             assert selection is not None
-            self.assertEqual(selection.main_project.project_id, "app")
+            self.assertEqual(selection.main_project.scope_id, "app")
 
     def test_excluded_directory_is_not_discovered_as_subproject(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

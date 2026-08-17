@@ -6,10 +6,11 @@ from typing import Any, Mapping
 from coding_tools_mcp.errors import ToolFailure
 
 from ..api import ExtensionContext, ExtensionManifest
-from ..config import ConfigError, table
+from ..config import map_of, scalar, table
 from ..contributions import ToolAnnotations, ToolContribution
-from ..services import CORE_WORKSPACE, CapabilityKey, WorkspaceAccess
+from ..services import CORE_WORKSPACE, CORE_WORKSPACE_RUNTIMES, CapabilityKey, WorkspaceAccess
 from .project_catalog import ProjectCatalog, build_project_catalog
+from .registry import PROJECT_REGISTRY, build_project_registry
 from .skill_catalog import ProjectNotFoundError, SkillCatalog, SkillInvalidError, SkillNotFoundError
 
 
@@ -20,22 +21,40 @@ class ProjectsExtension:
     manifest = ExtensionManifest(
         name="projects",
         description="Single-workspace project scope, instructions, and skills discovery.",
-        config_schema=table({}),
+        config_schema=table(
+            {
+                "registry": map_of(
+                    table(
+                        {
+                            "root": scalar(str),
+                            "allow_unavailable": scalar(bool),
+                        }
+                    )
+                )
+            }
+        ),
     )
 
     def __init__(self) -> None:
+        self._config: Mapping[str, object] = {}
         self._workspace: WorkspaceAccess | None = None
         self._skills: SkillCatalog | None = None
 
     def configure(self, config: Mapping[str, object]) -> None:
-        if config:
-            raise ConfigError("extensions.projects has no Phase 0 settings")
+        self._config = config
 
     def register(self, context: ExtensionContext) -> None:
         workspace = context.services.require(CORE_WORKSPACE)
+        workspace_runtimes = context.services.require(CORE_WORKSPACE_RUNTIMES)
+        registry = build_project_registry(
+            self._config,
+            fallback_root=workspace.root,
+            validate_root=workspace_runtimes.validate_root,
+        )
         catalog = build_project_catalog(workspace.root)
         self._workspace = workspace
         self._skills = SkillCatalog(catalog)
+        context.services.provide(PROJECT_REGISTRY, registry)
         context.services.provide(PROJECT_CATALOG, catalog)
         context.add_tool(self._list_skills_tool())
         context.add_tool(self._read_skill_tool())
