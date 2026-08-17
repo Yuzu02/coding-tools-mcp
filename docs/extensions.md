@@ -14,18 +14,26 @@ code named by TOML.
 ## Built-in extensions
 
 The current built-in extension is `projects`. It is enabled by default and owns
-the fork's project/skill discovery behavior:
+the fork's explicit multi-project addressing and project/skill discovery:
 
-- the structural project catalog;
+- the immutable configured project registry;
+- lazy project-local runtime/catalog/context state;
+- command ownership routing across project runtimes;
+- the structural project catalog inside each project runtime;
 - the `projects.catalog` service capability;
+- the `projects.registry` and `projects.runtimes` service capabilities;
+- `list_projects`;
+- `resolve_project`;
 - `list_skills`;
 - `read_skill`;
-- the model-facing renderers for those two tools.
+- project-addressing decorators for filesystem/Git/process/image/environment
+  tools;
+- opaque command/output routing; and
+- project-neutral server discovery instructions.
 
-The default composition therefore remains the current 22-tool catalog. If
-`projects` is disabled before startup, `list_skills` and `read_skill` are absent
-and that process exposes 20 tools, subject to the existing `view_image`
-capability gate.
+The default composition therefore exposes 24 tools. If `projects` is disabled
+before startup, its four contributed tools are absent and that process exposes
+the 20 mother-core tools, subject to the existing `view_image` capability gate.
 
 ## Configuration files
 
@@ -39,6 +47,24 @@ enabled = ["projects"]
 
 [extensions.projects]
 ```
+
+Register actual project roots in the local overlay rather than the public file:
+
+```toml
+config_version = 1
+
+[extensions.projects.registry.app]
+root = "/srv/projects/app"
+
+[extensions.projects.registry.api]
+root = "/srv/projects/api"
+```
+
+The keys `app` and `api` are stable `project_id` values. They are logical
+identifiers, not directory names. A launch with no explicit registry keeps
+single-workspace compatibility by synthesizing one project called `default`
+from `--workspace` / `CODING_TOOLS_MCP_WORKSPACE`; calls still pass
+`project_id="default"` explicitly.
 
 `coding-tools.local.toml` is the optional host-specific overlay. It is ignored
 by Git and must not be used for public defaults.
@@ -108,6 +134,31 @@ belongs under ignored locations such as `.runtime/` where appropriate.
 The public-fork hygiene tests enforce the local-config ignore rule and scan
 tracked text for known private deployment markers.
 
+## Project addressing
+
+The endpoint has no mutable active project. `list_projects` discovers the
+configured IDs; it does not select one. Every project-scoped call independently
+carries `project_id`, for example:
+
+```json
+{"project_id":"app","path":"src/main.py"}
+```
+
+The project runtime resolves that path against the `app` root. Registered
+nested projects form explicit boundaries: a parent-scoped relative path cannot
+silently cross into a separately registered child project.
+
+Command IDs and output refs are opaque handles and route back to their owning
+project automatically. `client_request_id` is project-local, so recovering a
+command by that identifier requires `project_id`; the same request ID may be
+used independently in another project.
+
+`safe` and `trusted` retain normal runtime confinement behavior. `dangerous`
+keeps explicit project routing/path validation but disables MCP permission
+gates and Landlock, so it must not be treated as isolation between mutually
+untrusted projects. Use separate service/process/container boundaries for
+different trust domains.
+
 ## Extension lifecycle
 
 Startup is deterministic:
@@ -153,8 +204,10 @@ Extensions communicate through named `CapabilityKey` values in a
 implementation. V1 permits one provider per capability key and rejects missing
 required capabilities or duplicate providers during registration.
 
-The mother core currently seeds `core.workspace`. The `projects` extension
-publishes `projects.catalog`. Registries become read-only before any extension
+The mother core currently seeds `core.workspace` and the generic
+`core.workspace_runtimes` factory. The `projects` extension publishes the
+configured project registry, lazy runtime manager, and structural project
+catalog capabilities. Registries become read-only before any extension
 `start()` call.
 
 ## Upstream synchronization bridge

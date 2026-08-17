@@ -22,6 +22,19 @@ extra.
 
 Report files are overwritten by whichever suite or benchmark was run most recently. Check `suite` in compliance reports and `conclusion` in benchmark reports before citing them.
 
+The current schema-drift source of truth is
+[`runtime-contract-v0.4.md`](runtime-contract-v0.4.md). The historical v0.3 and
+v0.2 contracts remain checked in as release-era records; current catalog tests
+must not rewrite their 22-tool/older snapshots to match v0.4.
+
+Project-addressing coverage lives under `tests/extensions/`. In particular,
+`test_project_addressing_integration.py` launches real stdio/HTTP servers with
+four temporary registered projects and verifies explicit stateless routing,
+concurrent reads, and command recovery. Shared legacy behavioral fixtures may
+inject the synthetic fallback `project_id="default"` only through test-client
+helpers; contract tests bypass that helper when they verify missing-address
+errors.
+
 ## PyPI Release
 
 Releasing is one action: push the version tag.
@@ -101,7 +114,7 @@ make benchmark-real-workloads
 | `make test-e2e` | End-to-end coding loops through the runtime |
 | `make test-runtime-semantics` | Patch/command/image behavior vectors |
 | `make test-docs-required` | Required docs, evidence artifacts, and CI workflow gate checks |
-| `make test-schema-drift` | Live tool schema/annotation names compared against the checked-in runtime contract/docs |
+| `make test-schema-drift` | Live 24-tool composed schema/annotation names compared against runtime contract v0.4/current docs, while historical contracts remain frozen |
 | `make dogfood-mcp` | Unittest MCP-only dogfood cases |
 | `make dogfood-runner` | Full deterministic HTTP dogfood transcript and report |
 | `make dogfood-smoke` | Both dogfood suites |

@@ -1,19 +1,18 @@
 # Project Addressing + Semantic Navigation Design
 
 **Date:** 2026-08-16
-**Status:** Architecture approved and revalidated; Phase 0 extension foundation is implemented and verified, Phase A project addressing is ready for implementation
+**Status:** Phase 0 extension foundation and Phase A project addressing are implemented; Phase A final acceptance/documentation verification is in progress, Phase B semantic navigation is pending
 **Target:** fork-owned multi-project and semantic extensions composed through the internal ExtensionHost
 
-**Repository validation snapshot (2026-08-17, refreshed after Phase 0):**
+**Repository validation snapshot (2026-08-17, refreshed after Phase A implementation):**
 
-- fork `main`: `f5bf954`, synchronized on top of current `xyTom/main`
+- fork `main`: `da89d81` after the four-project integration checkpoint
 - current original upstream `xyTom/main`: `66b3f19`
-- fork/upstream relation at validation time: `xyTom/main...main = 0 18`; upstream is an ancestor of fork `main`
+- upstream remained an ancestor through the Phase A implementation sequence; Task 11 reconfirms the live remote/ref before final acceptance
 - Phase 0 is implemented: layered TOML config, static extension registry/DAG, typed services, contributions/decorators, `ExtensionHost`, mother-core bridge, and the first `projects` extension are live and verified
-- current operational core remains single-workspace per handler invocation: `Runtime`, `WorkspaceCommandManager`, and `Workspace` still expose one active workspace state, which Phase A must generalize without mutating shared request state
-- current `ProjectCatalog` uses display-path-derived `project_id` values (`"."` or relative paths), confirming the need to separate stable configured identity from structural discovery
-- current default composed catalog exposes 22 tools; disabling the `projects` extension exposes 20, proving startup composition is already active
-- Phase 0 acceptance was re-run on this snapshot: extension tests 78/78, project/skills regression 16/16, full compliance 128/128, `mise run verify`, schema drift, dispatch-input, Ruff, mypy, integration, npm launcher, public/private config boundary, and upstream-bridge compatibility all pass
+- Phase A now provides immutable stable configured project IDs, structural `scope_id` separation, lazy project runtimes, nested registered-root boundaries, explicit project-scoped core/skill routing, command ownership recovery, global project discovery, and project-neutral handshake/discovery instructions
+- the default composed catalog exposes 24 tools (`projects` contributes four); disabling `projects` exposes the 20 mother-core tools
+- the real-server Phase A integration checkpoint passes four-project stdio/HTTP routing, concurrent reads, and stateless command recovery; the runtime-contract v0.4/docs and final full acceptance gates are the remaining Phase A closure work
 
 ## 1. Objective
 
@@ -324,7 +323,7 @@ request_permissions
 
 ### 5.1 Project-neutral server instructions
 
-The current single-workspace runtime injects one workspace's `ProjectContext.server_instructions()` into `initialize`/`server/discover`. A multi-project endpoint must not concatenate or implicitly choose one project's AGENTS/CLAUDE instructions.
+Before Phase A, the single-workspace runtime injected one workspace's `ProjectContext.server_instructions()` into `initialize`/`server/discover`. The implemented multi-project endpoint instead avoids concatenating or implicitly choosing one project's AGENTS/CLAUDE instructions.
 
 When `projects` is enabled, handshake/discovery instructions are project-neutral and explain the explicit addressing flow. Project-local instructions remain discoverable through `list_skills(project_id, workdir)` and the returned instruction-file paths, which clients may read with project-scoped `read_file` before modifying that scope.
 

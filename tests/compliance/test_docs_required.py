@@ -30,6 +30,7 @@ class RequiredDocsTests(unittest.TestCase):
             "docs/telemetry.md",
             "docs/troubleshooting.md",
             "docs/competitive-analysis.md",
+            "docs/runtime-contract-v0.4.md",
             "docs/runtime-contract-v0.3.md",
             "docs/migration-0.3.md",
             "docs/runtime-contract-v0.2.md",

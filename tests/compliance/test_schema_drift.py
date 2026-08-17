@@ -18,6 +18,8 @@ EXPECTED_STATELESS_TOOL_NAMES = frozenset(
     {
         "server_info",
         "check_exec_environment",
+        "list_projects",
+        "resolve_project",
         "read_file",
         "list_dir",
         "list_files",
@@ -55,7 +57,7 @@ def default_runtime() -> Iterator[Runtime]:
 
 
 class SchemaDriftTests(unittest.TestCase):
-    CONTRACT_PATH = ROOT / "docs/runtime-contract-v0.3.md"
+    CONTRACT_PATH = ROOT / "docs/runtime-contract-v0.4.md"
 
     def test_input_schemas_cover_exactly_the_registered_tools(self) -> None:
         self.assertEqual(set(input_schemas()), set(TOOL_REGISTRY))
@@ -131,13 +133,22 @@ class SchemaDriftTests(unittest.TestCase):
             ROOT / "SPEC.md": f"default catalog contains {count} tools",
             ROOT / "README.md": f"{count} battle-tested tools",
             ROOT / "README.zh-CN.md": f"{count} 个工具",
-            ROOT / "CHANGELOG.md": f"current default catalog is {count} tools",
-            ROOT / "docs/migration-0.3.md": f"current catalog is {count} tools",
         }
         for path, expected_text in expectations.items():
             with self.subTest(path=path.relative_to(ROOT)):
                 text = path.read_text(encoding="utf-8").lower()
                 self.assertIn(expected_text.lower(), text)
+
+    def test_v03_history_keeps_the_22_tool_snapshot(self) -> None:
+        historical = {
+            ROOT / "docs/runtime-contract-v0.3.md": "22 tools",
+            ROOT / "docs/migration-0.3.md": "current catalog is 22 tools",
+            ROOT / "CHANGELOG.md": "current default catalog is 22 tools",
+        }
+        for path, expected_text in historical.items():
+            with self.subTest(path=path.relative_to(ROOT)):
+                text = path.read_text(encoding="utf-8").lower()
+                self.assertIn(expected_text, text)
 
     def test_contract_error_enum_contains_live_tool_failure_codes(self) -> None:
         source = "\n".join(

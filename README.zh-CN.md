@@ -16,7 +16,8 @@ Coding Tools MCP 是一个**模型中立的编程运行时**，通过
 文件读取与搜索、结构化多文件补丁、命令执行、交互式命令、git 操作——
 一个服务器，任何 MCP 客户端都能驱动。Claude Desktop、Claude Code、Codex、
 Cursor、Cline、VS Code、Windsurf、Gemini CLI，或你自己写的 agent，拿到的
-都是同一套久经考验的 22 个工具：限定在单一工作区内，由权限模式层层把关。
+都是同一套久经考验的 24 个工具：通过显式 `project_id` 访问同一信任域内已配置
+的多个项目，并由权限模式层层把关。
 
 [![观看演示](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 
@@ -24,8 +25,9 @@ Cursor、Cline、VS Code、Windsurf、Gemini CLI，或你自己写的 agent，�
 
 - **让聊天应用变成编程 agent。** Claude Desktop——或任何 MCP 聊天客户端——
   用你已有的订阅直接获得真实的仓库访问能力，无需额外产品。
-- **安全是产品本身，不是附加项。** 每个服务器进程绑定一个工作区根目录；
-  绝对路径、`..` 穿越、符号链接逃逸一律拒绝；权限模式对网络访问、shell
+- **安全是产品本身，不是附加项。** 每个项目级请求都显式携带已配置的
+  `project_id`，相对路径只能落在所选项目根目录内；单独注册的嵌套项目也形成
+  明确边界。直接项目工具会拒绝绝对路径、`..` 穿越与符号链接逃逸；权限模式对网络访问、shell
   展开、内联脚本和破坏性命令逐项把关；Linux 上还有
   [Landlock](docs/security-boundary.md) 提供内核级文件系统隔离。
 - **模型与厂商中立。** 固定且如实标注的工具目录——没有 profile 切换，
@@ -128,17 +130,18 @@ coding-tools-mcp-desktop
 | 分组 | 工具 |
 | --- | --- |
 | 文件与搜索 | `read_file` · `list_dir` · `list_files` · `search_text` · `apply_patch` · `view_image` |
-| 项目技能 | `list_skills` · `read_skill` |
+| 项目与技能 | `list_projects` · `resolve_project` · `list_skills` · `read_skill` |
 | 执行 | `exec_command` · `list_commands` · `get_command` · `write_stdin` · `read_output` · `kill_command` · `request_permissions` |
 | Git | `git_status` · `git_diff` · `git_log` · `git_show` · `git_blame` |
 | 运行时 | `server_info` · `check_exec_environment` |
 
-仓库根部的 `AGENTS.md`/`CLAUDE.md` 会自动载入，并随 `initialize` 的
-`instructions` 下发；不握手的客户端则通过 `server/discover` 拿到同一份内容。
-工具的 `content` 是给 agent 看的精炼文本，`structuredContent` 则是完整稳定的
+`initialize` 与 `server/discover` 只返回与具体项目无关的路由说明。先用
+`list_projects` 发现稳定 ID，再在每个项目级调用中传入 `project_id`；不存在
+“激活当前项目”的前置调用。项目自己的 `AGENTS.md`/`CLAUDE.md` 与技能只在所选
+项目作用域内解析。工具的 `content` 是给 agent 看的精炼文本，`structuredContent` 则是完整稳定的
 机器结果。Schema 与结果封装：
 [docs/tools-and-schemas.md](docs/tools-and-schemas.md) ·
-[docs/runtime-contract-v0.3.md](docs/runtime-contract-v0.3.md)
+[docs/runtime-contract-v0.4.md](docs/runtime-contract-v0.4.md)
 
 ## 安全边界
 
@@ -146,10 +149,10 @@ coding-tools-mcp-desktop
 | --- | --- | --- |
 | `safe`（默认） | 日常 agent 工作 | 文件工具与常规命令；疑似联网命令、shell 展开、内联脚本、破坏性命令均需显式授权 |
 | `trusted` | 本地开发 | 放开网络、shell 展开与内联脚本；保留敏感值过滤与破坏性命令检查 |
-| `dangerous` | 仅限隔离容器/虚拟机 | 关闭 `exec_command` 权限门；工作区路径边界依然生效 |
+| `dangerous` | 仅限隔离容器/虚拟机 | 关闭 MCP 权限门与 Landlock；显式项目路由仍生效，但这不是多租户隔离 |
 
 递归列举与搜索默认排除 `.git`、`node_modules`、构建产物、虚拟环境和常见
-缓存。命令在工作区限定的 cwd 下运行，环境经过清洗，带超时与输出上限。
+缓存。命令在显式选择的项目 cwd 下运行，环境经过清洗，带超时与输出上限。
 支持 Landlock 的 Linux 主机获得内核级文件系统隔离；其他平台会收到明确
 警告——这仍不是完整的操作系统级沙箱，真正不可信的工作请用 Docker 镜像或
 虚拟机。详见：
@@ -180,7 +183,7 @@ SWE-bench 榜单成绩——[docs/swe-bench.md](docs/swe-bench.md) 写明了测�
 | --- | --- |
 | 上手 | [快速开始](docs/quickstart.md) · [客户端配置](docs/mcp-client-config.md) · [排障](docs/troubleshooting.md) |
 | 远程与沙箱 | [Remote MCP](docs/remote-mcp.md) · [Docker 沙箱](docs/docker.md) · [云沙箱 Worker](cloudflare/sandbox-control/README.md) |
-| 工具与契约 | [工具与 Schema](docs/tools-and-schemas.md) · [运行时契约](docs/runtime-contract-v0.3.md) · [迁移到 0.3](docs/migration-0.3.md) · [权限模式](docs/permission-modes.md) |
+| 工具与契约 | [工具与 Schema](docs/tools-and-schemas.md) · [运行时契约 v0.4](docs/runtime-contract-v0.4.md) · [内部扩展](docs/extensions.md) · [历史 0.3 迁移](docs/migration-0.3.md) · [权限模式](docs/permission-modes.md) |
 | 命令执行 | [Exec 配方](docs/exec-command-recipes.md) · [Exec 排障](docs/troubleshooting-exec.md) |
 | 集成 | [嵌入指南](docs/embedding.md) · [npm 启动器](npm/coding-tools-mcp/README.md) |
 | 安全与质量 | [安全策略](SECURITY.md) · [安全边界](docs/security-boundary.md) · [CI 与测试](docs/ci-and-tests.md) · [已知限制](docs/limitations.md) · [竞品分析](docs/competitive-analysis.md) |

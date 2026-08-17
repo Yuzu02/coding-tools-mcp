@@ -56,8 +56,9 @@ Configuration precedence is:
 CLI > environment > local TOML > public TOML > built-in defaults
 ```
 
-The default configuration enables the internal `projects` extension and keeps
-the current 22-tool catalog. Override the enabled list for one process with:
+The default configuration enables the internal `projects` extension and
+exposes the current 24-tool composed catalog. Override the enabled list for one
+process with:
 
 ```bash
 coding-tools-mcp --stdio --workspace /path/to/repo --extensions projects
@@ -66,6 +67,41 @@ coding-tools-mcp --stdio --workspace /path/to/repo --extensions ''
 
 See [extensions.md](extensions.md) for config file selection, lifecycle,
 capabilities, and the upstream synchronization boundary.
+
+### Address projects explicitly
+
+With the default `projects` extension, there is no active/current project. Call
+`list_projects` to discover stable IDs, then include one on every
+project-scoped call. Listing is discovery, not activation.
+
+For a traditional single `--workspace /path/to/repo` launch with no explicit
+registry, the runtime synthesizes the ID `default`:
+
+```json
+{"name":"list_projects","arguments":{}}
+```
+
+then, for example:
+
+```json
+{"name":"read_file","arguments":{"project_id":"default","path":"README.md"}}
+```
+
+For several projects, keep machine-specific roots in the ignored local overlay:
+
+```toml
+# coding-tools.local.toml
+config_version = 1
+
+[extensions.projects.registry.app]
+root = "/srv/projects/app"
+
+[extensions.projects.registry.api]
+root = "/srv/projects/api"
+```
+
+Then calls use `project_id="app"` or `project_id="api"` directly; no previous
+request changes routing state. See [runtime-contract-v0.4.md](runtime-contract-v0.4.md).
 
 When working from this checkout instead of a published package, start Streamable HTTP with:
 

@@ -1,40 +1,47 @@
 # Tools And Schemas
 
-The normative behavior is [runtime-contract-v0.3.md](runtime-contract-v0.3.md).
+The normative behavior is [runtime-contract-v0.4.md](runtime-contract-v0.4.md).
 Live JSON Schemas come from `tools/list`; CI compares their names, input
 properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The committed/default composition contains exactly 22 tools:
+The committed/default composition contains exactly 24 tools:
 
-- `server_info`: server, workspace, automatic project context, policy, runtime,
-  auth, protocol, and fixed-catalog metadata.
-- `check_exec_environment`: lightweight execution policy and Landlock status.
-- `read_file`: stream a bounded UTF-8 range without loading the whole file.
-- `list_dir`: list immediate or bounded-recursive directory entries.
-- `list_files`: iterate files with glob, ignore, hidden-file, sort, and cap
-  controls.
-- `search_text`: literal or regex search; ripgrep stops after the result cap.
-- `list_skills`: list effective project-scoped skills for an explicit workdir.
-- `read_skill`: load the effective named skill for an explicit workdir.
-- `apply_patch`: stage and atomically commit add/update/delete/move envelopes.
-- `exec_command`: run a bounded command and wait up to 10 seconds by default;
-  an optional stable `client_request_id` deduplicates an uncertain retry.
-- `list_commands`: list bounded metadata for workspace-owned commands; it can
-  filter by `client_request_id` without exposing command text or environment.
-- `get_command`: recover one workspace-owned command by `command_id` or
-  `client_request_id` without consuming its output cursor.
+- `server_info`: global server, auth, protocol, policy, extension, and configured
+  project metadata without project-specific instruction contents.
+- `check_exec_environment`: effective execution/runtime-directory policy for
+  one explicit `project_id`.
+- `read_file`: stream a bounded UTF-8 range from one project.
+- `list_dir`: list immediate or bounded-recursive entries in one project.
+- `list_files`: iterate project files with glob, ignore, hidden-file, sort, and
+  cap controls.
+- `search_text`: literal or regex project search; ripgrep stops after the cap.
+- `apply_patch`: stage and atomically commit add/update/delete/move envelopes
+  within one project.
+- `exec_command`: run a bounded command in one project and wait up to 10
+  seconds by default; `client_request_id` is idempotent within that project.
+- `list_commands`: aggregate project-owned retained commands or filter by
+  optional `project_id` / `client_request_id`.
+- `get_command`: recover by opaque `command_id`, or by
+  `project_id + client_request_id`, without consuming output.
 - `write_stdin`: poll or interact with a running command.
 - `kill_command`: terminate one runtime-owned command.
 - `read_output`: page retained stdout or stderr using absolute byte offsets.
-- `git_status`: structured working-tree status.
-- `git_diff`: bounded unified staged/unstaged diff.
-- `git_log`: structured bounded commit history.
-- `git_show`: bounded revision metadata/content/diff.
-- `git_blame`: structured bounded line attribution.
-- `request_permissions`: report elicitation status without silently granting.
-- `view_image`: one MCP image content block plus structured metadata.
+- `git_status`: structured status for one project.
+- `git_diff`: bounded unified staged/unstaged diff for one project.
+- `git_log`: structured bounded project commit history.
+- `git_show`: bounded project revision metadata/content/diff.
+- `git_blame`: structured bounded project line attribution.
+- `request_permissions`: report permission-request status without silently
+  granting; project-scoped targets carry their `project_id` in `arguments`.
+- `view_image`: one project-scoped MCP image block plus structured metadata.
+- `list_projects`: list stable configured project IDs and registry metadata.
+- `resolve_project`: map an absolute server path to its longest matching
+  configured project; primarily operator/local discovery.
+- `list_skills`: list effective skills/instruction files for one project and
+  explicit relative workdir.
+- `read_skill`: load an effective named skill from one project scope.
 
 The fork composes mother-core definitions plus enabled internal extension
 contributions once during process startup. `tools/list`, argument validation,
@@ -42,11 +49,15 @@ and `tools/call` all consume the same frozen composed catalog, so
 `listChanged` remains `false` for the lifetime of that process. There is no
 runtime profile switching or dynamic extension activation.
 
-The default `projects` extension contributes `list_skills` and `read_skill`.
-Starting the fork with `--extensions ''` intentionally removes those two tools
-for that process. `view_image` remains independently gated by installation
-capability. V1 tool decorators are deterministic and may add schema properties
-and wrap handlers, but may not replace existing schema properties.
+The default `projects` extension contributes `list_projects`,
+`resolve_project`, `list_skills`, and `read_skill`, and decorates the 13
+project-addressed mother-core operations plus `view_image` when exposed. The
+normal default therefore contains 24 tools. Starting the fork with
+`--extensions ''` intentionally exposes only the 20 mother-core tools for that
+process and removes project-addressing decoration. `view_image` remains
+independently gated by installation capability. V1 tool decorators are
+deterministic and may add schema properties and wrap handlers, but may not
+replace existing schema properties.
 
 ## Result envelope
 
@@ -98,11 +109,20 @@ patch. A file's final newline is an ordinary line the hunk can add or remove.
 
 ## Model-ready examples
 
-Every relative path resolves against the workspace root; there is no
-session-scoped working directory. Use explicit paths for multi-call workflows:
+Every project-scoped filesystem/Git/process call carries `project_id`. Relative
+paths and workdirs resolve against that selected project root; there is no
+session-scoped cwd or mutable current project. Discover IDs without activating
+anything:
 
 ```json
-{"cmd":"pytest -q","workdir":".","yield_time_ms":30000}
+{}
+```
+
+Call the global `list_projects` tool with that empty object, then address a
+project directly. For example, run tests in project `app`:
+
+```json
+{"project_id":"app","cmd":"pytest -q","workdir":".","yield_time_ms":30000}
 ```
 
 If the result is still running, copy its `command_id` exactly:
@@ -138,10 +158,12 @@ For an execution whose outcome is uncertain, pass one stable, non-secret
 `client_request_id` to `exec_command`. Retrying the same request either
 returns the existing command or reports `COMMAND_STARTING`/
 `COMMAND_START_FAILED` while its launch state is being resolved. Reusing that
-identifier for different command inputs returns `IDEMPOTENCY_CONFLICT`.
-`list_commands` can find the command by that identifier, and `get_command`
-recovers its metadata and output references by exactly one of `command_id` or
-`client_request_id`.
+identifier for different command inputs inside the same project returns
+`IDEMPOTENCY_CONFLICT`. The same `client_request_id` may exist independently in
+another project. `get_command(command_id=...)` uses the opaque global handle
+without `project_id`; `get_command(client_request_id=...)` requires the owning
+`project_id`. Bare `list_commands` aggregates retained commands and labels
+project ownership, while `list_commands(project_id=...)` filters one project.
 
 Only truncated terminal output returns a `read_output` next action by default.
 `output_ref` values are `command:<id>:stdout` or `command:<id>:stderr`; offsets
@@ -170,8 +192,12 @@ than labeling pipes as a TTY.
 - `dangerous`: disables command permission gates and Landlock; use only inside
   an isolated container or VM.
 
-These modes do not change the tool list. Direct path tools retain workspace
-confinement in every mode.
+These modes do not change the tool list. Direct path tools always route and
+validate relative paths against the addressed project. `dangerous` still
+disables MCP permission gates and Landlock, however, so it is not tenant
+isolation: arbitrary shell commands retain the aggregate host authority of the
+server process. Projects requiring different trust policies need separate
+external process/container boundaries.
 
 `--dangerously-fake-readonly-annotations` advertises every tool as read-only in
 `tools/list` for clients that gate on annotations. It does not change the tool list
