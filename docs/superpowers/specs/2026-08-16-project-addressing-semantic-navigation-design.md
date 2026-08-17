@@ -1,21 +1,23 @@
 # Project Addressing + Semantic Navigation Design
 
 **Date:** 2026-08-16
-**Status:** Validated against the repository and current upstream; architecture approved, ready for implementation planning
-**Target:** next explicit Coding Tools MCP contract revision after v0.3; v0.3 remains a compatibility profile
+**Status:** Architecture approved and revalidated; implementation is gated on the Extension Architecture + TOML Configuration foundation
+**Target:** fork-owned multi-project and semantic extensions composed through the internal ExtensionHost
 
 **Repository validation snapshot (2026-08-17):**
 
-- fork checkout: local development branch validated before publication
-- last integrated upstream baseline: `xyTom/main` at `38f83b9` (v0.3.0 integration)
+- fork `main`: `a5173ab`, synchronized on top of current `xyTom/main`
 - current original upstream `xyTom/main`: `66b3f19`
-- upstream delta since `38f83b9`: documentation-only (`README.md`, `README.zh-CN.md`, `docs/mcp-client-config.md`)
+- fork/upstream relation at validation time: `xyTom/main...main = 0 4`
 - current runtime remains single-workspace: `Runtime`, `WorkspaceCommandManager`, and `Workspace` are rooted at one configured workspace
 - current `ProjectCatalog` uses display-path-derived `project_id` values (`"."` or relative paths), confirming the need to separate stable configured identity from structural discovery
+- current v0.3 baseline still exposes a fixed 22-tool catalog; the fork may deliberately evolve that contract through the extension composition layer rather than preserving the count indefinitely
 
 ## 1. Objective
 
 Move Coding Tools MCP from a single-workspace runtime to one stateless MCP endpoint that can address multiple configured projects explicitly, and add first-class semantic code navigation without exposing Serena's project/session model to MCP clients.
+
+This design is implemented **after** [`2026-08-17-extension-architecture-config-design.md`](2026-08-17-extension-architecture-config-design.md). `projects` and `semantic` are internal fork extensions, not feature-specific mutations spread through the mother core.
 
 The target deployment model is:
 
@@ -38,7 +40,7 @@ A client never selects a mutable "current project". Every project-scoped request
 5. All paths supplied to project-scoped tools are resolved relative to the selected project root and must remain inside that root after canonicalization.
 6. One Coding Tools MCP process may keep internal caches, project metadata, command state, language-server processes, and Serena workers. Internal state is permitted as long as request semantics are explicit and concurrency-safe.
 7. Serena is an implementation detail behind a Coding Tools semantic adapter. Serena tool names, schemas, project activation semantics, and editing tools are never part of the public Coding Tools MCP contract.
-8. `apply_patch` remains the direct filesystem mutation primitive. Semantic navigation is read-only in the first phase.
+8. `apply_patch` remains the structured direct-edit primitive for agent-authored source changes. `exec_command` may continue to modify a selected project through canonical workspace tools such as formatters, generators, package managers, migrations, and autofix workflows. Semantic navigation is read-only in the first phase.
 
 ### 2.1 Relationship to the broader vNext design
 
@@ -53,19 +55,39 @@ Where the two designs conflict, this document makes these narrower replacements:
 
 Other vNext areas—configuration layering, hooks, Work Items, gateway policy, authentication, telemetry, and permission ceilings—remain unchanged unless a later design explicitly revises them.
 
-### 2.2 Fork/upstream parity constraint
+### 2.2 Fork/upstream synchronization constraint
 
-This fork remains additive relative to the original `xyTom/coding-tools-mcp` mainline.
+This fork is upstream-syncable relative to the original `xyTom/coding-tools-mcp` mainline; it is not constrained to remain behavior-identical or purely additive.
 
 Before implementation or release work for this design:
 
-- synchronize the latest original `xyTom/main` through the repository's established upstream-sync/integration workflow;
-- preserve upstream runtime/protocol behavior unless this new contract revision explicitly changes it;
-- keep fork-only capabilities isolated behind clear modules, profiles, or contract-version boundaries so routine upstream merges remain reviewable;
+- synchronize the latest original `xyTom/main` through the repository's established `sync/upstream-main` integration workflow;
+- resolve conflicts deliberately, preserving fork architecture where divergence is intentional;
+- keep fork-only capabilities behind the internal extension boundary so routine upstream merges remain reviewable;
 - prefer adapting existing upstream primitives over duplicating them;
-- rerun upstream compliance/tests plus fork-specific tests after every upstream integration.
+- rerun bridge compatibility tests, relevant upstream tests, and fork extension tests after every upstream integration.
 
-The 2026-08-17 validation found two upstream commits after the currently integrated `38f83b9`; they only change client-facing documentation, so they do not invalidate this architecture. They still need to be synchronized as part of normal fork maintenance.
+The 2026-08-17 validation confirms `66b3f19` is already integrated and the fork is exactly four commits ahead at `a5173ab`.
+
+### 2.3 Extension architecture prerequisite
+
+Project addressing and semantic navigation are consumers of the internal ExtensionHost defined by the Extension Architecture + TOML Configuration design.
+
+```text
+ExtensionHost
+    ├── projects extension
+    │     ├── ProjectRegistry service
+    │     ├── list_projects / resolve_project contributions
+    │     └── project-addressing decorators for mother-core tools
+    │
+    └── semantic extension
+          ├── requires projects
+          ├── consumes ProjectRegistry
+          ├── SemanticBackend service
+          └── semantic tool contributions
+```
+
+The implementation must not reintroduce direct extension-specific mutation of `TOOL_REGISTRY`, runtime monkey-patching, or feature-specific conditionals scattered across mother-core dispatch.
 
 ## 3. Project identity and configuration
 
@@ -99,7 +121,7 @@ Moving a project root on disk does not change its ID.
 
 ### 3.2 Registry model
 
-Introduce a process-wide immutable `ProjectRegistry` built at startup from configuration.
+The `projects` extension introduces a process-wide immutable `ProjectRegistry` built at startup from layered TOML configuration.
 
 Conceptual record:
 
@@ -129,6 +151,30 @@ ProjectRegistry
 ```
 
 The current behavior where `ProjectRecord.project_id` can effectively be a display path should be separated from the configured stable ID. Nested discovered units should use a separate `scope_id` or `display_root`; they must not shadow the top-level registered `project_id`.
+
+### 3.3 Per-project runtime state
+
+Multi-project routing must also separate the state that is workspace-local today. A global registry alone is insufficient because the current implementation keeps command ownership, project context, skills, patch baselines, and caches on one `Runtime`/workspace.
+
+Introduce an internal `ProjectRuntime` (exact class name may vary) owned by the `projects` extension:
+
+```text
+RegisteredProject
+      │
+      ▼
+ProjectRuntime
+      ├── Workspace/path resolver
+      ├── WorkspaceCommandManager
+      ├── ProjectContext
+      ├── ProjectCatalog
+      ├── SkillCatalog
+      ├── patch baselines/locks
+      └── project-local caches
+```
+
+It does **not** own MCP transport, authentication, protocol negotiation, or the global ExtensionHost. Those remain process-wide.
+
+Project runtimes may be created lazily, but the configured `ProjectRegistry` is immutable after startup. Command handles are globally routable through an internal `command_id -> project_id` ownership index, while `client_request_id` idempotency remains keyed by `(project_id, client_request_id)`.
 
 ## 4. Public project tools
 
@@ -255,17 +301,26 @@ read_output
 
 Command records must internally persist `project_id`. Idempotency bindings are keyed by `(project_id, client_request_id)`, preserving today's workspace-local semantics when several former workspaces share one process. A `client_request_id` reused in project A and project B is therefore independent, while reuse inside one project retains the existing fingerprint/conflict behavior.
 
+`check_exec_environment` becomes project-scoped when the `projects` extension is enabled because its effective workspace/runtime/sandbox diagnostics depend on the selected project. It therefore requires `project_id` in the multi-project contract.
+
 Global/server tools remain unscoped:
 
 ```text
 server_info
-check_exec_environment
 list_projects
 resolve_project
 request_permissions
 ```
 
 `request_permissions` receives and validates the same target arguments as the protected operation, so project-scoped permission requests indirectly include the target `project_id` inside `arguments`.
+
+### 5.1 Project-neutral server instructions
+
+The current single-workspace runtime injects one workspace's `ProjectContext.server_instructions()` into `initialize`/`server/discover`. A multi-project endpoint must not concatenate or implicitly choose one project's AGENTS/CLAUDE instructions.
+
+When `projects` is enabled, handshake/discovery instructions are project-neutral and explain the explicit addressing flow. Project-local instructions remain discoverable through `list_skills(project_id, workdir)` and the returned instruction-file paths, which clients may read with project-scoped `read_file` before modifying that scope.
+
+No previous request chooses which project's instructions apply.
 
 ## 6. Path and sandbox semantics
 
@@ -579,7 +634,7 @@ This preserves trust in tool semantics.
 }
 ```
 
-The tool registry remains the single source of truth for exposed tools and annotations.
+The ExtensionHost-composed tool registry is the single source of truth for exposed tools and annotations.
 
 Semantic tools are:
 
@@ -591,7 +646,7 @@ open_world = false
 
 They are gated by semantic backend availability/configuration so a server can run without Serena installed.
 
-The existing v0.3 compatibility profile keeps its current fixed 22-tool contract unchanged. The new multi-project/semantic contract is an explicit vNext profile/revision: `list_projects`, `resolve_project`, `project_id` schema changes, and semantic tools are never injected into a v0.3 endpoint silently. Within one running vNext process, the exposed tool catalog is fixed after startup; backend failure at runtime returns typed semantic errors rather than mutating the catalog.
+The current v0.3 implementation is the starting mother-core contract, not a permanent restriction on the fork. Enabling `projects` and `semantic` may deliberately evolve the fork's schemas and tool catalog. Within one running process, however, the ExtensionHost composes and freezes the exposed catalog at startup; backend failure at runtime returns typed semantic errors rather than mutating that catalog.
 
 ## 13. One-unit deployment model
 
@@ -639,22 +694,22 @@ If strict backward compatibility with old clients is required during a transitio
 
 ### 14.2 Global configuration
 
-The preferred new deployment source is a global config containing all project mappings. Existing CLI flags may override global defaults but must not create mutable current-project state.
+Project mappings live in the layered TOML model defined by the Extension Architecture + TOML Configuration design. Public composition/defaults belong in `coding-tools.toml`; actual host roots belong in ignored `coding-tools.local.toml`. Supported environment and explicit CLI overrides remain higher-precedence layers and must not create mutable current-project state.
 
 ## 15. Security consequences
 
-Moving from one workspace per process to multiple projects expands the process's aggregate filesystem authority. The server therefore must maintain project-level confinement per operation.
+Moving from one workspace per process to multiple projects expands the process's aggregate filesystem authority. The server must maintain deterministic project routing and path validation. OS-level isolation is provided only to the extent promised by the active permission mode and deployment policy; this design does not turn trusted projects into mutually hostile tenants.
 
 Required properties:
 
 1. Project lookup happens before any path resolution or command execution.
-2. A project-relative path may not escape to another configured project.
-3. `exec_command` confinement is built from the selected project's root and global read-only runtime allowances.
+2. Explicit `path`, `workdir`, and `cwd` addressing fields are resolved against the selected project and may not escape it through traversal or unsafe symlinks.
+3. In `safe`/`trusted`, filesystem confinement for commands is derived from the selected project plus documented runtime/toolchain allowances. In `dangerous`, Landlock and MCP safety gates remain disabled as they are today; a command string may therefore intentionally access broader host resources even though its declared project/workdir routing still resolves from `project_id`.
 4. Permission grants are scoped to both operation and project-target arguments.
 5. Command/output handles carry project ownership internally.
 6. Telemetry includes `project_id` but never secret environment values.
 7. Semantic subprocesses receive only the selected project root and required environment subset.
-8. If configured project roots are nested, a request scoped to the parent project may not cross into the separately registered child project unless an explicit future policy says otherwise; longest-root discovery does not grant parent-project authority over child-project operations.
+8. If configured project roots are nested, project-aware path resolvers do not silently retarget a parent-project request into the separately registered child project; longest-root discovery determines identity but does not mutate the caller's `project_id`. Strong OS-level prevention of an intentionally broad `dangerous` command remains outside this guarantee.
 9. Root paths exposed by discovery/status are operator metadata and may be redacted in remote/untrusted profiles without changing `project_id` semantics.
 
 ## 16. Testing strategy
@@ -680,6 +735,7 @@ For every project-scoped tool:
 - unknown project returns `PROJECT_NOT_FOUND`
 - project A cannot read/execute against project B through relative traversal
 - same relative path in two projects resolves independently
+- `dangerous` tests do not assert Landlock isolation that the mode intentionally disables; they still assert deterministic project/workdir routing
 
 Global tools must not accidentally require `project_id`.
 
@@ -726,16 +782,17 @@ CI should skip Serena integration tests with an explicit reason when the optiona
 
 ## 17. Implementation decomposition
 
-The implementation should be split into two independently reviewable phases, preceded by one maintenance gate.
+The implementation follows the extension foundation and then splits into two independently reviewable feature phases.
 
-### Prerequisite — Upstream parity and design reconciliation
+### Phase 0 — Extension Architecture + TOML Configuration
 
-- synchronize current original `xyTom/main` through the established fork integration workflow;
-- verify that upstream runtime/protocol/compliance tests still pass before fork-specific changes;
-- reconcile the broader vNext design's stable-state identity wording with stable `project_id`;
-- preserve the v0.3 compatibility profile unchanged.
+- implement [`2026-08-17-extension-architecture-config-design.md`](2026-08-17-extension-architecture-config-design.md);
+- establish `coding-tools.toml` + ignored `coding-tools.local.toml` layered configuration;
+- establish the static internal extension registry, dependency graph, lifecycle, service registry, tool contributions, and tool decorators;
+- integrate the minimal ExtensionHost bridge with the mother core;
+- prove the boundary by moving existing fork-owned project/skill discovery behind it where appropriate.
 
-No feature implementation starts from a stale upstream baseline.
+No multi-project or Serena feature implementation starts before this foundation is green.
 
 ### Phase A — Project addressing
 
@@ -750,6 +807,8 @@ Deliverables:
 - per-project path/exec confinement
 - single-unit multi-project configuration
 - updated contract/compliance tests
+
+Implementation form: internal `projects` extension. It publishes `ProjectRegistry`, contributes project discovery tools, and decorates project-scoped mother-core operations through the extension API.
 
 Acceptance criterion: four configured projects can be served by one MCP endpoint with no request-local/current-project state.
 
@@ -767,6 +826,8 @@ Deliverables:
 - `find_references`
 - typed semantic errors
 - integration tests for project isolation/concurrency
+
+Implementation form: internal `semantic` extension with `requires=("projects",)`. It consumes the published `ProjectRegistry` service and contributes its semantic tools without mother-core feature-specific patches.
 
 Acceptance criterion: two projects can issue overlapping semantic requests concurrently and receive only results from their own project namespace.
 
@@ -811,11 +872,11 @@ The design is successful when all of the following are true:
 2. Every project-scoped request is independently reproducible from its arguments.
 3. No request needs a previous project-selection call.
 4. `list_projects` and `resolve_project` expose stable project addressing.
-5. Existing filesystem/process/Git behavior is confined to the selected project.
+5. Filesystem/Git path addressing and command workdir routing are deterministically scoped to the selected project, while OS-level command confinement follows the configured permission mode.
 6. Semantic tool schemas are Coding Tools-owned and backend-neutral.
 7. Serena can be upgraded/replaced without changing the MCP contract.
 8. Concurrent project A/B semantic operations cannot contaminate one another.
 9. Backend failure is isolated and returned as a typed error.
-10. `apply_patch` remains the sole direct file-modification primitive.
-11. The fork remains synchronized with current original `xyTom/main`, with upstream behavior preserved outside explicit vNext contract changes.
-12. v0.3 clients retain the unchanged v0.3 fixed-tool compatibility profile.
+10. `apply_patch` remains the structured direct-edit primitive while canonical `exec_command` workflows may mutate the selected project under runtime policy.
+11. The fork remains synchronized through the explicit upstream integration workflow, with extension/core bridge conflicts localized and test-backed.
+12. Project and semantic capabilities are implemented through the ExtensionHost foundation rather than scattered feature-specific mother-core edits.
