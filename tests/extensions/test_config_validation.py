@@ -12,6 +12,13 @@ def write(path: Path, text: str) -> None:
 
 
 class ConfigValidationTests(unittest.TestCase):
+    def test_extension_config_reexports_shared_schema_types(self) -> None:
+        from coding_tools_mcp import config_schema
+        from coding_tools_mcp.extensions import config as extension_config
+
+        self.assertIs(extension_config.ConfigError, config_schema.ConfigError)
+        self.assertIs(extension_config.ConfigNode, config_schema.ConfigNode)
+
     def test_unknown_root_key_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
