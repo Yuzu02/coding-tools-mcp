@@ -3,15 +3,19 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from coding_tools_mcp.errors import JsonRpcError
 from coding_tools_mcp.extensions import (
     ExtensionManifest,
     ExtensionRegistry,
     RuntimeConfig,
+    SchemaPatch,
     ToolAnnotations,
     ToolContribution,
+    ToolDecorator,
 )
+from coding_tools_mcp.extensions.contributions import ToolHandler
 from coding_tools_mcp.server import Runtime
 
 
@@ -45,6 +49,39 @@ class EchoExtension:
 
     def stop(self):
         self.stops.append("echo")
+
+
+class DecoratorExtension:
+    manifest = ExtensionManifest(name="decorator")
+
+    def configure(self, config):
+        pass
+
+    def register(self, context):
+        def wrap(next_handler: ToolHandler) -> ToolHandler:
+            def handler(args: dict[str, Any]) -> dict[str, Any]:
+                forwarded = dict(args)
+                forwarded.pop("bridge_token", None)
+                return next_handler(forwarded)
+
+            return handler
+
+        context.add_decorator(
+            ToolDecorator(
+                targets=("server_info",),
+                schema_patch=SchemaPatch(
+                    properties={"bridge_token": {"type": "string", "minLength": 1}},
+                    required=("bridge_token",),
+                ),
+                wrap_handler=wrap,
+            )
+        )
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
 
 
 class CoreBridgeTests(unittest.TestCase):
@@ -125,6 +162,28 @@ class CoreBridgeTests(unittest.TestCase):
         runtime.close()
 
         self.assertEqual(EchoExtension.stops, ["echo"])
+
+    def test_decorator_bridge_changes_both_schema_and_dispatch(self) -> None:
+        registry = ExtensionRegistry([DecoratorExtension], default_enabled=())
+        runtime = Runtime(
+            self.root,
+            extension_registry=registry,
+            extension_config=RuntimeConfig.defaults(enabled=("decorator",)),
+        )
+        try:
+            tools = {tool["name"]: tool for tool in runtime.list_tools()["tools"]}
+            schema = tools["server_info"]["inputSchema"]
+            self.assertIn("bridge_token", schema["properties"])
+            self.assertIn("bridge_token", schema["required"])
+
+            with self.assertRaisesRegex(JsonRpcError, "arguments.bridge_token is required"):
+                runtime.call_tool("server_info", {})
+
+            result = runtime.call_tool("server_info", {"bridge_token": "ok"})
+            self.assertFalse(result["isError"])
+            self.assertEqual(result["structuredContent"]["server"], "coding-tools-mcp")
+        finally:
+            runtime.close()
 
 
 if __name__ == "__main__":
