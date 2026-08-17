@@ -577,6 +577,17 @@ class RuntimeHelperTests(unittest.TestCase):
             workspace = Path(tmp)
             runtime = Runtime(workspace)
             info = runtime.server_info_payload()
+            self.assertEqual(info.get("version"), info.get("package_version"))
+            self.assertEqual(info.get("package_version"), server_module.__version__)
+            self.assertEqual(info.get("runtime_contract_version"), "0.4")
+            self.assertEqual(
+                info.get("configuration", {}).get("fingerprint"),
+                runtime.config_snapshot.fingerprint,
+            )
+            self.assertEqual(
+                info.get("configuration", {}).get("mode"),
+                runtime.config_snapshot.resolution_mode,
+            )
             self.assertEqual(info.get("permission_mode"), "safe")
             self.assertEqual(info.get("runtime_dir"), str(runtime.runtime_dir))
             self.assertEqual(info.get("home"), str(runtime.command_home_dir()))

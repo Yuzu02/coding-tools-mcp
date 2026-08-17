@@ -54,7 +54,14 @@ from .extensions import (
     load_runtime_config,
     parse_extension_list,
 )
-from .host_config import ConfigSnapshot, build_developer_snapshot
+from .host_config import (
+    ConfigSnapshot,
+    HostConfig,
+    build_developer_snapshot,
+    build_host_snapshot,
+    load_host_config,
+    resolve_secret_ref,
+)
 from .landlock_exec import libc_syscall
 from .oauth import (
     OAUTH_CODE_TTL_SECONDS,
@@ -107,6 +114,7 @@ from .protocol import (
     validate_rpc_envelope,
 )
 from .project_context import ProjectContext, load_project_context
+from .runtime_contract import RUNTIME_CONTRACT_VERSION
 from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
@@ -633,6 +641,20 @@ def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
         shell_env_policy=shell_env_policy_from_args(args),
         allow_network=allow_network,
         fake_readonly_annotations=fake_readonly_annotations_from_args(args, permission_mode),
+    )
+
+
+def runtime_policy_from_host_config(config: HostConfig) -> RuntimePolicy:
+    inherit = {
+        "filtered": "core",
+        "all": "all",
+        "none": "none",
+    }[config.security.shell_env_inherit]
+    return RuntimePolicy(
+        permission_mode=config.security.permission_mode,
+        shell_env_policy=ShellEnvPolicy(inherit=inherit),
+        allow_network=config.security.allow_network,
+        fake_readonly_annotations=False,
     )
 
 
@@ -2049,6 +2071,14 @@ class Runtime:
             "server": SERVER_NAME,
             "title": SERVER_TITLE,
             "version": __version__,
+            "package_version": __version__,
+            "runtime_contract_version": RUNTIME_CONTRACT_VERSION,
+            "configuration": {
+                "mode": self.config_snapshot.resolution_mode,
+                "fingerprint": self.config_snapshot.fingerprint,
+                "versions": dict(self.config_snapshot.config_versions),
+                "warning_count": len(self.config_snapshot.warnings),
+            },
             "supported_protocol_versions": list(KNOWN_PROTOCOL_VERSIONS),
             **self._exec_environment_summary(),
             "auth_enabled": self.auth_enabled(),
@@ -6350,19 +6380,29 @@ class RuntimeHTTPServer(http.server.ThreadingHTTPServer):
         super().server_close()
 
 
-def build_runtime(
+def resolve_config_snapshot(
     args: argparse.Namespace,
-    runtime_policy: RuntimePolicy,
     *,
-    auth_token: str | None = None,
-    oauth_config: OAuthConfig | None = None,
-    emit_warning: bool = True,
-    project_context: ProjectContext | None = None,
-    transport: str = "stdio",
-    command_manager: WorkspaceCommandManager | None = None,
-) -> Runtime:
-    workspace = Path(args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd())
-    registry = builtin_extension_registry()
+    registry: ExtensionRegistry,
+    resolved_workspace: Path,
+) -> ConfigSnapshot:
+    host_config_path = getattr(args, "host_config", None)
+    if host_config_path is not None:
+        conflicts = (
+            ("config", "--config"),
+            ("local_config", "--local-config"),
+            ("extensions", "--extensions"),
+        )
+        for attribute, option in conflicts:
+            if getattr(args, attribute, None) is not None:
+                raise ConfigError(f"--host-config cannot be combined with {option}")
+        host_config = load_host_config(
+            Path(host_config_path),
+            extension_schemas=registry.schemas(),
+            default_enabled=registry.default_enabled,
+        )
+        return build_host_snapshot(host_config)
+
     raw_cli_extensions = getattr(args, "extensions", None)
     config = load_runtime_config(
         cwd=Path.cwd(),
@@ -6377,23 +6417,59 @@ def build_runtime(
             else None
         ),
     )
-    snapshot = build_developer_snapshot(
+    return build_developer_snapshot(
         runtime_config=config,
-        bootstrap_workspace=workspace,
+        bootstrap_workspace=resolved_workspace,
     )
+
+
+def build_runtime(
+    args: argparse.Namespace,
+    runtime_policy: RuntimePolicy,
+    *,
+    auth_token: str | None = None,
+    oauth_config: OAuthConfig | None = None,
+    emit_warning: bool = True,
+    project_context: ProjectContext | None = None,
+    transport: str = "stdio",
+    command_manager: WorkspaceCommandManager | None = None,
+    config_snapshot: ConfigSnapshot | None = None,
+    extension_registry: ExtensionRegistry | None = None,
+) -> Runtime:
+    developer_workspace = Path(
+        args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd()
+    )
+    registry = extension_registry or builtin_extension_registry()
+    snapshot = config_snapshot or resolve_config_snapshot(
+        args,
+        registry=registry,
+        resolved_workspace=developer_workspace,
+    )
+    effective_policy = runtime_policy
+    workspace = developer_workspace
+    enable_view_image = args.enable_view_image
+    effective_transport = transport
+    if snapshot.resolution_mode == "host":
+        host_config = snapshot.host_config
+        if host_config is None or host_config.runtime is None:
+            raise ConfigError("HostConfig runtime.bootstrap_workspace is required to start the MCP runtime")
+        workspace = host_config.runtime.bootstrap_workspace
+        effective_policy = runtime_policy_from_host_config(host_config)
+        enable_view_image = host_config.runtime.enable_view_image
+        effective_transport = host_config.transport.kind
     runtime = Runtime(
         workspace,
-        enable_view_image=args.enable_view_image,
-        permission_mode=runtime_policy.permission_mode,
-        shell_env_policy=runtime_policy.shell_env_policy,
-        allow_network=runtime_policy.allow_network,
+        enable_view_image=enable_view_image,
+        permission_mode=effective_policy.permission_mode,
+        shell_env_policy=effective_policy.shell_env_policy,
+        allow_network=effective_policy.allow_network,
         auth_token=auth_token,
         oauth_config=oauth_config,
         project_context=project_context,
-        fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
-        transport=transport,
+        fake_readonly_annotations=effective_policy.fake_readonly_annotations,
+        transport=effective_transport,
         command_manager=command_manager,
-        extension_config=config,
+        extension_config=snapshot.runtime_config,
         extension_registry=registry,
         config_snapshot=snapshot,
     )
@@ -6415,7 +6491,145 @@ def build_runtime(
 AUTH_MODE_CHOICES = ("bearer", "noauth", "oauth")
 
 
-def run_http(args: argparse.Namespace) -> int:
+def _host_http_auth(config: HostConfig) -> tuple[str | None, OAuthConfig | None]:
+    security = config.security
+    auth_token: str | None = None
+    if security.auth_token_ref is not None:
+        auth_token = resolve_secret_ref(security.auth_token_ref, environ=os.environ)
+
+    if security.auth_mode == "noauth":
+        return None, None
+    if security.auth_mode == "bearer":
+        if auth_token is None:
+            raise ConfigError("host.security.auth_token_ref is required for bearer auth")
+        return auth_token, None
+
+    password = (
+        resolve_secret_ref(security.oauth_password_ref, environ=os.environ)
+        if security.oauth_password_ref is not None
+        else secrets.token_urlsafe(32)
+    )
+    raw_token_secret = (
+        resolve_secret_ref(security.oauth_token_secret_ref, environ=os.environ)
+        if security.oauth_token_secret_ref is not None
+        else None
+    )
+    if raw_token_secret is None:
+        token_secret = secrets.token_bytes(32)
+    else:
+        try:
+            token_secret = bytes.fromhex(raw_token_secret)
+        except ValueError as exc:
+            raise ConfigError(
+                "host.security.oauth_token_secret_ref must resolve to hex-encoded bytes"
+            ) from exc
+        if len(token_secret) < 32:
+            raise ConfigError(
+                "host.security.oauth_token_secret_ref must resolve to at least 32 bytes"
+            )
+    oauth_config = OAuthConfig(
+        password=password,
+        server_url=(security.oauth_server_url or "").rstrip("/") or None,
+        token_secret=token_secret,
+        token_ttl=security.oauth_token_ttl_seconds or OAUTH_TOKEN_TTL_SECONDS,
+    )
+    if security.oauth_client_id:
+        client_secret = (
+            resolve_secret_ref(security.oauth_client_secret_ref, environ=os.environ)
+            if security.oauth_client_secret_ref is not None
+            else None
+        )
+        redirect_uris = security.oauth_redirect_uris or ("http://127.0.0.1/callback",)
+        try:
+            oauth_config.registry.add_preregistered(
+                security.oauth_client_id,
+                redirect_uris,
+                client_secret=client_secret,
+            )
+        except ValueError as exc:
+            raise ConfigError(f"invalid HostConfig OAuth redirect URI configuration: {exc}") from exc
+    return auth_token, oauth_config
+
+
+def _serve_http_runtime(
+    *,
+    bind_host: str,
+    bind_port: int,
+    runtime: Runtime,
+    oauth_config: OAuthConfig | None,
+) -> int:
+    server = RuntimeHTTPServer((bind_host, bind_port), MCPHandler, runtime)
+    if oauth_config:
+        url_label = oauth_config.server_url or "dynamic request URL"
+        suffix = " + bearer" if runtime.auth_token else ""
+        auth_label = f"oauth2{suffix} enabled (server_url={url_label})"
+    elif runtime.auth_token:
+        auth_label = "bearer auth enabled"
+    else:
+        auth_label = "no auth configured"
+    base_url = _http_base_for_bind_host(bind_host, bind_port)
+    print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        server.server_close()
+    return 0
+
+
+def run_http(
+    args: argparse.Namespace,
+    *,
+    config_snapshot: ConfigSnapshot | None = None,
+    extension_registry: ExtensionRegistry | None = None,
+) -> int:
+    registry = extension_registry or builtin_extension_registry()
+    snapshot = config_snapshot
+    if snapshot is None and getattr(args, "host_config", None) is not None:
+        developer_workspace = Path(
+            args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd()
+        )
+        try:
+            snapshot = resolve_config_snapshot(
+                args,
+                registry=registry,
+                resolved_workspace=developer_workspace,
+            )
+        except (ConfigError, ExtensionRegistryError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
+    host_config = snapshot.host_config if snapshot is not None else None
+    if host_config is not None:
+        if host_config.transport.kind != "http":
+            print("ERROR: HostConfig transport.kind is not http.", file=sys.stderr)
+            return 2
+        try:
+            auth_token, oauth_config = _host_http_auth(host_config)
+        except ConfigError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        try:
+            runtime = build_runtime(
+                args,
+                runtime_policy_from_host_config(host_config),
+                auth_token=auth_token,
+                oauth_config=oauth_config,
+                transport="http",
+                config_snapshot=snapshot,
+                extension_registry=registry,
+            )
+        except (ConfigError, ExtensionRegistryError, ContributionError, ServiceRegistryError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        return _serve_http_runtime(
+            bind_host=host_config.transport.host,
+            bind_port=host_config.transport.port,
+            runtime=runtime,
+            oauth_config=oauth_config,
+        )
+
     auth_mode = (os.environ.get(f"{ENV_PREFIX}_AUTH_MODE") or "").strip().lower()
     if auth_mode and auth_mode not in AUTH_MODE_CHOICES:
         supported = ", ".join(AUTH_MODE_CHOICES)
@@ -6529,38 +6743,60 @@ def run_http(args: argparse.Namespace) -> int:
             auth_token=auth_token,
             oauth_config=oauth_config,
             transport="http",
+            extension_registry=registry,
         )
     except (ConfigError, ExtensionRegistryError, ContributionError, ServiceRegistryError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
-    if oauth_config:
-        url_label = oauth_config.server_url or "dynamic request URL"
-        suffix = " + bearer" if runtime.auth_token else ""
-        auth_label = f"oauth2{suffix} enabled (server_url={url_label})"
-    elif runtime.auth_token:
-        auth_label = "bearer auth enabled"
+    return _serve_http_runtime(
+        bind_host=str(args.host),
+        bind_port=args.port,
+        runtime=runtime,
+        oauth_config=oauth_config,
+    )
+
+
+def run_stdio(
+    args: argparse.Namespace,
+    *,
+    config_snapshot: ConfigSnapshot | None = None,
+    extension_registry: ExtensionRegistry | None = None,
+) -> int:
+    registry = extension_registry or builtin_extension_registry()
+    snapshot = config_snapshot
+    if snapshot is None and getattr(args, "host_config", None) is not None:
+        developer_workspace = Path(
+            args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd()
+        )
+        try:
+            snapshot = resolve_config_snapshot(
+                args,
+                registry=registry,
+                resolved_workspace=developer_workspace,
+            )
+        except (ConfigError, ExtensionRegistryError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
+    host_config = snapshot.host_config if snapshot is not None else None
+    if host_config is not None:
+        if host_config.transport.kind != "stdio":
+            print("ERROR: HostConfig transport.kind is not stdio.", file=sys.stderr)
+            return 2
+        runtime_policy = runtime_policy_from_host_config(host_config)
     else:
-        auth_label = "no auth configured"
-    base_url = _http_base_for_bind_host(str(args.host), args.port)
-    print(f"{SERVER_NAME} listening on {base_url}/mcp ({auth_label})", file=sys.stderr)
+        try:
+            runtime_policy = runtime_policy_from_args(args)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        return 130
-    finally:
-        server.server_close()
-    return 0
-
-
-def run_stdio(args: argparse.Namespace) -> int:
-    try:
-        runtime_policy = runtime_policy_from_args(args)
-    except ValueError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
-    try:
-        runtime = build_runtime(args, runtime_policy)
+        runtime = build_runtime(
+            args,
+            runtime_policy,
+            config_snapshot=snapshot,
+            extension_registry=registry,
+        )
     except (ConfigError, ExtensionRegistryError, ContributionError, ServiceRegistryError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -6575,6 +6811,11 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"%(prog)s {__version__}",
     )
     parser.add_argument("--workspace", help="workspace root; defaults to CODING_TOOLS_MCP_WORKSPACE or cwd")
+    parser.add_argument(
+        "--host-config",
+        default=None,
+        help="strict HostConfig v2 TOML for machine/deployment-owned runtime configuration",
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -6696,6 +6937,38 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     install_sigterm_handler()
+    if args.host_config is not None:
+        registry = builtin_extension_registry()
+        developer_workspace = Path(
+            args.workspace or os.environ.get(f"{ENV_PREFIX}_WORKSPACE") or os.getcwd()
+        )
+        try:
+            snapshot = resolve_config_snapshot(
+                args,
+                registry=registry,
+                resolved_workspace=developer_workspace,
+            )
+        except (ConfigError, ExtensionRegistryError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        host_config = snapshot.host_config
+        if host_config is None:
+            print("ERROR: HostConfig snapshot did not contain HostConfig.", file=sys.stderr)
+            return 2
+        if args.stdio and host_config.transport.kind != "stdio":
+            print("ERROR: --stdio conflicts with HostConfig transport.kind=http.", file=sys.stderr)
+            return 2
+        if host_config.transport.kind == "stdio":
+            return run_stdio(
+                args,
+                config_snapshot=snapshot,
+                extension_registry=registry,
+            )
+        return run_http(
+            args,
+            config_snapshot=snapshot,
+            extension_registry=registry,
+        )
     return run_stdio(args) if args.stdio else run_http(args)
 
 

@@ -103,6 +103,13 @@ class HostSecurityConfig:
     allow_network: bool
     auth_mode: str
     auth_token_ref: SecretRef | None = None
+    oauth_client_id: str | None = None
+    oauth_client_secret_ref: SecretRef | None = None
+    oauth_password_ref: SecretRef | None = None
+    oauth_token_secret_ref: SecretRef | None = None
+    oauth_server_url: str | None = None
+    oauth_redirect_uris: tuple[str, ...] = ()
+    oauth_token_ttl_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -213,6 +220,13 @@ def host_config_schema(extension_schemas: Mapping[str, ConfigNode]) -> ConfigNod
                     "allow_network": scalar(bool),
                     "auth_mode": scalar(str),
                     "auth_token_ref": scalar(str),
+                    "oauth_client_id": scalar(str),
+                    "oauth_client_secret_ref": scalar(str),
+                    "oauth_password_ref": scalar(str),
+                    "oauth_token_secret_ref": scalar(str),
+                    "oauth_server_url": scalar(str),
+                    "oauth_redirect_uris": list_of(scalar(str)),
+                    "oauth_token_ttl_seconds": scalar(int),
                 }
             ),
             "extensions": table(
@@ -399,12 +413,48 @@ def load_host_config(
     auth_token_ref = (
         parse_secret_ref(cast(str, raw_auth_token_ref)) if raw_auth_token_ref is not None else None
     )
+    if auth_mode == "bearer" and auth_token_ref is None:
+        raise ConfigError("host.security.auth_token_ref is required for bearer auth")
+
+    def optional_secret_ref(name: str) -> SecretRef | None:
+        raw = security_map.get(name)
+        return parse_secret_ref(cast(str, raw)) if raw is not None else None
+
+    oauth_client_id = security_map.get("oauth_client_id")
+    if oauth_client_id is not None and (
+        not isinstance(oauth_client_id, str) or not oauth_client_id.strip()
+    ):
+        raise ConfigError("host.security.oauth_client_id must be a non-empty string")
+    oauth_server_url = security_map.get("oauth_server_url")
+    if oauth_server_url is not None and (
+        not isinstance(oauth_server_url, str) or not oauth_server_url.strip()
+    ):
+        raise ConfigError("host.security.oauth_server_url must be a non-empty string")
+    raw_redirect_uris = security_map.get("oauth_redirect_uris", [])
+    oauth_redirect_uris = tuple(cast(Sequence[str], raw_redirect_uris))
+    if any(not item.strip() for item in oauth_redirect_uris):
+        raise ConfigError("host.security.oauth_redirect_uris cannot contain empty values")
+    raw_oauth_ttl = security_map.get("oauth_token_ttl_seconds")
+    oauth_token_ttl_seconds: int | None = None
+    if raw_oauth_ttl is not None:
+        if type(raw_oauth_ttl) is not int or not 60 <= cast(int, raw_oauth_ttl) <= 604_800:
+            raise ConfigError(
+                "host.security.oauth_token_ttl_seconds must be between 60 and 604800 seconds"
+            )
+        oauth_token_ttl_seconds = cast(int, raw_oauth_ttl)
     security = HostSecurityConfig(
         permission_mode=permission_mode,
         shell_env_inherit=shell_env_inherit,
         allow_network=allow_network,
         auth_mode=auth_mode,
         auth_token_ref=auth_token_ref,
+        oauth_client_id=cast(str | None, oauth_client_id),
+        oauth_client_secret_ref=optional_secret_ref("oauth_client_secret_ref"),
+        oauth_password_ref=optional_secret_ref("oauth_password_ref"),
+        oauth_token_secret_ref=optional_secret_ref("oauth_token_secret_ref"),
+        oauth_server_url=cast(str | None, oauth_server_url),
+        oauth_redirect_uris=oauth_redirect_uris,
+        oauth_token_ttl_seconds=oauth_token_ttl_seconds,
     )
 
     if transport.kind == "http" and security.auth_mode == "noauth" and not _loopback_host(host):
@@ -650,6 +700,13 @@ def _host_fingerprint_payload(config: HostConfig) -> dict[str, object]:
             "allow_network": config.security.allow_network,
             "auth_mode": config.security.auth_mode,
             "auth_token_ref": _jsonable(config.security.auth_token_ref),
+            "oauth_client_id": config.security.oauth_client_id,
+            "oauth_client_secret_ref": _jsonable(config.security.oauth_client_secret_ref),
+            "oauth_password_ref": _jsonable(config.security.oauth_password_ref),
+            "oauth_token_secret_ref": _jsonable(config.security.oauth_token_secret_ref),
+            "oauth_server_url": config.security.oauth_server_url,
+            "oauth_redirect_uris": list(config.security.oauth_redirect_uris),
+            "oauth_token_ttl_seconds": config.security.oauth_token_ttl_seconds,
         },
         "extensions": {
             "enabled": list(config.extensions.enabled_extensions),
@@ -703,10 +760,14 @@ def build_host_snapshot(config: HostConfig) -> ConfigSnapshot:
         )
 
     secret_references: dict[str, str] = {}
-    if config.security.auth_token_ref is not None:
-        secret_references["security.auth_token_ref"] = _secret_ref_identity(
-            config.security.auth_token_ref
-        )
+    for name, ref in (
+        ("security.auth_token_ref", config.security.auth_token_ref),
+        ("security.oauth_client_secret_ref", config.security.oauth_client_secret_ref),
+        ("security.oauth_password_ref", config.security.oauth_password_ref),
+        ("security.oauth_token_secret_ref", config.security.oauth_token_secret_ref),
+    ):
+        if ref is not None:
+            secret_references[name] = _secret_ref_identity(ref)
 
     config_versions = MappingProxyType(
         {
