@@ -9,13 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO, cast
 
-from serena.config.serena_config import (  # type: ignore[import-not-found]
+from serena.config.serena_config import (  # type: ignore[import-not-found,import-untyped]
     LanguageBackend,
     ProjectConfig,
     RegisteredProject as SerenaRegisteredProject,
     SerenaConfig,
 )
-from serena.symbol import (  # type: ignore[import-not-found]
+from serena.symbol import (  # type: ignore[import-not-found,import-untyped]
     LanguageServerSymbol,
     LanguageServerSymbolRetriever,
     ReferenceInLanguageServerSymbol,
