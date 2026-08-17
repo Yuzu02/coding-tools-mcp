@@ -25,6 +25,7 @@ from .processes import (
     terminate_process_tree,
     wait_for_tcp,
 )
+from .preflight import run_preflight
 from .tunnel import (
     TunnelError,
     TunnelRuntime,
@@ -212,6 +213,11 @@ def run_services(
     """Run the configured services and return a deterministic launcher exit code."""
 
     deps = dependencies or LauncherDependencies()
+    if config.preflight:
+        report = run_preflight(config, port_probe=deps.port_in_use)
+        deps.emit(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0 if report.ok else 2
+
     artifacts = allocate_run_artifacts(config.logs_root)
     manifest = RunManifest.start(
         artifacts,

@@ -188,6 +188,15 @@ class LauncherIntegrationTests(unittest.TestCase):
             self.assertEqual(fake.commands, [])
             self.assertEqual(fake.started, [])
 
+    def test_preflight_exits_without_sync_validation_or_process_start(self) -> None:
+        fake = FakeDependencies()
+        with configured(["--preflight", "--no-tunnel", "--no-sync"]) as config:
+            code = run_services(config, fake.dependencies())
+
+            self.assertEqual(code, 0)
+            self.assertEqual(fake.commands, [])
+            self.assertEqual(fake.started, [])
+
     def test_sync_only_runs_uv_sync_and_exits(self) -> None:
         fake = FakeDependencies()
         with configured(["--sync-only", "--no-tunnel"]) as config:

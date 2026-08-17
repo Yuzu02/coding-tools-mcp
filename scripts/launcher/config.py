@@ -101,6 +101,7 @@ class ServiceConfig:
     sync_extras: tuple[str, ...]
     sync_only: bool
     doctor_only: bool
+    preflight: bool
     dry_run: bool
     startup_timeout: float
     shutdown_timeout: float
@@ -324,6 +325,7 @@ def _resolve_host_mode_config(
     parser.add_argument("--host-config", required=False)
     parser.add_argument("--sync-only", action="store_true")
     parser.add_argument("--doctor-only", action="store_true")
+    parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--uv", default=environment.get(_env_name("UV"), "uv"))
     parser.add_argument(
@@ -398,6 +400,7 @@ def _resolve_host_mode_config(
         sync_extras=host_config.deployment.sync_extras,
         sync_only=args.sync_only,
         doctor_only=args.doctor_only,
+        preflight=args.preflight,
         dry_run=args.dry_run,
         startup_timeout=host_config.deployment.startup_timeout_seconds,
         shutdown_timeout=host_config.deployment.shutdown_timeout_seconds,
@@ -606,6 +609,11 @@ def build_parser(
         "--doctor-only",
         action="store_true",
         default=_env_bool(env, "DOCTOR_ONLY", False),
+    )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        default=_env_bool(env, "PREFLIGHT", False),
     )
     parser.add_argument("--env-file", default=env.get(_env_name("ENV_FILE")))
     parser.add_argument(
@@ -864,6 +872,7 @@ def resolve_config(
         sync_extras=tuple(args.sync_extra),
         sync_only=args.sync_only,
         doctor_only=args.doctor_only,
+        preflight=args.preflight,
         dry_run=args.dry_run,
         startup_timeout=args.startup_timeout,
         shutdown_timeout=args.shutdown_timeout,
