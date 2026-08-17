@@ -108,6 +108,16 @@ class RequiredDocsTests(unittest.TestCase):
             with self.subTest(workflow="compliance", needle=needle):
                 self.assertIn(needle, compliance)
 
+        for needle in (
+            "semantic-integration:",
+            'python -m pip install -e ".[semantic]"',
+            "tests.extensions.test_semantic_serena_integration",
+            "tests.extensions.test_semantic_mcp_integration",
+        ):
+            with self.subTest(workflow="semantic-integration", needle=needle):
+                self.assertIn(needle, compliance)
+        self.assertNotIn('python -m pip install -e ".[dev,semantic]"', compliance)
+
         swebench = (ROOT / ".github/workflows/swebench-lite.yml").read_text(encoding="utf-8")
         for needle in ("workflow_dispatch", "--install-swebench", "--run-evaluation", "reports/benchmark/**"):
             with self.subTest(workflow="swebench-lite", needle=needle):
