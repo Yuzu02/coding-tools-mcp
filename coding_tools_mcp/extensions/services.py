@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, Protocol, TypeVar, cast
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 
 T = TypeVar("T")
@@ -56,4 +57,48 @@ class WorkspaceAccess(Protocol):
         raise NotImplementedError
 
 
+WorkspaceToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
+CommandLifecycleCallback = Callable[[str], None]
+
+
+class WorkspaceRuntimeHandle(Protocol):
+    @property
+    def root(self) -> Path:
+        raise NotImplementedError
+
+
+class WorkspaceRuntimeService(Protocol):
+    def validate_root(self, root: Path, *, require_exists: bool = True) -> Path:
+        raise NotImplementedError
+
+    def create(
+        self,
+        root: Path,
+        *,
+        excluded_roots: tuple[Path, ...] = (),
+        on_command_registered: CommandLifecycleCallback | None = None,
+        on_command_removed: CommandLifecycleCallback | None = None,
+    ) -> WorkspaceRuntimeHandle:
+        raise NotImplementedError
+
+    def invoke(
+        self,
+        handle: WorkspaceRuntimeHandle,
+        handler: WorkspaceToolHandler,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def resolve_existing(
+        self,
+        handle: WorkspaceRuntimeHandle,
+        raw_path: str = ".",
+    ) -> ResolvedPathLike:
+        raise NotImplementedError
+
+    def close(self, handle: WorkspaceRuntimeHandle) -> None:
+        raise NotImplementedError
+
+
 CORE_WORKSPACE = CapabilityKey[WorkspaceAccess]("core.workspace")
+CORE_WORKSPACE_RUNTIMES = CapabilityKey[WorkspaceRuntimeService]("core.workspace_runtimes")

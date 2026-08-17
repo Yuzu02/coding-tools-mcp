@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
 from .extensions import (
     CORE_WORKSPACE,
+    CORE_WORKSPACE_RUNTIMES,
     ComposedTool,
     ConfigError,
     ContributionError,
@@ -46,6 +48,7 @@ from .extensions import (
     RuntimeConfig,
     ServiceRegistryError,
     ToolAnnotations,
+    WorkspaceRuntimeHandle,
     builtin_extension_registry,
     load_runtime_config,
     parse_extension_list,
@@ -1197,18 +1200,28 @@ class ResolvedPath:
     existed: bool
 
 
+def resolve_workspace_root(root: Path, *, require_exists: bool = True) -> Path:
+    candidate = root.expanduser()
+    try:
+        resolved = candidate.resolve(strict=require_exists)
+    except FileNotFoundError as exc:
+        raise ToolFailure("INVALID_ARGUMENT", "Workspace root must be a directory.", category="validation") from exc
+    if resolved.exists() and not resolved.is_dir():
+        raise ToolFailure("INVALID_ARGUMENT", "Workspace root must be a directory.", category="validation")
+    unsafe_roots = {"/"}
+    try:
+        unsafe_roots.add(str(Path.home().resolve()))
+    except RuntimeError:
+        pass
+    if str(resolved) in unsafe_roots:
+        raise ToolFailure("INVALID_ARGUMENT", "Unsafe workspace root rejected.", category="security")
+    return resolved
+
+
 class Workspace:
-    def __init__(self, root: Path) -> None:
-        self.root = root.expanduser().resolve(strict=True)
-        if not self.root.is_dir():
-            raise ToolFailure("INVALID_ARGUMENT", "Workspace root must be a directory.", category="validation")
-        unsafe_roots = {"/"}
-        try:
-            unsafe_roots.add(str(Path.home().resolve()))
-        except RuntimeError:
-            pass
-        if str(self.root) in unsafe_roots:
-            raise ToolFailure("INVALID_ARGUMENT", "Unsafe workspace root rejected.", category="security")
+    def __init__(self, root: Path, *, excluded_roots: tuple[Path, ...] = ()) -> None:
+        self.root = resolve_workspace_root(root)
+        self.excluded_roots = tuple(path.expanduser().resolve(strict=True) for path in excluded_roots)
         self.git_path = shutil.which("git")
 
     def _reject_unsafe_text(self, raw_path: str) -> PurePosixPath:
@@ -1350,8 +1363,16 @@ class ClientRequestBinding:
 class WorkspaceCommandManager:
     """Own commands for one workspace independently of MCP transport sessions."""
 
-    def __init__(self, workspace: Path) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        on_command_registered: Callable[[str], None] | None = None,
+        on_command_removed: Callable[[str], None] | None = None,
+    ) -> None:
         self.workspace = workspace.expanduser().resolve(strict=True)
+        self.on_command_registered = on_command_registered
+        self.on_command_removed = on_command_removed
         self.server_instance_id = secrets.token_urlsafe(12)
         self.runtime_dir = runtime_dir_for_workspace(self.workspace, self.server_instance_id)
         self.fallback_runtime_dir = fallback_runtime_dir_for_workspace(
@@ -1456,6 +1477,113 @@ class WorkspaceCommandManager:
             self.client_requests.pop(client_request_id, None)
 
 
+@dataclass
+class WorkspaceRuntimeState:
+    workspace: Workspace
+    command_manager: WorkspaceCommandManager
+    owns_command_manager: bool
+    runtime_dir: Path
+    fallback_runtime_dir: Path | None
+    home_dir: Path
+    tmp_dir: Path
+    cache_dir: Path
+    runtime_dir_lock: threading.Lock = field(default_factory=threading.Lock)
+    runtime_dir_resolved: bool = False
+    patch_baselines: dict[str, str | None] = field(default_factory=dict)
+    patch_lock: threading.Lock = field(default_factory=threading.Lock)
+    patch_committer: AtomicPatchCommitter = field(default_factory=AtomicPatchCommitter)
+    close_lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
+
+    @property
+    def root(self) -> Path:
+        return self.workspace.root
+
+    def set_runtime_dir(self, runtime_dir: Path) -> None:
+        self.runtime_dir = runtime_dir
+        self.home_dir = runtime_dir / "home"
+        self.tmp_dir = runtime_dir / "tmp"
+        self.cache_dir = runtime_dir / "cache"
+
+
+class CoreWorkspaceRuntimeService:
+    """Create and bind reusable mother-core workspace execution states."""
+
+    def __init__(self, runtime: "Runtime") -> None:
+        self._runtime = runtime
+        self._handles: dict[int, WorkspaceRuntimeState] = {}
+        self._closed_handle_ids: set[int] = set()
+        self._lock = threading.RLock()
+
+    def validate_root(self, root: Path, *, require_exists: bool = True) -> Path:
+        return resolve_workspace_root(root, require_exists=require_exists)
+
+    def _require_handle(self, handle: WorkspaceRuntimeHandle) -> WorkspaceRuntimeState:
+        with self._lock:
+            state = self._handles.get(id(handle))
+        if state is None or state is not handle:
+            raise ValueError("workspace runtime handle belongs to another runtime")
+        return state
+
+    def create(
+        self,
+        root: Path,
+        *,
+        excluded_roots: tuple[Path, ...] = (),
+        on_command_registered: Callable[[str], None] | None = None,
+        on_command_removed: Callable[[str], None] | None = None,
+    ) -> WorkspaceRuntimeState:
+        workspace = Workspace(root, excluded_roots=excluded_roots)
+        manager = WorkspaceCommandManager(
+            workspace.root,
+            on_command_registered=on_command_registered,
+            on_command_removed=on_command_removed,
+        )
+        state = self._runtime._new_workspace_runtime_state(
+            workspace,
+            manager,
+            owns_command_manager=True,
+        )
+        with self._lock:
+            self._handles[id(state)] = state
+        return state
+
+    def invoke(
+        self,
+        handle: WorkspaceRuntimeHandle,
+        handler: Callable[[dict[str, Any]], dict[str, Any]],
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = self._require_handle(handle)
+        token = self._runtime._workspace_state_var.set(state)
+        try:
+            return handler(arguments)
+        finally:
+            self._runtime._workspace_state_var.reset(token)
+
+    def resolve_existing(self, handle: WorkspaceRuntimeHandle, raw_path: str = ".") -> ResolvedPath:
+        return self._require_handle(handle).workspace.resolve_existing(raw_path)
+
+    def close(self, handle: WorkspaceRuntimeHandle) -> None:
+        handle_id = id(handle)
+        with self._lock:
+            state = self._handles.pop(handle_id, None)
+            if state is None:
+                if handle_id in self._closed_handle_ids:
+                    return
+                raise ValueError("workspace runtime handle belongs to another runtime")
+            self._closed_handle_ids.add(handle_id)
+        self._runtime._close_workspace_runtime_state(state)
+
+    def close_all(self) -> None:
+        with self._lock:
+            states = tuple(self._handles.values())
+            self._handles.clear()
+            self._closed_handle_ids.update(id(state) for state in states)
+        for state in states:
+            self._runtime._close_workspace_runtime_state(state)
+
+
 class Runtime:
     def __init__(
         self,
@@ -1474,7 +1602,7 @@ class Runtime:
         extension_config: RuntimeConfig | None = None,
         extension_registry: ExtensionRegistry | None = None,
     ) -> None:
-        self.workspace = Workspace(workspace)
+        bootstrap_workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
@@ -1508,59 +1636,144 @@ class Runtime:
         self.allow_network = allow_network or self.capabilities.network
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
-        self.command_manager = command_manager or WorkspaceCommandManager(self.workspace.root)
-        if self.command_manager.workspace != self.workspace.root:
+        bootstrap_manager = command_manager or WorkspaceCommandManager(bootstrap_workspace.root)
+        if bootstrap_manager.workspace != bootstrap_workspace.root:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
                 "command_manager belongs to a different workspace.",
                 category="validation",
             )
-        self._owns_command_manager = command_manager is None
-        self.server_instance_id = self.command_manager.server_instance_id
-        self._set_runtime_dir(self.command_manager.runtime_dir)
-        self.fallback_runtime_dir = self.command_manager.fallback_runtime_dir
-        self._runtime_dir_lock = threading.Lock()
-        self._runtime_dir_resolved = False
+        self._workspace_state_var: ContextVar[WorkspaceRuntimeState | None] = ContextVar(
+            f"coding_tools_workspace_state_{id(self)}",
+            default=None,
+        )
+        self._default_workspace_state = self._new_workspace_runtime_state(
+            bootstrap_workspace,
+            bootstrap_manager,
+            owns_command_manager=command_manager is None,
+        )
         self._closed = False
-        self.patch_baselines: dict[str, str | None] = {}
-        self.patch_lock = threading.Lock()
-        self.patch_committer = AtomicPatchCommitter()
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
         # the discovery (git ls-files / directory walk) result.
         self.project_context: ProjectContext = (
-            project_context if project_context is not None else load_project_context(self.workspace.root)
+            project_context if project_context is not None else load_project_context(bootstrap_workspace.root)
         )
         self.telemetry = SessionTelemetry(permission_mode=self.permission_mode, transport=transport)
         self.extension_registry = extension_registry or builtin_extension_registry()
         self.extension_config = extension_config or RuntimeConfig.defaults(
             enabled=self.extension_registry.default_enabled
         )
-        self.extension_host = ExtensionHost.build(
-            registry=self.extension_registry,
-            config=self.extension_config,
-            core_tools=core_tool_contracts(self),
-            seed_services=((CORE_WORKSPACE, self.workspace),),
-        )
+        self.workspace_runtime_service = CoreWorkspaceRuntimeService(self)
+        try:
+            self.extension_host = ExtensionHost.build(
+                registry=self.extension_registry,
+                config=self.extension_config,
+                core_tools=core_tool_contracts(self),
+                seed_services=(
+                    (CORE_WORKSPACE, bootstrap_workspace),
+                    (CORE_WORKSPACE_RUNTIMES, self.workspace_runtime_service),
+                ),
+            )
+        except Exception:
+            self.workspace_runtime_service.close_all()
+            self._close_workspace_runtime_state(self._default_workspace_state)
+            raise
         self._tools = self.extension_host.tools
         self._exposed_tool_names = tuple(self._tools)
         self._exposed_tool_name_set = frozenset(self._tools)
 
+    def _new_workspace_runtime_state(
+        self,
+        workspace: Workspace,
+        command_manager: WorkspaceCommandManager,
+        *,
+        owns_command_manager: bool,
+    ) -> WorkspaceRuntimeState:
+        runtime_dir = command_manager.runtime_dir
+        return WorkspaceRuntimeState(
+            workspace=workspace,
+            command_manager=command_manager,
+            owns_command_manager=owns_command_manager,
+            runtime_dir=runtime_dir,
+            fallback_runtime_dir=command_manager.fallback_runtime_dir,
+            home_dir=runtime_dir / "home",
+            tmp_dir=runtime_dir / "tmp",
+            cache_dir=runtime_dir / "cache",
+        )
+
+    def _workspace_state(self) -> WorkspaceRuntimeState:
+        return self._workspace_state_var.get() or self._default_workspace_state
+
+    def _close_workspace_runtime_state(self, state: WorkspaceRuntimeState) -> None:
+        with state.close_lock:
+            if state.closed:
+                return
+            state.closed = True
+        if state.owns_command_manager:
+            state.command_manager.close()
+
+    @property
+    def workspace(self) -> Workspace:
+        return self._workspace_state().workspace
+
+    @property
+    def command_manager(self) -> WorkspaceCommandManager:
+        return self._workspace_state().command_manager
+
+    @property
+    def server_instance_id(self) -> str:
+        return self.command_manager.server_instance_id
+
+    @property
+    def runtime_dir(self) -> Path:
+        return self._workspace_state().runtime_dir
+
+    @property
+    def fallback_runtime_dir(self) -> Path | None:
+        return self._workspace_state().fallback_runtime_dir
+
+    @fallback_runtime_dir.setter
+    def fallback_runtime_dir(self, value: Path | None) -> None:
+        self._workspace_state().fallback_runtime_dir = value
+
+    @property
+    def home_dir(self) -> Path:
+        return self._workspace_state().home_dir
+
+    @property
+    def tmp_dir(self) -> Path:
+        return self._workspace_state().tmp_dir
+
+    @property
+    def cache_dir(self) -> Path:
+        return self._workspace_state().cache_dir
+
+    @property
+    def patch_baselines(self) -> dict[str, str | None]:
+        return self._workspace_state().patch_baselines
+
+    @property
+    def patch_lock(self) -> threading.Lock:
+        return self._workspace_state().patch_lock
+
+    @property
+    def patch_committer(self) -> AtomicPatchCommitter:
+        return self._workspace_state().patch_committer
+
     def _set_runtime_dir(self, runtime_dir: Path) -> None:
-        self.runtime_dir = runtime_dir
-        self.home_dir = self.runtime_dir / "home"
-        self.tmp_dir = self.runtime_dir / "tmp"
-        self.cache_dir = self.runtime_dir / "cache"
+        self._workspace_state().set_runtime_dir(runtime_dir)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        retention_stats = self._default_workspace_state.command_manager.retention_stats_snapshot()
         for warning in self.extension_host.stop():
             print(f"WARNING: extension shutdown: {warning}", file=sys.stderr)
-        if self._owns_command_manager:
-            self.command_manager.close()
-        self.telemetry.finish(output_retention=self.command_manager.retention_stats_snapshot())
+        self.workspace_runtime_service.close_all()
+        self._close_workspace_runtime_state(self._default_workspace_state)
+        self.telemetry.finish(output_retention=retention_stats)
 
     @property
     def commands(self) -> dict[str, CommandRun]:
@@ -1613,18 +1826,23 @@ class Runtime:
         directory mid-flight.
         """
 
-        with self._runtime_dir_lock:
-            resolved = self._runtime_dir_resolved
-            candidates = [self.runtime_dir]
-            if not resolved and self.fallback_runtime_dir is not None and self.fallback_runtime_dir not in candidates:
-                candidates.append(self.fallback_runtime_dir)
+        state = self._workspace_state()
+        with state.runtime_dir_lock:
+            resolved = state.runtime_dir_resolved
+            candidates = [state.runtime_dir]
+            if (
+                not resolved
+                and state.fallback_runtime_dir is not None
+                and state.fallback_runtime_dir not in candidates
+            ):
+                candidates.append(state.fallback_runtime_dir)
             errors: list[str] = []
             for runtime_dir in candidates:
                 error = self._create_runtime_dirs(runtime_dir)
                 if error is None:
                     if not resolved:
-                        self._set_runtime_dir(runtime_dir)
-                        self._runtime_dir_resolved = True
+                        state.set_runtime_dir(runtime_dir)
+                        state.runtime_dir_resolved = True
                     return
                 errors.append(error)
             raise ToolFailure(

@@ -26,7 +26,16 @@ from .contributions import (
 )
 from .host import ExtensionHost
 from .registry import ExtensionRegistry, ExtensionRegistryError
-from .services import CORE_WORKSPACE, CapabilityKey, ServiceRegistry, ServiceRegistryError, WorkspaceAccess
+from .services import (
+    CORE_WORKSPACE,
+    CORE_WORKSPACE_RUNTIMES,
+    CapabilityKey,
+    ServiceRegistry,
+    ServiceRegistryError,
+    WorkspaceAccess,
+    WorkspaceRuntimeHandle,
+    WorkspaceRuntimeService,
+)
 
 
 def builtin_extension_registry() -> ExtensionRegistry:
@@ -41,6 +50,7 @@ __all__ = [
     "ConfigError",
     "ConfigNode",
     "CORE_WORKSPACE",
+    "CORE_WORKSPACE_RUNTIMES",
     "CapabilityKey",
     "ComposedTool",
     "ContributionError",
@@ -57,6 +67,8 @@ __all__ = [
     "ServiceRegistry",
     "ServiceRegistryError",
     "WorkspaceAccess",
+    "WorkspaceRuntimeHandle",
+    "WorkspaceRuntimeService",
     "ToolAnnotations",
     "ToolContribution",
     "ToolDecorator",
