@@ -49,6 +49,9 @@ from .protocol import (
 SERENA_DISTRIBUTION = "serena-agent"
 SUPPORTED_SERENA_VERSION = "1.5.3"
 STDERR_DIAGNOSTIC_BYTES = 16 * 1024
+WORKER_GRACEFUL_CLOSE_SECONDS = 4.0
+WORKER_TERMINATE_SECONDS = 2.0
+WORKER_KILL_SECONDS = 1.0
 
 _WORKER_ENV_ALLOWLIST = (
     "PATH",
@@ -420,13 +423,18 @@ class _SerenaWorker:
                     pass
             if self._process.poll() is None:
                 try:
-                    self._process.terminate()
-                    self._process.wait(timeout=1.0)
+                    self._process.wait(timeout=WORKER_GRACEFUL_CLOSE_SECONDS)
                 except subprocess.TimeoutExpired:
-                    self._process.kill()
                     try:
-                        self._process.wait(timeout=1.0)
+                        self._process.terminate()
+                        self._process.wait(timeout=WORKER_TERMINATE_SECONDS)
                     except subprocess.TimeoutExpired:
+                        self._process.kill()
+                        try:
+                            self._process.wait(timeout=WORKER_KILL_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    except OSError:
                         pass
                 except OSError:
                     pass

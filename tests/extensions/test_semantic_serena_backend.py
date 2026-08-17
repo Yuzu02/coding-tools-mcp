@@ -121,6 +121,9 @@ for raw in sys.stdin.buffer:
         "ok": True,
         "result": result,
     })
+
+if args.mode == "graceful_close":
+    time.sleep(0.2)
 '''
 
 
@@ -309,6 +312,13 @@ class SemanticSerenaBackendTests(unittest.TestCase):
         self.assertIsNotNone(worker._process.stderr)
         self.assertTrue(worker._process.stdout.closed)
         self.assertTrue(worker._process.stderr.closed)
+
+    def test_close_allows_worker_to_finish_after_stdin_eof_before_signaling(self) -> None:
+        worker = self.worker("graceful_close")
+
+        worker.close()
+
+        self.assertEqual(worker._process.returncode, 0)
 
     def test_worker_crash_is_backend_error_and_next_call_can_restart(self) -> None:
         modes = ["crash", "ready"]
