@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -445,6 +446,13 @@ class _SerenaWorker:
 WorkerFactory = Callable[..., _SerenaWorker]
 
 
+@dataclass
+class _WorkerRecord:
+    worker: _SerenaWorker
+    last_used: float
+    in_flight: int = 0
+
+
 def _protocol_error(message: str, *, operation: str) -> SemanticBackendError:
     return SemanticBackendError(
         SEMANTIC_BACKEND_ERROR,
@@ -557,6 +565,7 @@ class SerenaSemanticBackend:
         *,
         availability: SerenaAvailability | None = None,
         worker_factory: WorkerFactory | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         detected = availability or detect_serena()
         self.available = detected.available
@@ -565,8 +574,11 @@ class SerenaSemanticBackend:
         self.config = config
         self.registry = registry
         self.runtimes = runtimes
-        self._workers: dict[str, _SerenaWorker] = {}
+        self._workers: dict[str, _WorkerRecord] = {}
+        self._starting_projects: set[str] = set()
+        self._start_locks: dict[str, threading.Lock] = {}
         self._lock = threading.RLock()
+        self._clock = clock or time.monotonic
         if worker_factory is None:
             self._worker_factory: WorkerFactory = lambda **kwargs: _SerenaWorker(
                 **kwargs,
@@ -595,33 +607,104 @@ class SerenaSemanticBackend:
             request_timeout_seconds=self.config.semantic_request_timeout_seconds,
         )
 
-    def _worker_for(self, project: RegisteredProject) -> _SerenaWorker:
-        self._ensure_available()
+    def _start_lock_for(self, project_id: str) -> threading.Lock:
         with self._lock:
-            existing = self._workers.get(project.project_id)
-            if existing is not None and existing.alive:
-                return existing
-            if existing is not None:
-                self._workers.pop(project.project_id, None)
-        if existing is not None:
-            existing.close()
+            lock = self._start_locks.get(project_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._start_locks[project_id] = lock
+            return lock
 
-        created = self._create_worker(project)
-        with self._lock:
-            raced = self._workers.get(project.project_id)
-            if raced is not None and raced.alive:
-                created.close()
-                return raced
-            if raced is not None:
-                raced.close()
-            self._workers[project.project_id] = created
-            return created
+    @staticmethod
+    def _close_worker(worker: _SerenaWorker) -> str | None:
+        try:
+            worker.close()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask caller failures
+            return str(exc)[:512]
+        return None
 
-    def _discard_worker(self, project_id: str, worker: _SerenaWorker) -> None:
-        with self._lock:
-            if self._workers.get(project_id) is worker:
+    def _expired_idle_records_locked(self, now: float) -> list[tuple[str, _WorkerRecord]]:
+        expired: list[tuple[str, _WorkerRecord]] = []
+        timeout = self.config.semantic_idle_timeout_seconds
+        for project_id, record in tuple(self._workers.items()):
+            if record.in_flight != 0 or now - record.last_used < timeout:
+                continue
+            if self._workers.get(project_id) is record:
                 self._workers.pop(project_id, None)
-        worker.close()
+                expired.append((project_id, record))
+        return expired
+
+    def _reserve_worker_slot_locked(
+        self,
+        project_id: str,
+    ) -> tuple[_WorkerRecord | None, list[_WorkerRecord]]:
+        now = self._clock()
+        close_after_unlock = [record for _project_id, record in self._expired_idle_records_locked(now)]
+
+        existing = self._workers.get(project_id)
+        if existing is not None and existing.worker.alive:
+            return existing, close_after_unlock
+        if existing is not None:
+            if self._workers.get(project_id) is existing:
+                self._workers.pop(project_id, None)
+            close_after_unlock.append(existing)
+
+        active_slots = len(self._workers) + len(self._starting_projects)
+        if active_slots >= self.config.max_semantic_projects:
+            idle = [
+                (candidate_id, record)
+                for candidate_id, record in self._workers.items()
+                if record.in_flight == 0
+            ]
+            if not idle:
+                raise SemanticBackendError(
+                    SEMANTIC_BACKEND_UNAVAILABLE,
+                    "semantic worker capacity is busy",
+                    retryable=True,
+                )
+            evict_id, evict_record = min(
+                idle,
+                key=lambda item: (item[1].last_used, item[0]),
+            )
+            self._workers.pop(evict_id, None)
+            close_after_unlock.append(evict_record)
+
+        self._starting_projects.add(project_id)
+        return None, close_after_unlock
+
+    def _worker_record_for(self, project: RegisteredProject) -> _WorkerRecord:
+        self._ensure_available()
+        project_id = project.project_id
+        start_lock = self._start_lock_for(project_id)
+        with start_lock:
+            with self._lock:
+                existing, close_after_unlock = self._reserve_worker_slot_locked(project_id)
+            for record in close_after_unlock:
+                self._close_worker(record.worker)
+            if existing is not None:
+                return existing
+
+            try:
+                created = self._create_worker(project)
+            except Exception:
+                with self._lock:
+                    self._starting_projects.discard(project_id)
+                raise
+
+            record = _WorkerRecord(worker=created, last_used=self._clock())
+            with self._lock:
+                self._starting_projects.discard(project_id)
+                self._workers[project_id] = record
+            return record
+
+    def _discard_record(self, project_id: str, record: _WorkerRecord) -> None:
+        removed = False
+        with self._lock:
+            if self._workers.get(project_id) is record:
+                self._workers.pop(project_id, None)
+                removed = True
+        if removed:
+            self._close_worker(record.worker)
 
     def _request(
         self,
@@ -629,13 +712,26 @@ class SerenaSemanticBackend:
         operation: str,
         params: Mapping[str, object],
     ) -> dict[str, object]:
-        worker = self._worker_for(project)
+        project_id = project.project_id
+        while True:
+            record = self._worker_record_for(project)
+            with self._lock:
+                if self._workers.get(project_id) is not record:
+                    continue
+                record.in_flight += 1
+                break
+        discard = False
         try:
-            return worker.request(operation, params)
+            return record.worker.request(operation, params)
         except SemanticBackendError:
-            if not worker.alive:
-                self._discard_worker(project.project_id, worker)
+            discard = not record.worker.alive
             raise
+        finally:
+            with self._lock:
+                record.in_flight = max(0, record.in_flight - 1)
+                record.last_used = self._clock()
+            if discard:
+                self._discard_record(project_id, record)
 
     def list_symbols(
         self,
@@ -750,20 +846,25 @@ class SerenaSemanticBackend:
 
     def close_project(self, project_id: str) -> None:
         with self._lock:
-            worker = self._workers.pop(project_id, None)
-        if worker is not None:
-            worker.close()
+            record = self._workers.pop(project_id, None)
+        if record is not None:
+            self._close_worker(record.worker)
+
+    def active_project_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._workers))
 
     def close(self) -> tuple[str, ...]:
         with self._lock:
             workers = tuple(self._workers.items())
             self._workers.clear()
+            self._starting_projects.clear()
+            self._start_locks.clear()
         warnings: list[str] = []
-        for project_id, worker in workers:
-            try:
-                worker.close()
-            except Exception as exc:  # noqa: BLE001 - shutdown must attempt every worker
-                warnings.append(f"{project_id}: {str(exc)[:512]}")
+        for project_id, record in workers:
+            warning = self._close_worker(record.worker)
+            if warning:
+                warnings.append(f"{project_id}: {warning}"[:1024])
         return tuple(warnings)
 
 
