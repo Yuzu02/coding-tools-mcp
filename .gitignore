@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 .runtime/
 deploy/systemd/*.service
+deploy/host-config/*.toml
 coding-tools.local.toml
 .python_history
 .coverage

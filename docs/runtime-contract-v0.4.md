@@ -156,10 +156,11 @@ tool invocation. When the target tool is project-scoped, the target
 therefore bound to the actual addressed operation rather than to mutable
 current-project state.
 
-## Project configuration
+## Configuration identities and project configuration
 
-Public/default composition belongs in `coding-tools.toml`; machine-specific
-roots belong in ignored `coding-tools.local.toml`.
+Developer compatibility mode keeps the v1 layered identities. Public/default
+composition belongs in `coding-tools.toml`; machine-specific developer roots
+belong in ignored `coding-tools.local.toml`.
 
 ```toml
 # coding-tools.toml
@@ -188,6 +189,21 @@ versioned. Unknown extension/config keys, dependency cycles, invalid registry
 roots, duplicate canonical roots, contribution collisions, and invalid
 decorator composition fail startup before transport begins accepting normal
 requests.
+
+System deployment mode is separate. It selects one strict HostConfig v2 with
+`--host-config PATH`; that mode does not merge or auto-load a sibling
+`coding-tools.local.toml`. HostConfig owns machine/deployment authority such as
+the bootstrap workspace, registered project roots, listener, permission and
+network ceilings, runtime/state/cache roots, extension enablement, deployment
+timeouts, and tunnel selection. The services launcher and MCP runtime consume
+the same normalized HostConfig model and immutable configuration snapshot.
+
+Each registered project may additionally contain `.coding-tools-mcp.toml`
+(`project_config_version = 1`). Project configuration is parsed at startup and
+may only select or reduce authority already granted by the host; it cannot
+change listeners, auth, tunnels, systemd policy, global roots, project
+registration, or expand host permission/network ceilings. Configuration
+changes therefore require restart; heavy project/Serena resources remain lazy.
 
 ## Optional semantic composition
 
@@ -509,4 +525,12 @@ the same MCP protocol eras. v0.3 remains available at
 entry are historical records and must not be rewritten to match v0.4.
 
 The package version remains independent of this internal contract document;
-release/version changes follow the repository release process separately.
+release/version changes follow the repository release process separately. In
+particular, runtime contract v0.4 does not itself require a package-version bump.
+
+`python -m coding_tools_mcp --version` reports the package/release version.
+`server_info.version` remains the legacy package-version field, and
+`server_info.package_version` exposes the same identity explicitly.
+`server_info.runtime_contract_version` separately reports `0.4`. The safe
+configuration metadata also exposes resolution mode, deterministic fingerprint,
+config versions, and warning count without resolved secret values.

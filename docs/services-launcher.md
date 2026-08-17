@@ -8,13 +8,11 @@ It uses `mise` only to provision pinned tools and `uv` to synchronize and run
 the Python checkout. It does not install the package globally, embed secrets in
 the repository, or construct child commands through a shell.
 
-The launcher is deployment/composition infrastructure, not the extension
-configuration parser. It starts the MCP process with the MCP checkout as its
-working directory, so the runtime can discover that checkout's
-`coding-tools.toml`. The runtime package remains the sole parser/source of truth
-for `coding-tools.toml`, `coding-tools.local.toml`, and extension-specific
-configuration. The launcher may pass normal CLI/environment startup inputs but
-does not interpret extension TOML itself.
+The launcher has two explicit configuration modes. Developer compatibility
+mode keeps the historical `coding-tools.toml` + `coding-tools.local.toml` +
+environment + CLI precedence. System deployment mode selects one strict
+HostConfig v2 and uses the same canonical HostConfig parser/model as the MCP
+runtime; the launcher does not maintain a second TOML implementation.
 
 ## Clean clone setup
 
@@ -46,7 +44,7 @@ Node and Rust are included because the repository's npm and real-workload
 verification paths use them. The launcher itself is Python and runs the MCP
 checkout exclusively through `uv run --project ... --locked`.
 
-## Basic operation
+## Developer compatibility mode
 
 The launcher needs a workspace to expose. The repository containing the
 launcher and the workspace exposed through MCP may be different directories.
@@ -86,6 +84,57 @@ tunnel admin:        127.0.0.1:8080
 
 Every value can be overridden by an argument or its
 `CODING_TOOLS_SERVICES_...` environment-variable counterpart.
+
+Compatibility precedence is:
+
+```text
+built-in defaults
+< coding-tools.toml
+< coding-tools.local.toml
+< supported environment overrides
+< explicit CLI overrides
+```
+
+This mode remains useful for interactive clone-based development. It is not the
+normal long-running systemd deployment authority.
+
+## System HostConfig v2 mode
+
+A long-running deployment selects one private HostConfig explicitly:
+
+```bash
+uv run --locked python scripts/start_services.py \
+  --host-config /etc/coding-tools-mcp/config.toml
+```
+
+The launcher resolves HostConfig once, derives deployment/supervision settings
+from that immutable snapshot, and starts the MCP child with the minimal
+configuration argv:
+
+```text
+python -m coding_tools_mcp --host-config /etc/coding-tools-mcp/config.toml
+```
+
+HostConfig mode does **not** load `<workspace>/.env` and rejects legacy flags
+that would compete with host-owned workspace, listener, permission, tunnel, or
+deployment settings. Secret values are resolved narrowly by their actual
+consumer. A tunnel `env:` secret reference remains available to tunnel-client
+but its named environment variable is removed from the MCP child environment.
+
+Run the deterministic deployment preflight without synchronization, capability
+probes, or long-lived child startup:
+
+```bash
+uv run --locked python scripts/start_services.py \
+  --host-config /etc/coding-tools-mcp/config.toml \
+  --preflight
+```
+
+Preflight checks registered-root visibility, listener availability, external
+runtime/state/cache writability, source/runtime separation, exact
+`serena-agent==1.5.3` when semantic mode is enabled, and tunnel profile-file
+metadata. Findings and the configuration fingerprint are serialized without
+secret values.
 
 ## Dependency synchronization
 
@@ -235,7 +284,7 @@ Non-loopback tunnel admin listeners require
 `--allow-remote-tunnel-ui`. Avoid exposing the admin UI unless the host has an
 independent access-control boundary.
 
-## Environment files
+## Environment files in compatibility mode
 
 Configuration precedence is:
 
@@ -246,6 +295,11 @@ CLI argument > existing process environment > selected .env > default
 The default file is `<workspace>/.env`. Existing process variables are never
 overwritten. Select another file with `--env-file PATH`, or disable loading with
 `--no-env-file`.
+
+This precedence and automatic workspace `.env` lookup apply only to developer
+compatibility mode. `--host-config` never loads a workspace `.env`; deployment
+secrets must already exist in the launcher process environment or in the
+absolute `file:` locations named by HostConfig secret references.
 
 Example:
 
@@ -389,6 +443,49 @@ Example `/etc/coding-tools-mcp/service.env`:
 CONTROL_PLANE_API_KEY=replace-me
 ```
 
+Example private `/etc/coding-tools-mcp/config.toml` using only synthetic
+project paths and IDs:
+
+```toml
+config_version = 2
+
+[runtime]
+bootstrap_workspace = "/srv/projects/example"
+runtime_root = "/var/lib/coding-tools-mcp/runtime"
+state_root = "/var/lib/coding-tools-mcp/state"
+cache_root = "/var/lib/coding-tools-mcp/cache"
+
+[transport]
+kind = "http"
+host = "127.0.0.1"
+port = 8000
+
+[security]
+permission_mode = "dangerous"
+shell_env_inherit = "all"
+allow_network = true
+auth_mode = "noauth"
+
+[extensions]
+enabled = ["projects"]
+
+[extensions.projects.registry.example]
+root = "/srv/projects/example"
+
+[deployment]
+mcp_repository = "/opt/coding-tools-mcp/repository"
+sync = false
+logs_root = "/var/lib/coding-tools-mcp/logs"
+
+[deployment.tunnel]
+mode = "profile-file"
+profile_file = "/etc/coding-tools-mcp/tunnel.yaml"
+api_key_ref = "env:CONTROL_PLANE_API_KEY"
+```
+
+Provision the runtime/state/cache/log roots outside the source tree and make
+them writable by the service account before preflight.
+
 Example `/etc/systemd/system/coding-tools-mcp.service`:
 
 ```ini
@@ -405,13 +502,18 @@ WorkingDirectory=/opt/coding-tools-mcp/repository
 EnvironmentFile=/etc/coding-tools-mcp/service.env
 Environment=HOME=/home/codingtools
 Environment=PATH=/home/codingtools/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/env mise exec -- uv run --locked python scripts/start_services.py --workspace /srv/coding-tools-mcp/workspace --tunnel-profile-file /etc/coding-tools-mcp/tunnel.yaml --no-sync
+ExecStartPre=/usr/bin/env mise exec -- uv run --locked python scripts/start_services.py --host-config /etc/coding-tools-mcp/config.toml --preflight
+ExecStart=/usr/bin/env mise exec -- uv run --locked python scripts/start_services.py --host-config /etc/coding-tools-mcp/config.toml
 Restart=on-failure
 RestartSec=5
 KillMode=control-group
 TimeoutStopSec=20
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=/srv/projects/example
+BindPaths=/var/lib/coding-tools-mcp
 
 [Install]
 WantedBy=multi-user.target
@@ -436,19 +538,21 @@ before restarting the next instance. Do not batch-restart every workspace at
 once.
 
 When hardening a service, do not place the command runtime or `TMPDIR` on a
-`noexec` mount if its workspace tools may execute generated shims. A deployed
-host uses each service's isolated `/var/cache/coding-tools-mcp-*` directory for
-`CODING_TOOLS_MCP_RUNTIME_ROOT` and `TMPDIR`; `/run/coding-tools-mcp-*` is
-`noexec` in those service namespaces and breaks tools such as `npx` and Next.js
-consumer builds.
+`noexec` mount if project tools may execute generated shims. Provision the
+HostConfig runtime/state/cache roots on mounts compatible with the workloads
+served by the unit, and keep those mutable roots outside registered source
+trees.
 
-Keep host-specific instance inventories and rollout order
-are documented in `docs/ops/deployed-instances.md`.
+HostConfig cannot widen the outer systemd sandbox. A path hidden by
+`ProtectHome`, omitted from bind mounts, or denied by filesystem permissions
+remains unavailable even if HostConfig names it. Treat the unit as the outer
+security ceiling and HostConfig as policy inside that ceiling.
 
-For that host, the four version-controlled unit files live under
-`deploy/systemd/`. `/etc/systemd/system/coding-tools-mcp*.service` should point
-to those canonical files rather than ignored `.runtime/` state or independent
-root-owned copies.
+One systemd unit may serve multiple registered projects when they share the
+same trust/security domain. Split units only for a genuine OS/security
+boundary, not merely because project count increased. Keep real unit files,
+HostConfig, tunnel identities, project inventories, and secret material outside
+the public fork.
 
 The launcher also writes its own run directory, which remains the primary source
 for child stdout, stderr, and tunnel diagnostics after a restart.
@@ -480,6 +584,8 @@ tail -n 80 .runtime/services/<run>/coding-tools-mcp.stderr.log
 tail -n 80 .runtime/services/<run>/tunnel-client.stderr.log
 ```
 
-Typical preflight failures are an occupied MCP port, a missing workspace,
-missing `pyproject.toml` or `uv.lock`, an unsupported older MCP checkout, a
-missing profile file, or a failed `tunnel-client doctor` check.
+Typical deterministic preflight failures are an occupied MCP port, an invisible
+registered project root, a runtime/state/cache root that is not writable or is
+inside a source root, a semantic backend version other than Serena 1.5.3, or a
+missing profile file. `--doctor-only` is separate and performs the live
+`tunnel-client doctor` workflow when tunnel validation is required.

@@ -31,8 +31,15 @@ class PublicForkHygieneTests(unittest.TestCase):
         self.assertEqual(real_units, [])
         self.assertNotIn("docs/ops/deployed-instances.md", paths)
         self.assertNotIn("coding-tools.local.toml", paths)
+        private_host_configs = [
+            path
+            for path in paths
+            if path.startswith("deploy/host-config/") and path.endswith(".toml")
+        ]
+        self.assertEqual(private_host_configs, [])
         ignore_lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
         self.assertIn("deploy/systemd/*.service", ignore_lines)
+        self.assertIn("deploy/host-config/*.toml", ignore_lines)
         self.assertIn("coding-tools.local.toml", ignore_lines)
 
     def test_tracked_text_has_no_private_host_markers(self) -> None:
