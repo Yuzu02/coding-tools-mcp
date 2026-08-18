@@ -23,10 +23,11 @@ labelled `NEVER RUN`.
 The migration block now passes explicit service UID/GID to `provision --apply`
 and `doctor`, documents broker ownership checks and the separate root gate for
 `doctor --system`, and triggers rollback automatically on verification failure.
-Rollback now tracks only provider names newly reserved and provisioned by the
-block; complete pre-existing fragment/subtree pairs are skipped, partial pairs
-fail, and only tracked names are removed on error. This makes reruns safe
-without deleting pre-existing provider state.
+Rollback deliberately leaves all credential fragments and broker subtrees
+untouched. Because the block has no reservation/locking mechanism, it cannot
+safely distinguish its writes from pre-existing or concurrent state. Any
+cleanup therefore requires a separate, manually reviewed `doctor` plus
+dry-run/explicit `remove --apply` operation.
 
 ## Documentation-safe checks
 

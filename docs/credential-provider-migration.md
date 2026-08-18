@@ -70,13 +70,12 @@ locally before checking any external tunnel path.
 ## Root-only migration/rollback block — NEVER RUN
 
 Replace every angle-bracket placeholder with the operator's already-reviewed
-value. Repeat the `provision_if_absent` call once per provider. Provider names
-used by this block must be reserved for this migration: an existing fragment
-and broker subtree are treated as already provisioned and are never removed by
-rollback; a partial pair is an error. The exact legacy bind entry placeholder
-must identify only the credential bind line; do not delete other project or
-runtime binds. The backup directory must be retained until post-migration
-verification is complete.
+value. Repeat the `provision` command once per provider. The command may replace
+an existing provider, so inspect the registry and broker first and do not rerun
+this block blindly. The exact legacy bind entry placeholder must identify only
+the credential bind line; do not delete other project or runtime binds. The
+backup directory must be retained until post-migration verification is
+complete.
 
 ```sh
 set -eu
@@ -89,18 +88,12 @@ BROKER_DIR="<state-root>/credentials"
 BACKUP_DIR="<rollback-backup-dir>"
 SERVICE_UID="<service-account-uid>"
 SERVICE_GID="<service-account-gid>"
-PROVISIONED_NAMES=""
 
 rollback() {
   trap - ERR
   systemctl stop "$UNIT" || true
-  # Names are appended only after an absent fragment/subtree is reserved.
-  # Provider names are safe basenames, so this loop cannot address a sibling.
-  for name in $PROVISIONED_NAMES; do
-    uv run --locked python scripts/credentials.py \
-      --registry-dir "$REGISTRY_DIR" --broker-dir "$BROKER_DIR" \
-      remove "$name" --apply || true
-  done
+  # Credential fragments and broker trees are intentionally left untouched:
+  # this block cannot safely distinguish its writes from concurrent state.
   cp -- "$BACKUP_DIR/unit-before" "$UNIT_FILE"
   if test -f "$BACKUP_DIR/drop-in-before"; then
     cp -- "$BACKUP_DIR/drop-in-before" "$DROPIN"
@@ -118,26 +111,12 @@ cp -- "$UNIT_FILE" "$BACKUP_DIR/unit-before"
 if test -f "$DROPIN"; then cp -- "$DROPIN" "$BACKUP_DIR/drop-in-before"; fi
 trap rollback ERR
 
-# Stage and provision each broker copy. Existing complete pairs are skipped,
-# making a successful rerun idempotent; partial pairs fail without deletion.
-provision_if_absent() {
-  name="$1"
-  source_store="$2"
-  fragment="$REGISTRY_DIR/$name.toml"
-  subtree="$BROKER_DIR/$name"
-  if test -e "$fragment" || test -e "$subtree"; then
-    test -f "$fragment" && test -d "$subtree" || return 1
-    return 0
-  fi
-  PROVISIONED_NAMES="$PROVISIONED_NAMES $name"
-  uv run --locked python scripts/credentials.py \
-    --registry-dir "$REGISTRY_DIR" --broker-dir "$BROKER_DIR" \
-    --service-uid "$SERVICE_UID" --service-gid "$SERVICE_GID" provision \
-    --name "$name" --command "<executable-basename>" \
-    --source "$source_store" --read-root "read-only" --write-root "state" --apply
-}
-
-provision_if_absent "<provider-name>" "<source-store>"
+# Stage and provision each broker copy; --apply is the mutating CLI flag.
+uv run --locked python scripts/credentials.py \
+  --registry-dir "$REGISTRY_DIR" --broker-dir "$BROKER_DIR" \
+  --service-uid "$SERVICE_UID" --service-gid "$SERVICE_GID" provision \
+  --name "<provider-name>" --command "<executable-basename>" \
+  --source "<source-store>" --read-root "read-only" --write-root "state" --apply
 
 # Remove exactly the reviewed legacy credential bind line, and no other bind.
 sed -i '\|<legacy-credential-bind-entry>|d' "$DROPIN"
@@ -156,16 +135,18 @@ curl --fail --silent "<local-status-url>" >/dev/null
 uv run --locked python scripts/mcp_smoke.py "<local-mcp-url>" \
   --expect-permission-mode "<permission-mode>"
 
-# Any failed command above triggers rollback automatically. It removes only
-# names provisioned by this run, then restores the saved unit/drop-in. To roll
-# back after a successful verification, run rollback once; it reloads systemd
-# and starts the prior service configuration without deleting pre-existing
-# provider state.
+# Any failed command above triggers rollback automatically. It restores only
+# the saved unit/drop-in and leaves all credential state intact. To roll back
+# after a successful verification, run rollback once; it reloads systemd and
+# starts the prior service configuration.
 trap - ERR
 # rollback
 ```
 
-Rollback restores the prior unit and drop-in state but does not delete source
-personal stores. After a successful migration, provider changes should use
-`credentials provision` or `credentials remove`; do not hand-edit fragments
-while the service is running.
+Rollback restores the prior unit and drop-in state but deliberately does not
+delete any credential fragment or broker subtree. If a failed attempt left
+state that must be removed, first run `credentials doctor` with the service UID
+and GID, inspect its redacted report, then use the normal dry-run
+`credentials remove <name>` plan and an explicitly reviewed `remove <name>
+--apply`. This manual cleanup is separate from rollback and must never target
+pre-existing or concurrently changed provider state.
