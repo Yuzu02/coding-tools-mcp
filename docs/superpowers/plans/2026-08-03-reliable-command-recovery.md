@@ -1,5 +1,7 @@
 # Reliable Command Recovery Implementation Plan
 
+**Status:** HISTORICAL EXECUTION PLAN — IMPLEMENTED + VERIFIED in the stateless command-recovery contract.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `exec_command` safely retryable after a lost MCP response and let fresh MCP sessions discover and recover workspace-owned commands.

@@ -1,10 +1,13 @@
 # Host Configuration, Project Policy, and Single-Unit Deployment Design
 
 **Date:** 2026-08-17
-**Status:** Approved architecture; canonical pre-Hooks/Work/Gateway design
+**Status:** IMPLEMENTED + VERIFIED; canonical pre-Hooks/Work/Gateway design
 **Scope:** HostConfig v2, project-local policy, immutable startup configuration,
 launcher/runtime convergence, deployment preflight, and migration to one
 same-trust deployment unit
+
+The implementation is recorded in the companion plan. Hooks, Work Items, and
+Gateway remain explicit non-goals and proposed future work.
 
 ## 1. Purpose
 

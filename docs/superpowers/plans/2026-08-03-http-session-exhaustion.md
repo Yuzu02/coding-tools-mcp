@@ -1,5 +1,7 @@
 # HTTP Session Exhaustion Plan
 
+**Status:** SUPERSEDED — HTTP transport is now stateless; retained as incident history.
+
 **Goal:** Prevent tunnel clients that create a fresh MCP session for each tool
 call from exhausting the 128-session HTTP limit.
 

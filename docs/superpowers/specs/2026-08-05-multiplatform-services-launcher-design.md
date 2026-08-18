@@ -2,12 +2,17 @@
 
 Date: 2026-08-05
 
-Status: approved for implementation
+Status: **IMPLEMENTED + VERIFIED**
 
 Base branch: `fix/git-workdir-resolution` at
 `9893bc88ab0fbfc0b410e4835915abfe9f7387e7`
 
 Implementation branch: `feat/multiplatform-services-launcher`
+
+This is a historical design/execution record. The launcher is implemented in
+`scripts/start_services.py` and `scripts/launcher/`; current deployment
+authority is HostConfig v2 and the systemd boundary documented in
+[`../../services-launcher.md`](../../services-launcher.md).
 
 ## Purpose
 

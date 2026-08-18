@@ -9,11 +9,10 @@ not current repository state.
 
 ## Problem
 
-The MCP workspace can contain several first-level repositories and nested
-repositories. The current project-context loader treats the entire configured
-workspace as one project. On a large parent workspace this causes broad scans,
-can reach the 20,000-file limit, and fails to expose the instructions that are
-actually relevant to a requested path or command work directory.
+At planning time, the MCP project-context loader treated the entire configured
+workspace as one project. On a large parent workspace this caused broad scans,
+could reach the 20,000-file limit, and failed to expose the instructions that
+were actually relevant to a requested path or command work directory.
 
 The workspace also contains reusable agent skills under `.agents/skills` and
 compatibility views under `.claude/skills`. Loading all skill bodies into MCP

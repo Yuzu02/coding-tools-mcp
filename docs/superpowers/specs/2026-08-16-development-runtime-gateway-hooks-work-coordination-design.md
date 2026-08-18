@@ -18,9 +18,9 @@ workspace configuration, deterministic hooks, durable work coordination, MCP
 gateway/proxy capabilities, and optional code/research integrations.
 
 It is a design specification, not an implementation plan. The current runtime
-contract remains [`SPEC.md`](../../../SPEC.md) and
-[`docs/runtime-contract-v0.3.md`](../../runtime-contract-v0.3.md) until an
-implementation is explicitly accepted and versioned.
+contract is [`docs/runtime-contract-v0.4.md`](../../runtime-contract-v0.4.md).
+Hooks, Work Items, and Gateway remain unimplemented until separately accepted
+and versioned.
 
 The earlier [`docs/work-items-design.md`](../../work-items-design.md) remains a
 focused design note. This document incorporates its decisions and broadens the

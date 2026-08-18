@@ -1,5 +1,7 @@
 # Semantic Navigation / Serena Implementation Plan
 
+**Status:** HISTORICAL EXECUTION PLAN — Phase B is IMPLEMENTED + VERIFIED.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add four backend-neutral, read-only semantic navigation tools to Coding Tools MCP through the internal `semantic` extension, backed initially by isolated per-project Serena 1.5.3 worker processes.

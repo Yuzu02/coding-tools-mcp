@@ -10,7 +10,7 @@
 
 **Tech Stack:** Python 3.11+, stdlib `contextvars`, `dataclasses`, `threading`, `pathlib`, existing Phase 0 `ExtensionHost`/`ServiceRegistry`/`ToolDecorator` APIs, existing MCP runtime, `unittest`, Ruff, mypy, Mise/uv, Git.
 
-## Baseline Snapshot
+## Historical Baseline Snapshot
 
 - Implementation branch: `main` by explicit user authorization; do not create a worktree or feature branch for this plan.
 - Baseline HEAD: `f5bf954843daefdbcc41a473a08b22f68122cc1f`.

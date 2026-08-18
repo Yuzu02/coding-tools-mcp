@@ -1,5 +1,7 @@
 # Multiplatform Services Launcher Implementation Plan
 
+**Status:** HISTORICAL EXECUTION PLAN — IMPLEMENTED + VERIFIED; deployment authority is now HostConfig v2.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a repository-owned Python launcher that provisions the declared toolchain with `mise`, synchronizes the checkout with `uv`, and safely supervises `coding-tools-mcp` plus OpenAI `tunnel-client` on Windows, Linux, and macOS.
