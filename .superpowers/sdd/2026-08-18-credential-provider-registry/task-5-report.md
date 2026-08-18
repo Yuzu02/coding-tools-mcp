@@ -1,6 +1,6 @@
 # Task 5 report
 
-Commits: `c7a0e6fc9ce2e1a135dc29b5685d98eef77b400a`, `b875a862eaba0968e7c52f45166d7d51abf87e7e`, `40fb9d24c32e42466eee8afccfb152b4e9fee47d`, `07c6eadafdbb850c72930c19147d88169fc579bc`, `3e388d85ee51b02366bcde79323ac414a6c54f78`
+Commits: `c7a0e6fc9ce2e1a135dc29b5685d98eef77b400a`, `b875a862eaba0968e7c52f45166d7d51abf87e7e`, `40fb9d24c32e42466eee8afccfb152b4e9fee47d`, `07c6eadafdbb850c72930c19147d88169fc579bc`, `3e388d85ee51b02366bcde79323ac414a6c54f78`, `b4ab469042d35108b8ad6e4aa21d6f303d7f2ce1`
 
 Files:
 
@@ -22,5 +22,6 @@ Validation:
 - Broker/registry parents are root-owned with service-group traversal/read access; provider stores remain service-owned 0700/0600 and fragments root-owned 0640.
 - Doctor returns `ok=false` for unsafe layouts and the CLI exits non-zero.
 - Broker doctor audit distinguishes the root parent from service-owned provider descendants; provisioned stores are not falsely flagged.
+- Provisioning recursively copies nested regular directories while rejecting symlinks, devices, FIFOs, and other unsafe nodes.
 
 Limitations: tests inject effective UIDs and never perform host deployment; production apply remains root-gated.
