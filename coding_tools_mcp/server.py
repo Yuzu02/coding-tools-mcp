@@ -60,10 +60,12 @@ from .host_config import (
     HostRuntimeConfig,
     build_developer_snapshot,
     build_host_snapshot,
+    credential_broker_dir,
+    credential_registry_dir,
     load_host_config,
     resolve_secret_ref,
 )
-from .credential_providers import CredentialProvider
+from .credential_providers import CredentialProvider, CredentialProviderRegistry, CredentialRegistrySnapshot
 from .landlock_exec import libc_syscall
 from .oauth import (
     OAUTH_CODE_TTL_SECONDS,
@@ -1756,6 +1758,7 @@ class Runtime:
         extension_registry: ExtensionRegistry | None = None,
         config_snapshot: ConfigSnapshot | None = None,
         exec_credentials: tuple[HostExecCredentialConfig, ...] = (),
+        credential_registry: CredentialProviderRegistry | None = None,
     ) -> None:
         bootstrap_workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
@@ -1789,6 +1792,7 @@ class Runtime:
                 details={"supported": list(SHELL_ENV_INHERIT_CHOICES)},
             )
         self.exec_credentials = tuple(exec_credentials)
+        self.credential_registry = credential_registry
         self.allow_network = allow_network or self.capabilities.network
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
@@ -1854,6 +1858,7 @@ class Runtime:
             bootstrap_manager,
             owns_command_manager=command_manager is None,
         )
+        self.process_start_time = datetime.now(timezone.utc).isoformat()
         self._closed = False
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
@@ -2225,6 +2230,47 @@ class Runtime:
             "cache_dir": str(self.cache_dir),
         }
 
+    def _credential_providers_payload(self) -> dict[str, Any]:
+        snapshot = self._credential_registry_snapshot()
+        if snapshot is None:
+            return {
+                "sensitive_env_filter": "enabled-when-registry-present",
+                "registry": {"health": "not-configured", "generation": None, "fingerprint": None, "error": None},
+                "filesystem_isolation": {"status": "placeholder-task-4"},
+                "providers": [],
+                "server_instance_id": self.server_instance_id,
+                "process_start_time": self.process_start_time,
+                "tool_names_fingerprint": hashlib.sha256(
+                    json.dumps(self.exposed_tool_names(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                ).hexdigest(),
+            }
+        return {
+            "sensitive_env_filter": "enabled-when-registry-present",
+            "registry": {
+                "health": snapshot.health,
+                "generation": snapshot.generation,
+                "fingerprint": snapshot.fingerprint,
+                "error": snapshot.error,
+            },
+            "filesystem_isolation": {"status": "placeholder-task-4"},
+            "providers": [
+                {
+                    "name": provider.name,
+                    "commands": list(provider.commands),
+                    "read_roots": [str(root) for root in provider.read_roots],
+                    "write_roots": [str(root) for root in provider.write_roots],
+                    "env_passthrough": list(provider.env_passthrough),
+                    "env_paths": {key: str(path) for key, path in provider.env_paths},
+                }
+                for provider in snapshot.providers
+            ],
+            "server_instance_id": self.server_instance_id,
+            "process_start_time": self.process_start_time,
+            "tool_names_fingerprint": hashlib.sha256(
+                json.dumps(self.exposed_tool_names(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            ).hexdigest(),
+        }
+
     def _landlock_enforced(self, landlock: dict[str, Any]) -> bool:
         return bool(landlock.get("available")) and self.landlock_enabled()
 
@@ -2256,6 +2302,7 @@ class Runtime:
                 "global_tmp_write": self.global_tmp_write_policy(),
                 "secret_env_filter": self.secret_env_filter_policy(),
             },
+            "credential_providers": self._credential_providers_payload(),
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
@@ -3455,7 +3502,8 @@ class Runtime:
         return path if isinstance(path, str) and path else None
 
     def _exec_credential_provider(self, command: str | None) -> HostExecCredentialConfig | None:
-        if not command or not self.exec_credentials:
+        providers = self._active_exec_credentials()
+        if not command or not providers:
             return None
         if "\n" in command or "\r" in command or SHELL_EXPANSION_RE.search(command):
             return None
@@ -3474,9 +3522,20 @@ class Runtime:
         if "/" in executable:
             return None
         return next(
-            (provider for provider in self.exec_credentials if executable in provider.commands),
+            (provider for provider in providers if executable in provider.commands),
             None,
         )
+
+    def _credential_registry_snapshot(self) -> CredentialRegistrySnapshot | None:
+        if self.credential_registry is None:
+            return None
+        return self.credential_registry.snapshot()
+
+    def _active_exec_credentials(self) -> tuple[HostExecCredentialConfig, ...]:
+        snapshot = self._credential_registry_snapshot()
+        if snapshot is not None:
+            return snapshot.providers
+        return self.exec_credentials
 
     def _exec_credential_read_roots(self, command: str | None) -> list[str]:
         provider = self._exec_credential_provider(command)
@@ -3504,7 +3563,7 @@ class Runtime:
         )
         env = self._base_command_env()
         env = sanitize_mcp_bootstrap_environment(env, venv_roots=inherited_bootstrap_roots)
-        if self.exec_credentials:
+        if self.credential_registry is not None or self.exec_credentials:
             env = {key: value for key, value in env.items() if not SENSITIVE_ENV_RE.search(key)}
         if not self.dangerously_skip_all_permissions:
             env = {key: value for key, value in env.items() if not is_filtered_env_var(key, value)}
@@ -3542,6 +3601,8 @@ class Runtime:
             for key, value in extra.items():
                 key_text = str(key)
                 value_text = str(value)
+                if self.credential_registry is not None and is_filtered_env_var(key_text, value_text):
+                    continue
                 if self.exec_credentials and SENSITIVE_ENV_RE.search(key_text):
                     continue
                 if not self.dangerously_skip_all_permissions and is_filtered_env_var(key_text, value_text):
@@ -6727,6 +6788,7 @@ def build_runtime(
     enable_view_image = args.enable_view_image
     effective_transport = transport
     exec_credentials: tuple[HostExecCredentialConfig, ...] = ()
+    credential_registry: CredentialProviderRegistry | None = None
     if snapshot.resolution_mode == "host":
         host_config = snapshot.host_config
         if host_config is None or host_config.runtime is None:
@@ -6735,6 +6797,9 @@ def build_runtime(
         effective_policy = runtime_policy_from_host_config(host_config)
         enable_view_image = host_config.runtime.enable_view_image
         effective_transport = host_config.transport.kind
+        credential_registry = CredentialProviderRegistry(
+            credential_registry_dir(host_config), credential_broker_dir(host_config)
+        )
     runtime = Runtime(
         workspace,
         enable_view_image=enable_view_image,
@@ -6751,6 +6816,7 @@ def build_runtime(
         extension_registry=registry,
         config_snapshot=snapshot,
         exec_credentials=exec_credentials,
+        credential_registry=credential_registry,
     )
     if emit_warning and runtime.capabilities.skip_all_permissions:
         print(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 import os
 import signal
 import shutil
@@ -19,7 +20,7 @@ from unittest.mock import patch
 from coding_tools_mcp import server as server_module
 from coding_tools_mcp import processes as processes_module
 from coding_tools_mcp import telemetry as telemetry_module
-from coding_tools_mcp.host_config import HostExecCredentialConfig
+from coding_tools_mcp.credential_providers import CredentialProviderRegistry, atomic_write_fragment
 from coding_tools_mcp.patching import (
     AtomicPatchCommitter,
     FileBaseline,
@@ -33,6 +34,7 @@ from coding_tools_mcp.server import (
     LANDLOCK_ACCESS_FS_WRITE_FILE,
     MAX_ACTIVE_COMMANDS,
     Runtime,
+    HostExecCredentialConfig,
     ShellEnvPolicy,
     ToolFailure,
     exec_output_diagnostics,
@@ -107,6 +109,56 @@ def fake_landlock_exec() -> Iterator[dict[str, object]]:
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_registry_credentials_are_command_scoped_and_scrub_explicit_sensitive_env(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "state" / "credentials"
+            provider_root = broker_dir / "alpha"
+            provider_root.mkdir(parents=True)
+            atomic_write_fragment(
+                registry_dir / "alpha.toml",
+                f'name = "alpha"\ncommands = ["alpha"]\nread_roots = ["{provider_root}"]\nenv_passthrough = ["ALPHA_TOKEN"]\n',
+            )
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=ShellEnvPolicy(inherit="all"),
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            with patch.dict(
+                server_module.os.environ,
+                {"PATH": "/usr/bin", "ALPHA_TOKEN": "alpha-secret", "BETA_TOKEN": "beta-secret"},
+                clear=True,
+            ):
+                selected = runtime._command_env({"BETA_TOKEN": "explicit-beta"}, command="alpha whoami")
+                ordinary = runtime._command_env({"ALPHA_TOKEN": "explicit-alpha"}, command="printf ok")
+            self.assertEqual(selected.get("ALPHA_TOKEN"), "alpha-secret")
+            self.assertNotIn("BETA_TOKEN", selected)
+            self.assertNotIn("ALPHA_TOKEN", ordinary)
+            self.assertNotIn("BETA_TOKEN", ordinary)
+
+    def test_server_info_discloses_registry_health_without_secret_values(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            registry_dir.mkdir()
+            (registry_dir / "broken.toml").write_text("not = [valid", encoding="utf-8")
+            runtime = Runtime(
+                workspace,
+                credential_registry=CredentialProviderRegistry(registry_dir, root / "state" / "credentials"),
+            )
+            info = runtime.server_info_payload()
+            credential_info = info["credential_providers"]
+            self.assertEqual(info["exec_policy"]["secret_env_filter"], "enabled")
+            self.assertEqual(credential_info["sensitive_env_filter"], "enabled-when-registry-present")
+            self.assertEqual(credential_info["registry"]["health"], "invalid")
+            self.assertNotIn("COMPLIANCE_SHOULD_NOT_LEAK", json.dumps(info))
+            self.assertNotIn("not = [valid", json.dumps(info))
     def test_windows_tty_request_reports_explicit_unsupported_error(self) -> None:
         with TemporaryDirectory() as tmp, patch.object(processes_module.os, "name", "nt"):
             with self.assertRaises(ToolFailure) as raised:
