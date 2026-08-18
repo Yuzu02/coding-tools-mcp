@@ -31,7 +31,7 @@ mise run setup
 `mise install` provisions the versions declared in `mise.toml`:
 
 - Python 3.14.7;
-- `uv` 0.12.3;
+- `uv` 0.12.5;
 - Node 24.19.0;
 - Rust 1.97.1;
 - `github:openai/tunnel-client` 0.0.11.

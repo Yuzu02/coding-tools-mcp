@@ -18,7 +18,7 @@ class LauncherToolchainTests(unittest.TestCase):
         environment = config["env"]
 
         self.assertEqual(tools["python"], "3.14.7")
-        self.assertEqual(tools["uv"], "0.12.3")
+        self.assertEqual(tools["uv"], "0.12.5")
         self.assertEqual(tools["node"], "24.19.0")
         self.assertEqual(tools["rust"], "1.97.1")
         self.assertEqual(tools["gh"], "2.97.0")
