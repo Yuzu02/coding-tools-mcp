@@ -170,6 +170,35 @@ class SkillCatalogTests(unittest.TestCase):
             self.assertEqual([record.name for record in context.skills], ["xlsx"])
             self.assertEqual(context.skills[0].description, long_description)
 
+    def test_parser_accepts_folded_description_with_nested_metadata(self) -> None:
+        temporary, root, sdk, _, _ = make_workspace()
+        with temporary:
+            skill = sdk / ".agents" / "skills" / "neon-postgres" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "---\n"
+                "name: neon-postgres\n"
+                "description: >-\n"
+                "  Guides and best practices for working with Lakebase Postgres, the database\n"
+                "  behind Neon. Covers setup, connection methods and schema migrations.\n"
+                "metadata:\n"
+                "  parent: neon\n"
+                "  source: https://github.com/neondatabase/agent-skills\n"
+                "---\n"
+                "body\n",
+                encoding="utf-8",
+            )
+
+            context = SkillCatalog(build_project_catalog(root)).list_for(sdk)
+
+            self.assertEqual([record.name for record in context.skills], ["neon-postgres"])
+            self.assertEqual(
+                context.skills[0].description,
+                "Guides and best practices for working with Lakebase Postgres, the database "
+                "behind Neon. Covers setup, connection methods and schema migrations.",
+            )
+            self.assertEqual(context.warnings, ())
+
     def test_invalid_required_scalar_forms_are_rejected(self) -> None:
         temporary, root, sdk, _, _ = make_workspace()
         with temporary:

@@ -3109,7 +3109,7 @@ class Runtime:
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
         explicit_env = args.get("env", {})
-        env = self._command_env(explicit_env)
+        env = self._command_env(explicit_env, workdir=workdir.path)
         client_request_id = self._validated_client_request_id(args.get("client_request_id"))
         client_binding: ClientRequestBinding | None = None
         if client_request_id is not None:
@@ -3396,7 +3396,48 @@ class Runtime:
                 details={"permission": "privileged_executable", "path": str(executable_path)},
             )
 
-    def _command_env(self, extra: Any) -> dict[str, str]:
+    def _project_mise_path(self, env: dict[str, str], workdir: Path | None) -> str | None:
+        if workdir is None or not env.get("PATH"):
+            return None
+        current = workdir.resolve(strict=False)
+        workspace_root = self.workspace.root.resolve(strict=False)
+        has_project_config = False
+        while True:
+            if any(
+                (current / name).is_file()
+                for name in ("mise.toml", "mise.local.toml", ".mise.toml", ".tool-versions")
+            ):
+                has_project_config = True
+                break
+            if current == workspace_root or current.parent == current:
+                break
+            current = current.parent
+        if not has_project_config:
+            return None
+        mise = shutil.which("mise", path=env["PATH"])
+        if mise is None:
+            return None
+        try:
+            completed = subprocess.run(
+                [mise, "env", "--json", "--cd", str(workdir)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        try:
+            activated = json.loads(completed.stdout)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        path = activated.get("PATH") if isinstance(activated, dict) else None
+        return path if isinstance(path, str) and path else None
+
+    def _command_env(self, extra: Any, *, workdir: Path | None = None) -> dict[str, str]:
         inherited_bootstrap_roots = (
             mcp_bootstrap_venv_roots({str(key): str(value) for key, value in os.environ.items()})
             if self.shell_env_policy.inherit != "none"
@@ -3432,6 +3473,10 @@ class Runtime:
         if os.name == "nt":
             env["TEMP"] = str(tmp_dir)
             env["TMP"] = str(tmp_dir)
+        mise_path = self._project_mise_path(env, workdir)
+        if mise_path is not None:
+            env["PATH"] = mise_path
+            env = sanitize_mcp_bootstrap_environment(env, venv_roots=inherited_bootstrap_roots)
         if isinstance(extra, dict):
             for key, value in extra.items():
                 key_text = str(key)

@@ -305,8 +305,7 @@ def _parse_frontmatter(path: Path) -> tuple[str, str]:
             raise ValueError("missing YAML frontmatter")
 
         consumed = len(first_line)
-        values: dict[str, str] = {}
-        ignored_indent: int | None = None
+        frontmatter_lines: list[str] = []
         while True:
             line = handle.readline()
             if not line:
@@ -316,34 +315,87 @@ def _parse_frontmatter(path: Path) -> tuple[str, str]:
                 raise ValueError(f"frontmatter exceeds {MAX_SKILL_FRONTMATTER_BYTES} bytes")
             if line.strip() == b"---":
                 break
+            frontmatter_lines.append(line.decode("utf-8").rstrip("\r\n"))
 
-            raw_line = line.decode("utf-8").rstrip("\r\n")
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(frontmatter_lines):
+        raw_line = frontmatter_lines[index]
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            index += 1
+            continue
 
-            indent = len(raw_line) - len(raw_line.lstrip(" "))
-            if ignored_indent is not None:
-                if indent > ignored_indent:
-                    continue
-                ignored_indent = None
-            if indent:
-                raise ValueError("frontmatter must use scalar key: value fields")
-            if ":" not in raw_line:
-                raise ValueError("frontmatter must use scalar key: value fields")
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if indent:
+            raise ValueError("frontmatter must use scalar key: value fields")
+        if ":" not in raw_line:
+            raise ValueError("frontmatter must use scalar key: value fields")
 
-            key, raw_value = raw_line.split(":", 1)
-            key = key.strip()
-            value = raw_value.strip()
-            if key not in {"name", "description"}:
-                if not value:
-                    ignored_indent = indent
-                continue
-            values[key] = _parse_scalar(value)
+        key, raw_value = raw_line.split(":", 1)
+        key = key.strip()
+        value = raw_value.strip()
+        if key not in {"name", "description"}:
+            index += 1
+            if not value:
+                while index < len(frontmatter_lines):
+                    nested = frontmatter_lines[index]
+                    if nested.strip() and not nested.startswith(" "):
+                        break
+                    index += 1
+            continue
+
+        if value in {">", ">-", ">+", "|", "|-", "|+"}:
+            block_lines: list[str] = []
+            index += 1
+            while index < len(frontmatter_lines):
+                nested = frontmatter_lines[index]
+                if nested.strip() and not nested.startswith(" "):
+                    break
+                block_lines.append(nested)
+                index += 1
+            values[key] = _parse_block_scalar(value, block_lines)
+            continue
+
+        values[key] = _parse_scalar(value)
+        index += 1
     for required in ("name", "description"):
         if not values.get(required, "").strip():
             raise ValueError(f"frontmatter requires non-empty {required}")
     return values["name"].strip(), values["description"].strip()
+
+
+def _parse_block_scalar(marker: str, raw_lines: list[str]) -> str:
+    non_empty = [line for line in raw_lines if line.strip()]
+    if not non_empty:
+        return ""
+    indentation = min(len(line) - len(line.lstrip(" ")) for line in non_empty)
+    if indentation <= 0:
+        raise ValueError("block scalar content must be indented")
+    lines = [line[indentation:] if line.strip() else "" for line in raw_lines]
+
+    if marker.startswith("|"):
+        value = "\n".join(lines)
+    else:
+        paragraphs: list[str] = []
+        current: list[str] = []
+        for line in lines:
+            if line == "":
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+                paragraphs.append("")
+            else:
+                current.append(line)
+        if current:
+            paragraphs.append(" ".join(current))
+        value = "\n".join(paragraphs)
+
+    if marker.endswith("-"):
+        return value.rstrip("\n")
+    if marker.endswith("+"):
+        return value + "\n"
+    return value.rstrip("\n") + "\n"
 
 
 def _parse_scalar(raw: str) -> str:

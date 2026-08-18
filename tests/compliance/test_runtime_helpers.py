@@ -488,6 +488,35 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertTrue(runtime.cache_dir.is_dir())
             self.assertFalse((workspace / ".coding-tools").exists())
 
+    def test_command_env_activates_project_mise_tool_paths(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "mise.toml").write_text('[tools]\nnode = "24"\n', encoding="utf-8")
+            runtime = Runtime(workspace, shell_env_policy=ShellEnvPolicy(inherit="all"))
+            host_env = {
+                "PATH": "/usr/bin",
+                "MISE_SYSTEM_DATA_DIR": "/opt/mise",
+            }
+            mise_result = subprocess.CompletedProcess(
+                args=["/usr/bin/mise", "env"],
+                returncode=0,
+                stdout='{"PATH":"/project/mise/bin:/usr/bin","PROJECT_ROOT":"/project"}\n',
+                stderr="",
+            )
+            with (
+                patch.dict(server_module.os.environ, host_env, clear=True),
+                patch.object(server_module.shutil, "which", return_value="/usr/bin/mise"),
+                patch.object(server_module.subprocess, "run", return_value=mise_result) as run,
+            ):
+                env = runtime._command_env({}, workdir=workspace)
+
+            self.assertEqual(env.get("PATH"), "/project/mise/bin:/usr/bin")
+            self.assertNotIn("PROJECT_ROOT", env)
+            self.assertEqual(
+                run.call_args.args[0],
+                ["/usr/bin/mise", "env", "--json", "--cd", str(workspace)],
+            )
+
     def test_command_env_uses_external_home_tmp_and_cache_without_ecosystem_cache_vars(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
