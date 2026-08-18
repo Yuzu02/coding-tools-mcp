@@ -3532,6 +3532,8 @@ class Runtime:
     def _git_path_filters(self, args: dict[str, Any], *, workdir: Path, repo_root: Path) -> list[str]:
         filters: list[str] = []
         for raw_path in self._raw_git_path_filters(args):
+            if raw_path == ".":
+                continue
             resolved = self.workspace.resolve_for_write_at(workdir, raw_path)
             if not is_relative_to(resolved.path, repo_root):
                 raise ToolFailure("PATH_OUTSIDE_WORKSPACE", "Git path filter escapes the selected repository.", category="security")

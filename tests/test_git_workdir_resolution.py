@@ -114,6 +114,24 @@ class GitWorkdirResolutionTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_git_log_accepts_explicit_schema_default_path(self) -> None:
+        temporary, workspace, _, _ = self.make_workspace()
+        with temporary:
+            runtime = Runtime(workspace)
+            try:
+                schema_default = input_schemas()["git_log"]["properties"]["path"]["default"]
+                self.assertEqual(schema_default, ".")
+
+                omitted = runtime.git_log({"workdir": "alpha", "max_count": 5})
+                explicit = runtime.git_log(
+                    {"workdir": "alpha", "path": schema_default, "max_count": 5}
+                )
+
+                self.assertEqual(explicit["commits"], omitted["commits"])
+                self.assertEqual(explicit["path"], ".")
+            finally:
+                runtime.close()
+
     def test_path_filter_cannot_escape_selected_repository(self) -> None:
         temporary, workspace, _, _ = self.make_workspace()
         with temporary:
