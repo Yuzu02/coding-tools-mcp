@@ -243,17 +243,30 @@ class CredentialAdmin:
         return result
 
     def _audit_broker(self) -> dict[str, Any]:
-        result = self._audit_tree(self.broker_dir, expected_uid=0, expected_gid=self.service_gid, root_mode=0o710, file_mode=0o600)
-        if result["exists"] and self.service_uid is not None:
+        result: dict[str, Any] = {"exists": self.broker_dir.exists(), "safe": True, "items": 0, "unsafe": []}
+        if not self.broker_dir.exists() or self.broker_dir.is_symlink():
+            result["safe"] = False
+            return result
+        try:
+            root_info = self.broker_dir.lstat()
+            result["items"] = 1
+            if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0 or root_info.st_gid != self.service_gid or root_info.st_mode & 0o777 != 0o710:
+                result["unsafe"].append(str(self.broker_dir))
+        except OSError:
+            result["safe"] = False
+            return result
+        if self.service_uid is not None:
             for node in self.broker_dir.rglob("*"):
+                result["items"] += 1
                 try:
                     info = node.lstat()
                 except OSError:
+                    result["unsafe"].append(str(node))
                     continue
                 expected_mode = 0o700 if stat.S_ISDIR(info.st_mode) else 0o600
-                if info.st_uid != self.service_uid or info.st_gid != self.service_gid or info.st_mode & 0o777 != expected_mode:
+                if (not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode)) or info.st_uid != self.service_uid or info.st_gid != self.service_gid or info.st_mode & 0o777 != expected_mode:
                     result["unsafe"].append(str(node))
-            result["safe"] = not result["unsafe"]
+        result["safe"] = not result["unsafe"]
         return result
 
     @staticmethod

@@ -105,6 +105,16 @@ class CredentialAdminTests(unittest.TestCase):
         report = self.admin.doctor()
         self.assertFalse(report["checks"]["broker"]["safe"])
 
+    def test_provisioned_broker_layout_is_healthy(self) -> None:
+        self.admin.provision(self.request(), apply=True, euid=0)
+        report = self.admin.doctor()
+        # The test simulates root gating; ownership is only asserted when the
+        # process can actually chown the parent directories.
+        if os.geteuid() == 0:
+            self.assertTrue(report["ok"])
+        else:
+            self.assertNotIn(str(self.broker / "example" / "state" / "secret.txt"), report["checks"]["broker"]["unsafe"])
+
     def test_doctor_marks_unsafe_layout(self) -> None:
         report = self.admin.doctor()
         self.assertFalse(report["ok"])
