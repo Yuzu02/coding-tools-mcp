@@ -6,7 +6,12 @@ import argparse
 import json
 from pathlib import Path
 
-from coding_tools_mcp.credential_admin import CredentialAdmin, CredentialAdminError, ProvisionRequest
+from coding_tools_mcp.credential_admin import (
+    DEFAULT_SYSTEM_UNIT,
+    CredentialAdmin,
+    CredentialAdminError,
+    ProvisionRequest,
+)
 
 
 def _env_path(value: str) -> tuple[str, str]:
@@ -27,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("list")
     doctor = commands.add_parser("doctor")
     doctor.add_argument("--system", action="store_true")
+    doctor.add_argument("--system-unit", default=DEFAULT_SYSTEM_UNIT)
     provision = commands.add_parser("provision")
     provision.add_argument("--name", required=True)
     provision.add_argument("--command", dest="commands", action="append", required=True)
@@ -49,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "list":
             report = admin.list()
         elif args.command == "doctor":
-            report = admin.doctor(system=args.system)
+            report = admin.doctor(system=args.system, system_unit=args.system_unit)
         elif args.command == "provision":
             request = ProvisionRequest(
                 args.name,

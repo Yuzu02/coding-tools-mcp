@@ -22,6 +22,22 @@ class CredentialAdminError(ValueError):
     pass
 
 
+DEFAULT_SYSTEM_UNIT = "coding-tools-mcp-unified.service"
+
+
+def _validate_system_unit(system_unit: str) -> str:
+    if (
+        not isinstance(system_unit, str)
+        or not system_unit
+        or system_unit.startswith("-")
+        or any(character.isspace() or ord(character) < 0x20 for character in system_unit)
+        or "/" in system_unit
+        or "\\" in system_unit
+    ):
+        raise CredentialAdminError("system unit must be a non-empty unit name without whitespace or path separators")
+    return system_unit
+
+
 @dataclass(frozen=True)
 class ProvisionRequest:
     name: str
@@ -230,9 +246,17 @@ class CredentialAdmin:
         snapshot = CredentialProviderRegistry(self.registry_dir, self.broker_dir).snapshot()
         return {"health": snapshot.health, "generation": snapshot.generation, "fingerprint": snapshot.fingerprint, "providers": [{"name": p.name, "commands": p.commands, "read_roots": tuple(map(str, p.read_roots)), "write_roots": tuple(map(str, p.write_roots)), "env_paths": tuple(key for key, _ in p.env_paths)} for p in snapshot.providers]}
 
-    def doctor(self, *, system: bool = False, euid: int | None = None, systemctl_runner: Any = None) -> dict[str, Any]:
+    def doctor(
+        self,
+        *,
+        system: bool = False,
+        system_unit: str = DEFAULT_SYSTEM_UNIT,
+        euid: int | None = None,
+        systemctl_runner: Any = None,
+    ) -> dict[str, Any]:
         if system:
             require_root(operation="doctor --system", euid=euid)
+            _validate_system_unit(system_unit)
         report = self.list()
         report["registry_dir"] = str(self.registry_dir)
         report["broker_dir"] = str(self.broker_dir)
@@ -242,7 +266,7 @@ class CredentialAdmin:
         if system:
             runner = systemctl_runner or subprocess.run
             try:
-                result = runner(["systemctl", "show", "--no-pager", "--property=LoadState,ActiveState,SubState", "coding-tools-mcp.service"], capture_output=True, text=True, check=False, timeout=5)
+                result = runner(["systemctl", "show", "--no-pager", "--property=LoadState,ActiveState,SubState", system_unit], capture_output=True, text=True, check=False, timeout=5)
                 report["systemctl"] = {"returncode": int(result.returncode), "status": result.stdout.strip()[:512]}
             except subprocess.TimeoutExpired:
                 report["systemctl"] = {"returncode": 124, "status": "timeout"}

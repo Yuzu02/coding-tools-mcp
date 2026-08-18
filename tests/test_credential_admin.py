@@ -160,6 +160,22 @@ class CredentialAdminTests(unittest.TestCase):
         report = self.admin.doctor(system=True, euid=0, systemctl_runner=runner)
         self.assertEqual(report["systemctl"]["returncode"], 0)
         self.assertEqual(calls[0][0:2], ["systemctl", "show"])
+        self.assertEqual(calls[0][-1], "coding-tools-mcp-unified.service")
+
+    def test_doctor_system_accepts_configured_system_unit(self) -> None:
+        calls: list[list[str]] = []
+        class Result:
+            returncode = 0
+            stdout = ""
+        def runner(command: list[str], **_kwargs: object) -> Result:
+            calls.append(command)
+            return Result()
+        self.admin.doctor(system=True, system_unit="coding-tools-mcp-fork.service", euid=0, systemctl_runner=runner)
+        self.assertEqual(calls[0][-1], "coding-tools-mcp-fork.service")
+
+    def test_doctor_system_rejects_unsafe_system_unit(self) -> None:
+        with self.assertRaisesRegex(CredentialAdminError, "system unit"):
+            self.admin.doctor(system=True, system_unit="--version", euid=0, systemctl_runner=lambda *_args, **_kwargs: None)
 
     def test_doctor_system_uses_timeout(self) -> None:
         seen: dict[str, object] = {}
@@ -179,6 +195,18 @@ class CredentialAdminCliTests(unittest.TestCase):
         help_text = build_parser().format_help()
         for command in ("list", "doctor", "provision", "remove"):
             self.assertIn(command, help_text)
+
+    def test_cli_doctor_system_unit_defaults_and_overrides(self) -> None:
+        from scripts.credentials import build_parser
+        defaults = build_parser().parse_args([
+            "--registry-dir", "/tmp/registry", "--broker-dir", "/tmp/broker", "doctor", "--system",
+        ])
+        override = build_parser().parse_args([
+            "--registry-dir", "/tmp/registry", "--broker-dir", "/tmp/broker", "doctor", "--system",
+            "--system-unit", "coding-tools-mcp-fork.service",
+        ])
+        self.assertEqual(defaults.system_unit, "coding-tools-mcp-unified.service")
+        self.assertEqual(override.system_unit, "coding-tools-mcp-fork.service")
 
     def test_cli_help_lists_environment_options(self) -> None:
         from scripts.credentials import build_parser
