@@ -114,6 +114,7 @@ for raw in sys.stdin.buffer:
             "mise_system_data_dir": os.environ.get("MISE_SYSTEM_DATA_DIR"),
             "mise_config_dir": os.environ.get("MISE_CONFIG_DIR"),
             "mise_trusted_config_paths": os.environ.get("MISE_TRUSTED_CONFIG_PATHS"),
+            "uv_python_install_dir": os.environ.get("UV_PYTHON_INSTALL_DIR"),
             "uv_offline": os.environ.get("UV_OFFLINE"),
             "npm_offline": os.environ.get("NPM_CONFIG_OFFLINE"),
         }
@@ -220,6 +221,7 @@ class SemanticSerenaBackendTests(unittest.TestCase):
         source_env["MISE_SYSTEM_DATA_DIR"] = "/opt/mise-data"
         source_env["MISE_CONFIG_DIR"] = "/dev/null"
         source_env["MISE_TRUSTED_CONFIG_PATHS"] = "/workspace/a:/workspace/b"
+        source_env["UV_PYTHON_INSTALL_DIR"] = "/opt/uv-python"
         return _SerenaWorker(
             project=self.alpha,
             state_dir=self.root / f"state-{mode}",
@@ -318,6 +320,7 @@ class SemanticSerenaBackendTests(unittest.TestCase):
         self.assertEqual(environment["mise_system_data_dir"], "/opt/mise-data")
         self.assertEqual(environment["mise_config_dir"], "/dev/null")
         self.assertEqual(environment["mise_trusted_config_paths"], "/workspace/a:/workspace/b")
+        self.assertEqual(environment["uv_python_install_dir"], "/opt/uv-python")
         self.assertEqual(environment["uv_offline"], "1")
         self.assertEqual(environment["npm_offline"], "true")
 
