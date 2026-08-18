@@ -1,5 +1,13 @@
 # Nota de diseño: Work Items y estado por workspace
 
+**Estado:** nota precursora; el diseño canónico actual para Work Items,
+claims/leases y coordinación con worktrees es
+[`docs/superpowers/specs/2026-08-18-work-items-worktree-coordination-design.md`](superpowers/specs/2026-08-18-work-items-worktree-coordination-design.md).
+
+Esta nota conserva las decisiones iniciales que siguen siendo útiles. Cuando
+exista conflicto de identidad, configuración, worktree routing, Worktrunk,
+sandbox o persistencia, el spec de 2026-08-18 prevalece.
+
 Esta nota registra las decisiones de diseño para una extensión aditiva del
 runtime. No modifica ni reemplaza el contrato MCP v0.3 descrito en
 [`SPEC.md`](../SPEC.md) y [`docs/runtime-contract-v0.3.md`](runtime-contract-v0.3.md).

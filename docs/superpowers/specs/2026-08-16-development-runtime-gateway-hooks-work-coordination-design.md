@@ -9,8 +9,17 @@ Repository: `coding-tools-mcp`
 **Supersession note:** its proposed global/workspace configuration precedence
 and `${ENV:NAME}` secret-reference syntax are superseded by the implemented
 HostConfig v2 / ProjectConfig v1 authority model. This document remains
-proposed for Hooks, Work Items, and Gateway only; it does not authorize those
+proposed for Hooks and Gateway; its Work Items/worktree portion is retained as
+historical design context and superseded below. It does not authorize those
 features or redefine the deployed v0.4 runtime.
+
+**Work coordination supersession:** the focused
+[`2026-08-18-work-items-worktree-coordination-design.md`](2026-08-18-work-items-worktree-coordination-design.md)
+is now authoritative for Work Items, claims/leases, worktree identity/routing,
+Worktrunk integration, and worktree-aware sandbox requirements. Sections 7-8
+below remain historical design context where that focused spec is more precise.
+Hooks and Gateway portions of this document remain proposed and are not
+superseded by the Work Items spec.
 
 This document specifies an additive vNext architecture for `coding-tools-mcp`.
 It preserves the current v0.3 coding runtime while defining the next layer of

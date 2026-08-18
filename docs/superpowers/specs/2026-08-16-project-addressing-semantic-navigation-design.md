@@ -65,6 +65,13 @@ Where the two designs conflict, this document makes these narrower replacements:
 
 Other vNext areas—configuration layering, hooks, Work Items, gateway policy, authentication, telemetry, and permission ceilings—remain unchanged unless a later design explicitly revises them.
 
+The later proposed
+[`2026-08-18-work-items-worktree-coordination-design.md`](2026-08-18-work-items-worktree-coordination-design.md)
+does exactly that for future worktree-aware addressing. It preserves stable
+`project_id` semantics while proposing an optional `worktree_id` execution-root
+dimension. That proposal does not change the implemented v0.4 routing contract
+until its own implementation plan is accepted and shipped.
+
 ### 2.2 Fork/upstream synchronization constraint
 
 This fork is upstream-syncable relative to the original `xyTom/coding-tools-mcp` mainline; it is not constrained to remain behavior-identical or purely additive.
