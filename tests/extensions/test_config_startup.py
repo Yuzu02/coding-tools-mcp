@@ -178,6 +178,40 @@ class ConfigStartupTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_build_runtime_propagates_host_exec_credential_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            credential_root = root / "credential-store"
+            credential_root.mkdir()
+            xdg_data = root / "xdg-data"
+            host = root / "host.toml"
+            write_host_config(
+                host,
+                workspace=workspace,
+                security_extra=(
+                    "[[security.exec_credentials]]",
+                    'name = "vercel"',
+                    'commands = ["vercel"]',
+                    f'read_roots = [{json.dumps(str(credential_root))}]',
+                    'env_passthrough = ["VERCEL_TOKEN"]',
+                    f'env_paths = ["XDG_DATA_HOME={xdg_data}"]',
+                ),
+            )
+            args = build_parser().parse_args(["--host-config", str(host)])
+
+            runtime = build_runtime(args, runtime_policy_from_args(args), emit_warning=False)
+            try:
+                self.assertEqual(len(runtime.exec_credentials), 1)
+                self.assertEqual(runtime.exec_credentials[0].name, "vercel")
+                self.assertEqual(
+                    runtime._exec_credential_read_roots("vercel whoami"),
+                    [str(credential_root.resolve())],
+                )
+            finally:
+                runtime.close()
+
     def test_host_runtime_state_and_cache_roots_govern_all_workspace_runtimes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

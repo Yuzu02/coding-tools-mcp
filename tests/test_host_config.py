@@ -88,6 +88,117 @@ class HostConfigTests(unittest.TestCase):
                     default_enabled=(),
                 )
 
+    def test_host_config_parses_exec_credential_providers_without_literal_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            vercel_store = root / "vercel-store"
+            vercel_session = root / "vercel-session"
+            path = root / "config.toml"
+            path.write_text(
+                "\n".join(
+                    (
+                        "config_version = 2",
+                        "[runtime]",
+                        f'bootstrap_workspace = "{workspace}"',
+                        "[security]",
+                        'auth_mode = "noauth"',
+                        "[[security.exec_credentials]]",
+                        'name = "vercel"',
+                        'commands = ["vercel"]',
+                        f'read_roots = ["{vercel_store}"]',
+                        f'write_roots = ["{vercel_session}"]',
+                        'env_passthrough = ["VERCEL_TOKEN"]',
+                        f'env_paths = ["XDG_DATA_HOME={root / "xdg-data"}"]',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_host_config(
+                path,
+                extension_schemas={},
+                default_enabled=(),
+            )
+
+            self.assertEqual(len(config.security.exec_credentials), 1)
+            provider = config.security.exec_credentials[0]
+            self.assertEqual(provider.name, "vercel")
+            self.assertEqual(provider.commands, ("vercel",))
+            self.assertEqual(provider.read_roots, (vercel_store.resolve(),))
+            self.assertEqual(provider.write_roots, (vercel_session.resolve(),))
+            self.assertEqual(provider.env_passthrough, ("VERCEL_TOKEN",))
+            self.assertEqual(provider.env_paths, (("XDG_DATA_HOME", (root / "xdg-data").resolve()),))
+
+    def test_host_config_rejects_secret_name_in_exec_credential_env_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            path = root / "config.toml"
+            path.write_text(
+                "\n".join(
+                    (
+                        "config_version = 2",
+                        "[runtime]",
+                        f'bootstrap_workspace = "{workspace}"',
+                        "[security]",
+                        "[[security.exec_credentials]]",
+                        'name = "bad"',
+                        'commands = ["vercel"]',
+                        f'env_paths = ["VERCEL_TOKEN={root / "literal-value-is-forbidden"}"]',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ConfigError, "secret-like environment variable"):
+                load_host_config(
+                    path,
+                    extension_schemas={},
+                    default_enabled=(),
+                )
+
+    def test_host_config_exec_credentials_cannot_override_isolated_process_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            for field_line in (
+                f'env_paths = ["HOME={root / "user-home"}"]',
+                'env_passthrough = ["HOME"]',
+                'env_passthrough = ["XDG_CONFIG_HOME"]',
+                'env_passthrough = ["PATH"]',
+            ):
+                with self.subTest(field_line=field_line):
+                    path = root / "config.toml"
+                    path.write_text(
+                        "\n".join(
+                            (
+                                "config_version = 2",
+                                "[runtime]",
+                                f'bootstrap_workspace = "{workspace}"',
+                                "[security]",
+                                "[[security.exec_credentials]]",
+                                'name = "bad"',
+                                'commands = ["vercel"]',
+                                field_line,
+                                "",
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ConfigError, "isolated process environment"):
+                        load_host_config(
+                            path,
+                            extension_schemas={},
+                            default_enabled=(),
+                        )
+
     def test_secret_ref_accepts_env_and_absolute_file(self) -> None:
         from coding_tools_mcp.host_config import parse_secret_ref
 

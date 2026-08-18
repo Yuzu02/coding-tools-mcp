@@ -57,6 +57,7 @@ from .extensions import (
 from .host_config import (
     ConfigSnapshot,
     HostConfig,
+    HostExecCredentialConfig,
     HostRuntimeConfig,
     build_developer_snapshot,
     build_host_snapshot,
@@ -1751,6 +1752,7 @@ class Runtime:
         extension_config: RuntimeConfig | None = None,
         extension_registry: ExtensionRegistry | None = None,
         config_snapshot: ConfigSnapshot | None = None,
+        exec_credentials: tuple[HostExecCredentialConfig, ...] = (),
     ) -> None:
         bootstrap_workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
@@ -1783,6 +1785,7 @@ class Runtime:
                 category="validation",
                 details={"supported": list(SHELL_ENV_INHERIT_CHOICES)},
             )
+        self.exec_credentials = tuple(exec_credentials)
         self.allow_network = allow_network or self.capabilities.network
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
@@ -2111,8 +2114,8 @@ class Runtime:
     def landlock_enabled(self) -> bool:
         return self.capabilities.landlock
 
-    def landlock_write_roots(self) -> list[Path]:
-        return [self.runtime_dir]
+    def landlock_write_roots(self, command: str | None = None) -> list[Path]:
+        return [self.runtime_dir, *self._exec_credential_write_roots(command)]
 
     def is_allowed_command_tmp_path(self, candidate: str) -> bool:
         if self.capabilities.skip_all_permissions:
@@ -2253,6 +2256,17 @@ class Runtime:
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
+            "exec_credential_providers": [
+                {
+                    "name": provider.name,
+                    "commands": list(provider.commands),
+                    "read_roots": [str(root) for root in provider.read_roots],
+                    "write_roots": [str(root) for root in provider.write_roots],
+                    "env_passthrough": list(provider.env_passthrough),
+                    "env_paths": {key: str(path) for key, path in provider.env_paths},
+                }
+                for provider in self.exec_credentials
+            ],
             # The static budget only: how often it was actually hit is a
             # runtime-wide counter and is reported in telemetry, not to
             # whichever client happened to ask.
@@ -3109,7 +3123,7 @@ class Runtime:
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
         explicit_env = args.get("env", {})
-        env = self._command_env(explicit_env, workdir=workdir.path)
+        env = self._command_env(explicit_env, workdir=workdir.path, command=cmd)
         client_request_id = self._validated_client_request_id(args.get("client_request_id"))
         client_binding: ClientRequestBinding | None = None
         if client_request_id is not None:
@@ -3137,8 +3151,8 @@ class Runtime:
             try:
                 landlock_fd = open_landlock_ruleset(
                     self.workspace.root,
-                    guard_allow_roots(),
-                    write_roots=self.landlock_write_roots(),
+                    guard_allow_roots() + self._exec_credential_read_roots(cmd),
+                    write_roots=self.landlock_write_roots(cmd),
                 )
                 popen_cmd = landlock_exec_argv(landlock_fd, cmd)
                 popen_shell = False
@@ -3437,7 +3451,49 @@ class Runtime:
         path = activated.get("PATH") if isinstance(activated, dict) else None
         return path if isinstance(path, str) and path else None
 
-    def _command_env(self, extra: Any, *, workdir: Path | None = None) -> dict[str, str]:
+    def _exec_credential_provider(self, command: str | None) -> HostExecCredentialConfig | None:
+        if not command or not self.exec_credentials:
+            return None
+        if "\n" in command or "\r" in command or SHELL_EXPANSION_RE.search(command):
+            return None
+        try:
+            tokens = shlex_split(command)
+        except ValueError:
+            return None
+        if not tokens or is_env_assignment_token(tokens[0]):
+            return None
+        if any(token in SHELL_CONTROL_TOKENS or token in REDIRECTION_TOKENS or token in HEREDOC_TOKENS for token in tokens):
+            return None
+        executables = command_executables(tokens)
+        if len(executables) != 1:
+            return None
+        executable = executables[0].replace("\\", "/")
+        if "/" in executable:
+            return None
+        return next(
+            (provider for provider in self.exec_credentials if executable in provider.commands),
+            None,
+        )
+
+    def _exec_credential_read_roots(self, command: str | None) -> list[str]:
+        provider = self._exec_credential_provider(command)
+        if provider is None:
+            return []
+        return [str(root) for root in provider.read_roots]
+
+    def _exec_credential_write_roots(self, command: str | None) -> list[Path]:
+        provider = self._exec_credential_provider(command)
+        if provider is None:
+            return []
+        return list(provider.write_roots)
+
+    def _command_env(
+        self,
+        extra: Any,
+        *,
+        workdir: Path | None = None,
+        command: str | None = None,
+    ) -> dict[str, str]:
         inherited_bootstrap_roots = (
             mcp_bootstrap_venv_roots({str(key): str(value) for key, value in os.environ.items()})
             if self.shell_env_policy.inherit != "none"
@@ -3445,6 +3501,8 @@ class Runtime:
         )
         env = self._base_command_env()
         env = sanitize_mcp_bootstrap_environment(env, venv_roots=inherited_bootstrap_roots)
+        if self.exec_credentials:
+            env = {key: value for key, value in env.items() if not SENSITIVE_ENV_RE.search(key)}
         if not self.dangerously_skip_all_permissions:
             env = {key: value for key, value in env.items() if not is_filtered_env_var(key, value)}
             env = {key: value for key, value in env.items() if key not in ECOSYSTEM_CACHE_ENV_NAMES}
@@ -3481,9 +3539,19 @@ class Runtime:
             for key, value in extra.items():
                 key_text = str(key)
                 value_text = str(value)
+                if self.exec_credentials and SENSITIVE_ENV_RE.search(key_text):
+                    continue
                 if not self.dangerously_skip_all_permissions and is_filtered_env_var(key_text, value_text):
                     continue
                 env[key_text] = value_text
+        provider = self._exec_credential_provider(command)
+        if provider is not None:
+            for key in provider.env_passthrough:
+                value = os.environ.get(key)
+                if value is not None:
+                    env[key] = value
+            for key, path in provider.env_paths:
+                env[key] = str(path)
         return env
 
     def _git_env(self) -> dict[str, str]:
@@ -6655,6 +6723,7 @@ def build_runtime(
     workspace = developer_workspace
     enable_view_image = args.enable_view_image
     effective_transport = transport
+    exec_credentials: tuple[HostExecCredentialConfig, ...] = ()
     if snapshot.resolution_mode == "host":
         host_config = snapshot.host_config
         if host_config is None or host_config.runtime is None:
@@ -6663,6 +6732,7 @@ def build_runtime(
         effective_policy = runtime_policy_from_host_config(host_config)
         enable_view_image = host_config.runtime.enable_view_image
         effective_transport = host_config.transport.kind
+        exec_credentials = host_config.security.exec_credentials
     runtime = Runtime(
         workspace,
         enable_view_image=enable_view_image,
@@ -6678,6 +6748,7 @@ def build_runtime(
         extension_config=snapshot.runtime_config,
         extension_registry=registry,
         config_snapshot=snapshot,
+        exec_credentials=exec_credentials,
     )
     if emit_warning and runtime.capabilities.skip_all_permissions:
         print(

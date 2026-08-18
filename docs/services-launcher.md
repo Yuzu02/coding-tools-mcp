@@ -466,6 +466,13 @@ shell_env_inherit = "all"
 allow_network = true
 auth_mode = "noauth"
 
+[[security.exec_credentials]]
+name = "example-cli"
+commands = ["example-cli"]
+write_roots = ["/home/codingtools/.config/example-cli"]
+env_passthrough = ["EXAMPLE_CLI_TOKEN"]
+env_paths = ["EXAMPLE_CLI_CONFIG_DIR=/home/codingtools/.config/example-cli"]
+
 [extensions]
 enabled = ["projects"]
 
@@ -482,6 +489,29 @@ mode = "profile-file"
 profile_file = "/etc/coding-tools-mcp/tunnel.yaml"
 api_key_ref = "env:CONTROL_PLANE_API_KEY"
 ```
+
+`security.exec_credentials` is an operator-controlled credential boundary for
+`exec_command`. Each provider names one or more executable basenames and may
+grant only the filesystem roots and parent-process environment variables that
+those CLIs need. `env_paths` accepts only `NAME=/absolute/path` entries and
+rejects secret-like variable names, so literal tokens do not belong in
+HostConfig. `env_passthrough` contains names only; values remain outside the
+configuration and are injected only for a matching simple command. When at
+least one provider is configured, inherited credential-like environment
+variables are removed from other commands, including in `dangerous` mode.
+
+Provider activation is deliberately conservative: pipelines, shell control
+operators, redirections, multiline commands, command substitutions, and
+explicit executable paths do not receive provider credentials. Read/write
+roots are also command-scoped when Landlock is enabled. `server_info` reports
+provider names, command allowlists, root paths, and environment-variable names
+for auditability, but never environment values.
+
+`ProtectHome=tmpfs` still applies outside the MCP process. If a provider points
+at a credential store under a protected home directory, expose only that exact
+store in the unit namespace: use `BindReadOnlyPaths=` for a read-only store or
+`BindPaths=` when the CLI must refresh/persist its session. Do not bind an
+entire home or config directory merely to make credential discovery work.
 
 Provision the runtime/state/cache/log roots outside the source tree and make
 them writable by the service account before preflight.

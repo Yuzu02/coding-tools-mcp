@@ -19,6 +19,7 @@ from unittest.mock import patch
 from coding_tools_mcp import server as server_module
 from coding_tools_mcp import processes as processes_module
 from coding_tools_mcp import telemetry as telemetry_module
+from coding_tools_mcp.host_config import HostExecCredentialConfig
 from coding_tools_mcp.patching import (
     AtomicPatchCommitter,
     FileBaseline,
@@ -516,6 +517,114 @@ class RuntimeHelperTests(unittest.TestCase):
                 run.call_args.args[0],
                 ["/usr/bin/mise", "env", "--json", "--cd", str(workspace)],
             )
+
+    def test_exec_credential_provider_passthrough_is_command_scoped_and_keeps_home_isolated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            credential_root = root / "credential-store"
+            credential_root.mkdir()
+            xdg_data = root / "xdg-data"
+            provider = HostExecCredentialConfig(
+                name="vercel",
+                commands=("vercel",),
+                read_roots=(credential_root,),
+                env_passthrough=("VERCEL_TOKEN",),
+                env_paths=(("XDG_DATA_HOME", xdg_data),),
+            )
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=ShellEnvPolicy(inherit="all"),
+                exec_credentials=(provider,),
+            )
+            host_env = {
+                "PATH": "/usr/bin",
+                "VERCEL_TOKEN": "credential-for-test-only",
+                "UNRELATED_API_KEY": "must-not-leak",
+                "XDG_DATA_HOME": "/ambient/data",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                direct = runtime._command_env({}, workdir=workspace, command="vercel whoami")
+                unrelated = runtime._command_env({}, workdir=workspace, command="printf ok")
+                compound = runtime._command_env({}, workdir=workspace, command="vercel whoami; printf nope")
+                multiline = runtime._command_env({}, workdir=workspace, command="vercel whoami\nprintf nope")
+
+            self.assertEqual(direct.get("VERCEL_TOKEN"), "credential-for-test-only")
+            self.assertEqual(direct.get("XDG_DATA_HOME"), str(xdg_data.resolve()))
+            self.assertEqual(direct.get("HOME"), str(runtime.command_home_dir()))
+            self.assertNotEqual(direct.get("HOME"), str(Path.home()))
+            self.assertNotIn("UNRELATED_API_KEY", direct)
+            info = runtime.server_info_payload()
+            self.assertEqual(
+                info.get("exec_credential_providers"),
+                [
+                    {
+                        "name": "vercel",
+                        "commands": ["vercel"],
+                        "read_roots": [str(credential_root.resolve())],
+                        "write_roots": [],
+                        "env_passthrough": ["VERCEL_TOKEN"],
+                        "env_paths": {"XDG_DATA_HOME": str(xdg_data.resolve())},
+                    }
+                ],
+            )
+            for env in (unrelated, compound, multiline):
+                self.assertNotIn("VERCEL_TOKEN", env)
+                self.assertNotIn("UNRELATED_API_KEY", env)
+                self.assertNotEqual(env.get("XDG_DATA_HOME"), str(xdg_data.resolve()))
+
+    def test_exec_credential_provider_filesystem_roots_only_apply_to_simple_allowlisted_command(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            credential_root = root / "credential-store"
+            credential_root.mkdir()
+            writable_root = root / "credential-session"
+            writable_root.mkdir()
+            provider = HostExecCredentialConfig(
+                name="neon",
+                commands=("neon",),
+                read_roots=(credential_root,),
+                write_roots=(writable_root,),
+            )
+            runtime = Runtime(workspace, exec_credentials=(provider,))
+
+            self.assertEqual(runtime._exec_credential_read_roots("neon projects list"), [str(credential_root.resolve())])
+            self.assertEqual(runtime._exec_credential_write_roots("neon projects list"), [writable_root.resolve()])
+            for command in (
+                "printf ok",
+                "HOME=/home/example neon projects list",
+                "NEON_API_KEY=inline-secret neon projects list",
+                "neon projects list | cat",
+                "neon projects list; cat credentials.json",
+                "neon projects list\ncat credentials.json",
+                "neon $(printf projects) list",
+            ):
+                with self.subTest(command=command):
+                    self.assertEqual(runtime._exec_credential_read_roots(command), [])
+                    self.assertEqual(runtime._exec_credential_write_roots(command), [])
+
+    def test_exec_command_passes_provider_write_root_to_landlock_only_for_matching_command(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            writable_root = root / "credential-session"
+            writable_root.mkdir()
+            provider = HostExecCredentialConfig(
+                name="printf-provider",
+                commands=("printf",),
+                write_roots=(writable_root,),
+            )
+            runtime = Runtime(workspace, exec_credentials=(provider,))
+
+            with fake_landlock_exec() as captured:
+                runtime.exec_command({"cmd": "printf ok", "timeout_ms": 5000, "yield_time_ms": 0})
+
+            self.assertEqual(captured.get("write_roots"), [runtime.runtime_dir, writable_root.resolve()])
 
     def test_command_env_uses_external_home_tmp_and_cache_without_ecosystem_cache_vars(self) -> None:
         with TemporaryDirectory() as tmp:
