@@ -2,7 +2,7 @@
 
 ## Result
 
-Commit: `待定` (docs: document credential provider migration)
+Commit: `62c261e` (docs: document credential provider migration)
 
 Owned files:
 

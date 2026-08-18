@@ -21,7 +21,7 @@ class CredentialAdminTests(unittest.TestCase):
         self.broker = root / "broker"
         self.registry.mkdir()
         self.broker.mkdir()
-        self.admin = CredentialAdmin(self.registry, self.broker, service_uid=os.geteuid())
+        self.admin = CredentialAdmin(self.registry, self.broker, service_uid=os.geteuid(), service_gid=os.getegid())
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -40,6 +40,17 @@ class CredentialAdminTests(unittest.TestCase):
         self.assertEqual(report["action"], "provision")
         self.assertFalse((self.registry / "example.toml").exists())
         self.assertFalse((self.broker / "example").exists())
+
+    def test_dry_run_rejects_malformed_command(self) -> None:
+        request = self.request()
+        malformed = ProvisionRequest(request.name, ("bad command",), request.source, request.read_roots, request.write_roots)
+        with self.assertRaises(CredentialAdminError):
+            self.admin.provision(malformed, apply=False)
+
+    def test_apply_requires_explicit_service_account(self) -> None:
+        admin = CredentialAdmin(self.registry, self.broker)
+        with self.assertRaisesRegex(CredentialAdminError, "service UID and GID"):
+            admin.provision(self.request(), apply=True, euid=0)
 
     def test_apply_requires_root(self) -> None:
         with self.assertRaisesRegex(CredentialAdminError, "explicit root"):
@@ -74,6 +85,24 @@ class CredentialAdminTests(unittest.TestCase):
         self.admin.provision(self.request(), apply=True, euid=0)
         output = json.dumps(self.admin.list()) + json.dumps(self.admin.doctor())
         self.assertNotIn("do-not-print", output)
+
+    def test_doctor_reports_mode_and_owner_violations(self) -> None:
+        self.admin.provision(self.request(), apply=True, euid=0)
+        (self.broker / "example" / "state" / "secret.txt").chmod(0o644)
+        report = self.admin.doctor()
+        self.assertFalse(report["checks"]["broker"]["safe"])
+
+    def test_doctor_system_uses_bounded_systemctl_show(self) -> None:
+        calls: list[list[str]] = []
+        class Result:
+            returncode = 0
+            stdout = "LoadState=loaded\nActiveState=active\nSubState=running\n"
+        def runner(command: list[str], **_kwargs: object) -> Result:
+            calls.append(command)
+            return Result()
+        report = self.admin.doctor(system=True, euid=0, systemctl_runner=runner)
+        self.assertEqual(report["systemctl"]["returncode"], 0)
+        self.assertEqual(calls[0][0:2], ["systemctl", "show"])
 
 
 class CredentialAdminCliTests(unittest.TestCase):

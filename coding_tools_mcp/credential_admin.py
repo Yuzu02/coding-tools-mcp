@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,8 +79,8 @@ class CredentialAdmin:
     def __init__(self, registry_dir: Path, broker_dir: Path, *, service_uid: int | None = None, service_gid: int | None = None) -> None:
         self.registry_dir = Path(registry_dir).expanduser().resolve(strict=False)
         self.broker_dir = Path(broker_dir).expanduser().resolve(strict=False)
-        self.service_uid = os.getuid() if service_uid is None else service_uid
-        self.service_gid = os.getgid() if service_gid is None else service_gid
+        self.service_uid = service_uid
+        self.service_gid = service_gid
 
     def _fragment(self, request: ProvisionRequest, target: Path) -> str:
         _safe_name(request.name)
@@ -120,20 +121,20 @@ class CredentialAdmin:
         fragment = self.registry_dir / f"{request.name}.toml"
         text = self._fragment(request, target)
         report: dict[str, Any] = {"action": "provision", "provider": request.name, "fragment": str(fragment), "broker": str(target), "apply": apply}
+        self._validate_fragment(text, request.name)
         if not apply:
             return report
         require_root(operation="provision", euid=euid)
+        if self.service_uid is None or self.service_gid is None:
+            raise CredentialAdminError("provision requires explicit service UID and GID")
         # Validate against the established parser before touching the broker.
-        with tempfile.TemporaryDirectory(prefix=".validate-", dir=self.registry_dir.parent) as validation_root:
-            validation_dir = Path(validation_root) / "registry"
-            validation_dir.mkdir()
-            temporary_fragment = validation_dir / f"{request.name}.toml"
-            atomic_write_fragment(temporary_fragment, text)
-            snapshot = CredentialProviderRegistry(validation_dir, self.broker_dir).snapshot()
-            if snapshot.health != "healthy":
-                raise CredentialAdminError("proposed credential provider fragment is invalid")
+        self._validate_fragment(text, request.name)
         self.broker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.registry_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.broker_dir, 0o700)
+        os.chmod(self.registry_dir, 0o700)
+        if os.geteuid() == 0:
+            os.chown(self.registry_dir, 0, 0)
         with tempfile.TemporaryDirectory(prefix=f".{request.name}.", dir=self.broker_dir) as temporary:
             stage = Path(temporary) / request.name
             stage.mkdir(mode=0o700)
@@ -148,6 +149,16 @@ class CredentialAdmin:
             os.replace(stage, target)
         atomic_write_fragment(fragment, text)
         return report
+
+    def _validate_fragment(self, text: str, name: str) -> None:
+        with tempfile.TemporaryDirectory(prefix=".validate-", dir=self.registry_dir.parent) as validation_root:
+            validation_dir = Path(validation_root) / "registry"
+            validation_dir.mkdir()
+            temporary_fragment = validation_dir / f"{name}.toml"
+            atomic_write_fragment(temporary_fragment, text)
+            snapshot = CredentialProviderRegistry(validation_dir, self.broker_dir).snapshot()
+            if snapshot.health != "healthy":
+                raise CredentialAdminError("proposed credential provider fragment is invalid")
 
     def _copy_node(self, source: Path, destination: Path) -> None:
         mode = source.lstat().st_mode
@@ -175,17 +186,18 @@ class CredentialAdmin:
         snapshot = CredentialProviderRegistry(self.registry_dir, self.broker_dir).snapshot()
         return {"health": snapshot.health, "generation": snapshot.generation, "fingerprint": snapshot.fingerprint, "providers": [{"name": p.name, "commands": p.commands, "read_roots": tuple(map(str, p.read_roots)), "write_roots": tuple(map(str, p.write_roots)), "env_paths": tuple(key for key, _ in p.env_paths)} for p in snapshot.providers]}
 
-    def doctor(self, *, system: bool = False, euid: int | None = None) -> dict[str, Any]:
+    def doctor(self, *, system: bool = False, euid: int | None = None, systemctl_runner: Any = None) -> dict[str, Any]:
         if system:
             require_root(operation="doctor --system", euid=euid)
         report = self.list()
         report["registry_dir"] = str(self.registry_dir)
         report["broker_dir"] = str(self.broker_dir)
         report["system_requested"] = system
-        report["checks"] = {
-            "registry_directory": self._directory_check(self.registry_dir),
-            "broker_directory": self._directory_check(self.broker_dir),
-        }
+        report["checks"] = {"registry": self._audit_tree(self.registry_dir, expected_uid=0, expected_gid=0, is_registry=True), "broker": self._audit_tree(self.broker_dir, expected_uid=self.service_uid, expected_gid=self.service_gid)}
+        if system:
+            runner = systemctl_runner or subprocess.run
+            result = runner(["systemctl", "show", "--no-pager", "--property=LoadState,ActiveState,SubState", "coding-tools-mcp.service"], capture_output=True, text=True, check=False)
+            report["systemctl"] = {"returncode": int(result.returncode), "status": result.stdout.strip()[:512]}
         return report
 
     @staticmethod
@@ -197,6 +209,29 @@ class CredentialAdmin:
         except OSError:
             return {"exists": False, "safe": True, "mode": None}
         return {"exists": True, "safe": stat.S_ISDIR(mode), "mode": oct(mode & 0o777)}
+
+    @staticmethod
+    def _audit_tree(path: Path, *, expected_uid: int | None, expected_gid: int | None, is_registry: bool = False) -> dict[str, Any]:
+        result: dict[str, Any] = {"exists": path.exists(), "safe": True, "items": 0, "unsafe": []}
+        if not path.exists() or path.is_symlink():
+            result["safe"] = False
+            return result
+        nodes = [path, *path.rglob("*")]
+        for node in nodes:
+            result["items"] += 1
+            try:
+                info = node.lstat()
+            except OSError:
+                result["safe"] = False
+                continue
+            expected_mode = 0o700 if stat.S_ISDIR(info.st_mode) else 0o600
+            if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+                result["unsafe"].append(str(node))
+                continue
+            if info.st_uid != expected_uid or info.st_gid != expected_gid or info.st_mode & 0o777 != expected_mode:
+                result["unsafe"].append(str(node))
+        result["safe"] = not result["unsafe"]
+        return result
 
     def remove(self, name: str, *, apply: bool = False, euid: int | None = None) -> dict[str, Any]:
         target = validated_provider_subtree(self.broker_dir, name)

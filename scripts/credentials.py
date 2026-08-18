@@ -13,6 +13,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="credentials")
     parser.add_argument("--registry-dir", type=Path, required=True)
     parser.add_argument("--broker-dir", type=Path, required=True)
+    parser.add_argument("--service-uid", type=int)
+    parser.add_argument("--service-gid", type=int)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list")
     doctor = commands.add_parser("doctor")
@@ -32,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    admin = CredentialAdmin(args.registry_dir, args.broker_dir)
+    admin = CredentialAdmin(args.registry_dir, args.broker_dir, service_uid=args.service_uid, service_gid=args.service_gid)
     if args.command == "list":
         report = admin.list()
     elif args.command == "doctor":
