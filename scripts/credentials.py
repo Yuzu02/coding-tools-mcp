@@ -9,6 +9,14 @@ from pathlib import Path
 from coding_tools_mcp.credential_admin import CredentialAdmin, CredentialAdminError, ProvisionRequest
 
 
+def _env_path(value: str) -> tuple[str, str]:
+    """Parse the CLI's NAME=relative-broker-path pair."""
+    name, separator, path = value.partition("=")
+    if not separator or not name or not path or Path(path).is_absolute():
+        raise argparse.ArgumentTypeError("must use NAME=relative-broker-path")
+    return name, path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="credentials")
     parser.add_argument("--registry-dir", type=Path, required=True)
@@ -25,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     provision.add_argument("--source", type=Path, required=True)
     provision.add_argument("--read-root", dest="read_roots", action="append", default=[])
     provision.add_argument("--write-root", dest="write_roots", action="append", default=["state"])
+    provision.add_argument("--env-path", dest="env_paths", type=_env_path, action="append", default=[])
+    provision.add_argument("--env-passthrough", dest="env_passthrough", action="append", default=[])
     provision.add_argument("--apply", action="store_true")
     remove = commands.add_parser("remove")
     remove.add_argument("name")
@@ -41,7 +51,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "doctor":
             report = admin.doctor(system=args.system)
         elif args.command == "provision":
-            request = ProvisionRequest(args.name, tuple(args.commands), args.source, tuple(args.read_roots), tuple(args.write_roots))
+            request = ProvisionRequest(
+                args.name,
+                tuple(args.commands),
+                args.source,
+                tuple(args.read_roots),
+                tuple(args.write_roots),
+                tuple(args.env_passthrough),
+                tuple(args.env_paths),
+            )
             report = admin.provision(request, apply=args.apply)
         else:
             report = admin.remove(args.name, apply=args.apply)

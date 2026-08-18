@@ -47,6 +47,25 @@ class CredentialAdminTests(unittest.TestCase):
         with self.assertRaises(CredentialAdminError):
             self.admin.provision(malformed, apply=False)
 
+    def test_dry_run_serializes_environment_paths_and_passthrough(self) -> None:
+        request = self.request()
+        request = ProvisionRequest(
+            request.name,
+            request.commands,
+            request.source,
+            request.read_roots,
+            request.write_roots,
+            env_passthrough=("GIT_AUTHOR_NAME",),
+            env_paths=(("GIT_CONFIG_GLOBAL", "gitconfig"), ("GH_CONFIG_DIR", "gh")),
+        )
+        self.admin.provision(request, apply=False)
+
+        fragment = self.admin._fragment(request, self.broker / "example")
+        self.assertIn('env_passthrough = ["GIT_AUTHOR_NAME"]', fragment)
+        self.assertIn(f'GIT_CONFIG_GLOBAL={self.broker / "example" / "gitconfig"}', fragment)
+        self.assertIn(f'GH_CONFIG_DIR={self.broker / "example" / "gh"}', fragment)
+        self.assertNotIn("do-not-print", fragment)
+
     def test_dry_run_rejects_invalid_existing_registry(self) -> None:
         (self.registry / "broken.toml").write_text('name="broken"\ncommands=[]\n', encoding="utf-8")
         with self.assertRaisesRegex(CredentialAdminError, "invalid"):
@@ -149,6 +168,37 @@ class CredentialAdminCliTests(unittest.TestCase):
         help_text = build_parser().format_help()
         for command in ("list", "doctor", "provision", "remove"):
             self.assertIn(command, help_text)
+
+    def test_cli_help_lists_environment_options(self) -> None:
+        from scripts.credentials import build_parser
+        help_text = build_parser().format_help()
+        provision_parser = next(
+            action.choices["provision"]
+            for action in build_parser()._actions
+            if hasattr(action, "choices") and action.choices
+        )
+        provision_help = provision_parser.format_help()
+        self.assertIn("--env-path", help_text + provision_help)
+        self.assertIn("--env-passthrough", help_text + provision_help)
+
+    def test_cli_parses_repeatable_environment_options(self) -> None:
+        from scripts.credentials import build_parser
+        args = build_parser().parse_args([
+            "--registry-dir", "/tmp/registry", "--broker-dir", "/tmp/broker", "provision",
+            "--name", "github", "--command", "gh", "--source", "/tmp/store",
+            "--env-path", "GIT_CONFIG_GLOBAL=gitconfig", "--env-path", "GH_CONFIG_DIR=gh",
+            "--env-passthrough", "GIT_AUTHOR_NAME", "--env-passthrough", "GIT_AUTHOR_EMAIL",
+        ])
+        self.assertEqual(args.env_paths, [("GIT_CONFIG_GLOBAL", "gitconfig"), ("GH_CONFIG_DIR", "gh")])
+        self.assertEqual(args.env_passthrough, ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"])
+
+    def test_cli_rejects_malformed_environment_path(self) -> None:
+        from scripts.credentials import build_parser
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args([
+                "--registry-dir", "/tmp/registry", "--broker-dir", "/tmp/broker", "provision",
+                "--name", "github", "--command", "gh", "--source", "/tmp/store", "--env-path", "not-a-pair",
+            ])
 
 
 if __name__ == "__main__":

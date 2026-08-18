@@ -100,7 +100,19 @@ class CredentialAdmin:
                 checked.append(str(candidate))
             roots[field] = tuple(checked)
         env_paths: list[str] = []
-        for key, value in request.env_paths:
+        for pair in request.env_paths:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise CredentialAdminError("declared environment path must use NAME=relative-broker-path")
+            key, value = pair
+            if (
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not key
+                or not value
+                or Path(value).is_absolute()
+                or any(part == ".." for part in Path(value).parts)
+            ):
+                raise CredentialAdminError("declared environment path must use NAME=relative-broker-path")
             candidate = (target / value).resolve(strict=False)
             try:
                 candidate.relative_to(target)
