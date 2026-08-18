@@ -571,7 +571,7 @@ class RuntimeHelperTests(unittest.TestCase):
             mise_result = subprocess.CompletedProcess(
                 args=["/usr/bin/mise", "env"],
                 returncode=0,
-                stdout='{"PATH":"/project/mise/bin:/usr/bin","PROJECT_ROOT":"/project"}\n',
+                stdout='{"PATH":"/project/mise/bin","PROJECT_ROOT":"/project"}\n',
                 stderr="",
             )
             with (
@@ -1183,6 +1183,7 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertIn("/usr/local/sdkman/candidates", roots)
         self.assertIn("/etc/gitconfig", roots)
         self.assertIn("/etc/gitconfig.d", roots)
+        self.assertIn("/etc/git/gitignore_global", roots)
         self.assertIn(str(java_home.resolve()), roots)
         self.assertIn(str(explicit_root.resolve()), roots)
         self.assertIn(str(explicit_file.resolve()), roots)

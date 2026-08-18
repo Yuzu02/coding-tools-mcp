@@ -363,6 +363,7 @@ OS_METADATA_READ_FILES = (
 GIT_READ_ROOTS = (
     "/etc/gitconfig",
     "/etc/gitconfig.d",
+    "/etc/git/gitignore_global",
 )
 SYSTEM_PATH_ROOT_PREFIXES = (
     "/bin",
@@ -3639,7 +3640,20 @@ class Runtime:
         except (TypeError, json.JSONDecodeError):
             return None
         path = activated.get("PATH") if isinstance(activated, dict) else None
-        return path if isinstance(path, str) and path else None
+        if not isinstance(path, str) or not path:
+            return None
+
+        # `mise env` may emit only its activated tool directories.  Keep the
+        # already-sanitized base PATH as a fallback so host-owned providers
+        # (for example neon/vercel) remain resolvable.  Do not add any paths
+        # here: activation may only augment the PATH that was already passed
+        # to mise, and bootstrap sanitization runs again at the call site.
+        base_entries = env["PATH"].split(os.pathsep)
+        entries: list[str] = []
+        for entry in (*path.split(os.pathsep), *base_entries):
+            if entry and entry not in entries:
+                entries.append(entry)
+        return os.pathsep.join(entries) or None
 
     def _exec_credential_provider(self, command: str | None) -> HostExecCredentialConfig | None:
         providers = self._active_exec_credentials()

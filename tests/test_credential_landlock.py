@@ -233,9 +233,11 @@ class CredentialLandlockTests(unittest.TestCase):
                 credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
             )
             try:
+                roots = runtime._credential_landlock_roots("echo ok", workspace)
                 isolation = runtime.server_info_payload()["credential_providers"]["filesystem_isolation"]
             finally:
                 runtime.close()
+            self.assertIn(Path("/etc/git/gitignore_global"), roots.read_roots)
             self.assertEqual(isolation["backend"], "landlock")
             self.assertEqual(isolation["enforced_for"], "all_exec")
             self.assertIn(isolation["status"], {"available", "unavailable"})
