@@ -508,6 +508,7 @@ Restart=on-failure
 RestartSec=5
 KillMode=control-group
 TimeoutStopSec=20
+SuccessExitStatus=130
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

@@ -90,6 +90,10 @@ class RequiredDocsTests(unittest.TestCase):
                 with self.subTest(path=rel_path, needle=needle):
                     self.assertIn(needle, text)
 
+    def test_services_launcher_systemd_example_accepts_interrupt_exit(self) -> None:
+        text = (ROOT / "docs/services-launcher.md").read_text(encoding="utf-8")
+        self.assertIn("SuccessExitStatus=130", text)
+
     def test_ci_workflows_include_required_gates(self) -> None:
         compliance = (ROOT / ".github/workflows/compliance.yml").read_text(encoding="utf-8")
         for needle in (
