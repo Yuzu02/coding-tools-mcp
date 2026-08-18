@@ -444,7 +444,9 @@ CONTROL_PLANE_API_KEY=replace-me
 ```
 
 Example private `/etc/coding-tools-mcp/config.toml` using only synthetic
-project paths and IDs:
+project paths and IDs. Credential providers are deliberately not declared in
+HostConfig; the launcher derives their registry and broker from this file's
+location and its `runtime.state_root`:
 
 ```toml
 config_version = 2
@@ -466,13 +468,6 @@ shell_env_inherit = "all"
 allow_network = true
 auth_mode = "noauth"
 
-[[security.exec_credentials]]
-name = "example-cli"
-commands = ["example-cli"]
-write_roots = ["/home/codingtools/.config/example-cli"]
-env_passthrough = ["EXAMPLE_CLI_TOKEN"]
-env_paths = ["EXAMPLE_CLI_CONFIG_DIR=/home/codingtools/.config/example-cli"]
-
 [extensions]
 enabled = ["projects"]
 
@@ -490,28 +485,63 @@ profile_file = "/etc/coding-tools-mcp/tunnel.yaml"
 api_key_ref = "env:CONTROL_PLANE_API_KEY"
 ```
 
-`security.exec_credentials` is an operator-controlled credential boundary for
-`exec_command`. Each provider names one or more executable basenames and may
-grant only the filesystem roots and parent-process environment variables that
-those CLIs need. `env_paths` accepts only `NAME=/absolute/path` entries and
-rejects secret-like variable names, so literal tokens do not belong in
-HostConfig. `env_passthrough` contains names only; values remain outside the
-configuration and are injected only for a matching simple command. When at
-least one provider is configured, inherited credential-like environment
-variables are removed from other commands, including in `dangerous` mode.
+### Dynamic credential providers
 
-Provider activation is deliberately conservative: pipelines, shell control
-operators, redirections, multiline commands, command substitutions, and
-explicit executable paths do not receive provider credentials. Read/write
-roots are also command-scoped when Landlock is enabled. `server_info` reports
-provider names, command allowlists, root paths, and environment-variable names
-for auditability, but never environment values.
+The host-owned provider registry is the only credential-provider authority for
+HostConfig deployments. It is the `credentials.d` directory beside the
+selected HostConfig, and the broker is always `<state-root>/credentials` (for
+the example above, `/var/lib/coding-tools-mcp/state/credentials`). The service
+account must be able to read the registry and its own broker subtrees; registry
+fragments should be root-managed and published atomically.
 
-`ProtectHome=tmpfs` still applies outside the MCP process. If a provider points
-at a credential store under a protected home directory, expose only that exact
-store in the unit namespace: use `BindReadOnlyPaths=` for a read-only store or
-`BindPaths=` when the CLI must refresh/persist its session. Do not bind an
-entire home or config directory merely to make credential discovery work.
+Each `credentials.d/*.toml` fragment contains one provider and names no secret
+values:
+
+```toml
+name = "example"
+commands = ["example-cli"]
+read_roots = ["/var/lib/coding-tools-mcp/state/credentials/example/read-only"]
+write_roots = ["/var/lib/coding-tools-mcp/state/credentials/example/state"]
+env_passthrough = ["EXAMPLE_TOKEN"]
+env_paths = ["EXAMPLE_CLI_CONFIG_DIR=/var/lib/coding-tools-mcp/state/credentials/example/state"]
+```
+
+`name` and each command are safe basenames. Every read/write root and every
+`env_paths` path must be a canonical descendant of that provider's broker
+subtree; symlinked roots and paths outside it are rejected. `env_passthrough`
+contains variable names only. Values come from the service environment and
+are granted only to the matching simple executable. Secret-like variable names
+are rejected from `env_paths`, and the isolated `HOME`, `PATH`, temporary, and
+XDG roots cannot be overridden. Never bind or copy a personal home directory:
+provision the required files into the provider's broker subtree instead.
+
+The registry is checked lazily before each `exec_command` and `server_info`.
+Changes to fragment names, metadata, size, timestamps, or contents create a
+new generation without restarting MCP. A malformed or unavailable generation
+is fail-closed: no providers, roots, or provider environment values are
+authorized, and `server_info.credential_providers.registry.health` is
+`invalid`. A healthy registry has `health = "healthy"`, a generation and a
+fingerprint. An empty configured directory is healthy with no providers.
+
+When a registry is configured, every command—not only provider commands—is
+started through the credential-isolation Landlock profile. Non-provider
+commands receive no broker root; a selected provider receives only its own
+declared roots. This all-command enforcement is the trade-off that prevents a
+`dangerous` non-provider command from opening every provider store: dangerous
+permission mode does not disable registry isolation. If the credential
+Landlock profile cannot be created or verified, the command is not started
+(fail closed). `server_info.credential_providers.filesystem_isolation` reports
+the backend, availability, and `enforced_for = "all_exec"`.
+
+For operations and dry-run behavior, use
+[credential-provider-migration.md](credential-provider-migration.md). The
+`credentials` tool is host-only and is never exposed as an MCP tool.
+
+`ProtectHome=tmpfs` still applies outside the MCP process. Providers must use
+their broker subtrees, not stores under a personal home, so no home bind is
+needed for credential discovery. Keep `BindPaths=` limited to the generic
+state root required by the service and never bind an entire home or config
+directory.
 
 Provision the runtime/state/cache/log roots outside the source tree and make
 them writable by the service account before preflight.
