@@ -28,11 +28,17 @@ The host-only `credentials` CLI takes `--registry-dir <dir>` and
 
 - `list`: path/provider metadata and registry health; dry-run and read-only by
   default.
-- `doctor`: registry and broker checks; add `--system` only when an explicit
-  root operator wants systemd checks.
+- `doctor`: registry and broker ownership/mode checks; pass the same
+  `--service-uid <uid> --service-gid <gid>` identity used by the systemd
+  service so broker ownership is checked against the real service account.
+  Add `--system` only for an explicit root operator: this is a separate root
+  gate and also queries systemd status.
 - `provision`: validates a source directory, stages a provider broker copy,
   and publishes its fragment; it is a plan by default and mutates only with
-  `--apply`.
+  `--apply`. An apply requires root plus explicit
+  `--service-uid <uid> --service-gid <gid>`; those values select the account
+  that owns the staged broker tree and must identify the service account, not
+  the invoking operator.
 - `remove <name>`: prints a removal plan by default and removes the named
   fragment and broker subtree only with `--apply`.
 
@@ -73,12 +79,14 @@ set -eu
 UNIT="<unit-name>"
 UNIT_FILE="<unit-file>"
 DROPIN="<drop-in-file>"
-HOST_CONFIG="<host-config-file>"
 REGISTRY_DIR="<registry-dir>"
 BROKER_DIR="<state-root>/credentials"
 BACKUP_DIR="<rollback-backup-dir>"
+SERVICE_UID="<service-account-uid>"
+SERVICE_GID="<service-account-gid>"
 
 rollback() {
+  trap - ERR
   systemctl stop "$UNIT" || true
   cp -- "$BACKUP_DIR/unit-before" "$UNIT_FILE"
   if test -f "$BACKUP_DIR/drop-in-before"; then
@@ -95,10 +103,12 @@ systemctl stop "$UNIT"
 mkdir -p -- "$BACKUP_DIR"
 cp -- "$UNIT_FILE" "$BACKUP_DIR/unit-before"
 if test -f "$DROPIN"; then cp -- "$DROPIN" "$BACKUP_DIR/drop-in-before"; fi
+trap rollback ERR
 
 # Stage and provision each broker copy; --apply is the only mutating CLI flag.
 uv run --locked python scripts/credentials.py \
-  --registry-dir "$REGISTRY_DIR" --broker-dir "$BROKER_DIR" provision \
+  --registry-dir "$REGISTRY_DIR" --broker-dir "$BROKER_DIR" \
+  --service-uid "$SERVICE_UID" --service-gid "$SERVICE_GID" provision \
   --name "<provider-name>" --command "<executable-basename>" \
   --source "<source-store>" --read-root "read-only" --write-root "state" --apply
 
@@ -111,13 +121,18 @@ grep -qF 'StateDirectory=<state-directory-name>' "$DROPIN" || \
 
 systemctl daemon-reload
 systemctl start "$UNIT"
+uv run --locked python scripts/credentials.py \
+  --registry-dir "$REGISTRY_DIR" --broker-dir "$BROKER_DIR" \
+  --service-uid "$SERVICE_UID" --service-gid "$SERVICE_GID" doctor
 curl --fail --silent "<local-health-url>" >/dev/null
 curl --fail --silent "<local-status-url>" >/dev/null
 uv run --locked python scripts/mcp_smoke.py "<local-mcp-url>" \
   --expect-permission-mode "<permission-mode>"
 
-# If any verification fails, run rollback once; it restores the saved unit and
+# Any failed command above triggers rollback automatically. To roll back after
+# a successful verification, run rollback once; it restores the saved unit and
 # drop-in, reloads systemd, and starts the prior service configuration.
+trap - ERR
 # rollback
 ```
 

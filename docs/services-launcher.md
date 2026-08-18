@@ -494,6 +494,14 @@ the example above, `/var/lib/coding-tools-mcp/state/credentials`). The service
 account must be able to read the registry and its own broker subtrees; registry
 fragments should be root-managed and published atomically.
 
+When using `scripts/credentials.py provision --apply`, pass the numeric
+`--service-uid <service-account-uid> --service-gid <service-account-gid>` for
+the account named by the unit's `User=`/`Group=`. The CLI uses those values to
+own and later audit the broker tree; they are not the invoking administrator's
+identity. `doctor` uses the same pair for ownership/mode checks, while
+`doctor --system` additionally requires explicit root and performs its
+systemd-status query.
+
 Each `credentials.d/*.toml` fragment contains one provider and names no secret
 values:
 
