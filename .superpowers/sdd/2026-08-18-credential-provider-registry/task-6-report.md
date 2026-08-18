@@ -47,6 +47,8 @@ rerunnable and rollback never deletes credential state.
   `doctor` exposes redacted `checks.*.safe` results and `doctor --system` keeps
   its explicit root gate. The documentation records the intended nonzero exit
   contract for unsafe checks; no host or migration command was executed.
+- `uv run python -m unittest tests.test_public_fork_hygiene -v` — passed (2
+  tests); removed private host/repository markers from the implementation plan.
 - Reviewed owned docs for stale `security.exec_credentials` authority and
   secret/tunnel-specific migration values — none found in the new provider
   guidance or migration block.

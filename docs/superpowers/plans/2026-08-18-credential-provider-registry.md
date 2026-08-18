@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work only in `/home/yuzu/repos/tools/coding-tools-mcp`; do not modify SICOTILab-SaaS.
+- Work only within this coding-tools-mcp repository; do not modify unrelated repositories.
 - Do not mount a home directory, print credential material, deploy, push, or use a worktree.
 - The MCP runtime must never mount filesystems, modify systemd, invoke sudo, or change ownership/modes outside its runtime directories.
 - A registry error must discard previous grants and scrub secret-like environment values; it must never preserve stale credential access.
