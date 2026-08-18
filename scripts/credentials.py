@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     except CredentialAdminError as exc:
         build_parser().error(str(exc))
     print(json.dumps(report, sort_keys=True))
-    return 0
+    return 0 if report.get("ok", True) else 1
 
 
 if __name__ == "__main__":

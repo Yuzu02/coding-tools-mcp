@@ -80,6 +80,9 @@ class CredentialAdminTests(unittest.TestCase):
         self.assertEqual(report["action"], "provision")
         self.assertEqual((self.broker / "example" / "state" / "secret.txt").stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.broker / "example").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.broker.stat().st_mode & 0o777, 0o710)
+        self.assertEqual(self.registry.stat().st_mode & 0o777, 0o750)
+        self.assertEqual((self.registry / "example.toml").stat().st_mode & 0o777, 0o640)
         self.assertIn('name = "example"', (self.registry / "example.toml").read_text())
 
     def test_remove_withdraws_fragment_before_broker_cleanup(self) -> None:
@@ -101,6 +104,10 @@ class CredentialAdminTests(unittest.TestCase):
         (self.broker / "example" / "state" / "secret.txt").chmod(0o644)
         report = self.admin.doctor()
         self.assertFalse(report["checks"]["broker"]["safe"])
+
+    def test_doctor_marks_unsafe_layout(self) -> None:
+        report = self.admin.doctor()
+        self.assertFalse(report["ok"])
 
     def test_doctor_system_uses_bounded_systemctl_show(self) -> None:
         calls: list[list[str]] = []

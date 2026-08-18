@@ -134,10 +134,11 @@ class CredentialAdmin:
         self._validate_fragment(text, request.name)
         self.broker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.registry_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.broker_dir, 0o700)
-        os.chmod(self.registry_dir, 0o700)
+        os.chmod(self.broker_dir, 0o710)
+        os.chmod(self.registry_dir, 0o750)
         if os.geteuid() == 0:
-            os.chown(self.registry_dir, 0, 0)
+            os.chown(self.broker_dir, 0, self.service_gid)
+            os.chown(self.registry_dir, 0, self.service_gid)
         with tempfile.TemporaryDirectory(prefix=f".{request.name}.", dir=self.broker_dir) as temporary:
             stage = Path(temporary) / request.name
             stage.mkdir(mode=0o700)
@@ -151,7 +152,13 @@ class CredentialAdmin:
                 self._remove_tree(target)
             os.replace(stage, target)
         atomic_write_fragment(fragment, text)
+        self._secure_fragment(fragment)
         return report
+
+    def _secure_fragment(self, fragment: Path) -> None:
+        os.chmod(fragment, 0o640)
+        if os.geteuid() == 0:
+            os.chown(fragment, 0, self.service_gid)
 
     def _validate_fragment(self, text: str, name: str) -> None:
         with tempfile.TemporaryDirectory(prefix=".validate-", dir=self.registry_dir.parent) as validation_root:
@@ -210,7 +217,8 @@ class CredentialAdmin:
         report["registry_dir"] = str(self.registry_dir)
         report["broker_dir"] = str(self.broker_dir)
         report["system_requested"] = system
-        report["checks"] = {"registry": self._audit_tree(self.registry_dir, expected_uid=0, expected_gid=0, is_registry=True), "broker": self._audit_tree(self.broker_dir, expected_uid=self.service_uid, expected_gid=self.service_gid)}
+        report["checks"] = {"registry": self._audit_registry(), "broker": self._audit_broker()}
+        report["ok"] = report["health"] == "healthy" and all(item["safe"] for item in report["checks"].values())
         if system:
             runner = systemctl_runner or subprocess.run
             try:
@@ -230,8 +238,26 @@ class CredentialAdmin:
             return {"exists": False, "safe": True, "mode": None}
         return {"exists": True, "safe": stat.S_ISDIR(mode), "mode": oct(mode & 0o777)}
 
+    def _audit_registry(self) -> dict[str, Any]:
+        result = self._audit_tree(self.registry_dir, expected_uid=0, expected_gid=self.service_gid, root_mode=0o750, file_mode=0o640)
+        return result
+
+    def _audit_broker(self) -> dict[str, Any]:
+        result = self._audit_tree(self.broker_dir, expected_uid=0, expected_gid=self.service_gid, root_mode=0o710, file_mode=0o600)
+        if result["exists"] and self.service_uid is not None:
+            for node in self.broker_dir.rglob("*"):
+                try:
+                    info = node.lstat()
+                except OSError:
+                    continue
+                expected_mode = 0o700 if stat.S_ISDIR(info.st_mode) else 0o600
+                if info.st_uid != self.service_uid or info.st_gid != self.service_gid or info.st_mode & 0o777 != expected_mode:
+                    result["unsafe"].append(str(node))
+            result["safe"] = not result["unsafe"]
+        return result
+
     @staticmethod
-    def _audit_tree(path: Path, *, expected_uid: int | None, expected_gid: int | None, is_registry: bool = False) -> dict[str, Any]:
+    def _audit_tree(path: Path, *, expected_uid: int | None, expected_gid: int | None, root_mode: int, file_mode: int) -> dict[str, Any]:
         result: dict[str, Any] = {"exists": path.exists(), "safe": True, "items": 0, "unsafe": []}
         if not path.exists() or path.is_symlink():
             result["safe"] = False
@@ -244,7 +270,7 @@ class CredentialAdmin:
             except OSError:
                 result["safe"] = False
                 continue
-            expected_mode = 0o700 if stat.S_ISDIR(info.st_mode) else 0o600
+            expected_mode = root_mode if node == path else (0o700 if stat.S_ISDIR(info.st_mode) else file_mode)
             if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
                 result["unsafe"].append(str(node))
                 continue
