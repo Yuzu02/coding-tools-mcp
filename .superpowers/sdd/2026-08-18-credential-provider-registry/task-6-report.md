@@ -29,6 +29,10 @@ safely distinguish its writes from pre-existing or concurrent state. Any
 cleanup therefore requires a separate, manually reviewed `doctor` plus
 dry-run/explicit `remove --apply` operation.
 
+The design spec and implementation plan now use the same wording: unit/drop-in
+rollback is deterministic, while credential provisioning is not blindly
+rerunnable and rollback never deletes credential state.
+
 ## Documentation-safe checks
 
 - `uv run --locked python scripts/credentials.py --help` — passed; all four
