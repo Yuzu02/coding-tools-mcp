@@ -68,9 +68,12 @@ The host-only `credentials` CLI takes `--registry-dir <dir>` and
   `--service-uid <uid> --service-gid <gid>` identity used by the systemd
   service so broker ownership is checked against the real service account.
   Add `--system` only for an explicit root operator: this is a separate root
-  gate and also queries systemd status. A completed check exits zero only when
-  all audited trees are safe; any unsafe ownership, mode, or registry result
-  exits nonzero (while retaining redacted JSON diagnostics).
+  gate and also queries systemd status for the canonical
+  `coding-tools-mcp-unified.service` unit. For a differently named or legacy
+  unit, pass `--system-unit <unit-name>` together with `--system`. A completed
+  check exits zero only when all audited trees are safe; any unsafe ownership,
+  mode, or registry result exits nonzero (while retaining redacted JSON
+  diagnostics).
 - `provision`: validates a source directory, stages a provider broker copy,
   and publishes its fragment; it is a plan by default and mutates only with
   `--apply`. An apply requires root plus explicit

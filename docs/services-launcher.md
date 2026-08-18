@@ -500,7 +500,10 @@ the account named by the unit's `User=`/`Group=`. The CLI uses those values to
 own and later audit the broker tree; they are not the invoking administrator's
 identity. `doctor` uses the same pair for ownership/mode checks, while
 `doctor --system` additionally requires explicit root and performs its
-systemd-status query.
+systemd-status query against `coding-tools-mcp-unified.service` by default.
+If the deployment uses another unit name, pass it explicitly with
+`--system-unit <unit-name>`; this keeps the doctor check tied to the unit that
+actually runs the service.
 
 Each `credentials.d/*.toml` fragment contains one provider and names no secret
 values:
@@ -587,7 +590,7 @@ directory.
 Provision the runtime/state/cache/log roots outside the source tree and make
 them writable by the service account before preflight.
 
-Example `/etc/systemd/system/coding-tools-mcp.service`:
+Example `/etc/systemd/system/coding-tools-mcp-unified.service`:
 
 ```ini
 [Unit]
@@ -625,9 +628,9 @@ Activate it:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now coding-tools-mcp.service
-sudo systemctl status coding-tools-mcp.service
-journalctl -u coding-tools-mcp.service -f
+sudo systemctl enable --now coding-tools-mcp-unified.service
+sudo systemctl status coding-tools-mcp-unified.service
+journalctl -u coding-tools-mcp-unified.service -f
 ```
 
 For upgrades on a host with multiple MCP instances, distinguish runtime-code
