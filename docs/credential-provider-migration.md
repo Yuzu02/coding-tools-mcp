@@ -2,8 +2,8 @@
 
 This page documents the one-time move from legacy credential bind entries to
 the dynamic provider registry. It is operator documentation only. Live
-migration, deployment, and rollback are outside this task; the block below is
-labelled `NEVER RUN` and is not invoked by MCP.
+migration, deployment, and rollback are outside this task; the root-only block
+below is not invoked by MCP.
 
 ## Runtime model
 
@@ -17,11 +17,45 @@ remove only the obsolete credential bind entry from the unit drop-in.
 A fragment has one table with these fields: `name` (safe provider name),
 `commands` (one or more executable basenames), optional `read_roots`, optional
 `write_roots`, optional `env_passthrough` (environment variable names only),
-and optional `env_paths` (`NAME=/absolute/path` strings). All roots must stay
-inside `<state-root>/credentials/<name>`. Secret values, token files in the
-repository, and secret-like `env_paths` names are prohibited. The service
-environment supplies values for `env_passthrough` only when a matching simple
-command runs.
+and optional `env_paths` (`NAME=relative-broker-path` strings). The CLI accepts
+each `--env-path NAME=relative-broker-path` repeatedly and resolves the path
+under that provider's broker subtree when it publishes the fragment. All roots
+must stay inside `<state-root>/credentials/<name>`. Secret values, token files
+in the repository, and secret-like `env_paths` names are prohibited. The
+service environment supplies values for `env_passthrough` only when a matching
+simple command runs.
+
+## Generic Git provider profile
+
+Treat GitHub authentication and Git commit identity as separate concerns. The
+provider's broker copy must contain both a broker-owned Git configuration file
+and a broker-owned GitHub CLI configuration directory. Set
+`GIT_CONFIG_GLOBAL` to the former and `GH_CONFIG_DIR` to the latter through
+`env_paths`; neither tool may fall back to a personal home directory. The
+operator must choose and stage one canonical commit author/committer identity
+in the Git configuration before applying the provider. This repository's
+locally pinned identity is not an automatic deployment property.
+
+The corresponding host-only plan uses the generic Git executable and repeats
+the relative environment-path option for both broker-owned locations:
+
+```sh
+uv run --locked python scripts/credentials.py \
+  --registry-dir <registry-dir> --broker-dir <broker-dir> \
+  --service-uid <service-account-uid> --service-gid <service-account-gid> provision \
+  --name git-provider --command git --command gh \
+  --source <operator-reviewed-source-store> \
+  --read-root read-only --write-root state \
+  --env-path GIT_CONFIG_GLOBAL=gitconfig \
+  --env-path GH_CONFIG_DIR=gh
+```
+
+The source is staged by root and must already contain the canonical identity
+selected by the operator. The command above is a dry-run plan unless `--apply`
+is added after the subcommand options; review the plan and source first, and do
+not rerun an apply blindly. `gh auth status` is a safe identity check for the
+brokered GitHub CLI configuration, but it does not prove the Git commit
+author/committer metadata. Do not use commands that print credential contents.
 
 The host-only `credentials` CLI takes `--registry-dir <dir>` and
 `--broker-dir <dir>` before its subcommand. Its four commands are:
@@ -116,7 +150,8 @@ uv run --locked python scripts/credentials.py \
   --registry-dir "$REGISTRY_DIR" --broker-dir "$BROKER_DIR" \
   --service-uid "$SERVICE_UID" --service-gid "$SERVICE_GID" provision \
   --name "<provider-name>" --command "<executable-basename>" \
-  --source "<source-store>" --read-root "read-only" --write-root "state" --apply
+  --source "<source-store>" --read-root "read-only" --write-root "state" \
+  --env-path "GIT_CONFIG_GLOBAL=gitconfig" --env-path "GH_CONFIG_DIR=gh" --apply
 
 # Remove exactly the reviewed legacy credential bind line, and no other bind.
 sed -i '\|<legacy-credential-bind-entry>|d' "$DROPIN"

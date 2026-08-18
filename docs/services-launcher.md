@@ -545,6 +545,36 @@ For operations and dry-run behavior, use
 [credential-provider-migration.md](credential-provider-migration.md). The
 `credentials` tool is host-only and is never exposed as an MCP tool.
 
+### Generic Git provider
+
+For a Git provider, keep GitHub authentication separate from Git commit
+metadata. The broker source is staged by root and must contain one canonical
+author/committer identity chosen by the operator. Configure that identity in a
+broker-owned Git config and configure GitHub CLI authentication in a separate
+broker-owned CLI directory. Pass them to matching commands with
+`GIT_CONFIG_GLOBAL` and `GH_CONFIG_DIR`; do not rely on a personal home
+directory. This repository's locally pinned identity is not an automatic
+deployment property.
+
+The host-only CLI takes global registry, broker, and service identity options
+before `provision`. Its environment-path options are repeatable and use paths
+relative to the provider broker:
+
+```sh
+uv run --locked python scripts/credentials.py \
+  --registry-dir <registry-dir> --broker-dir <broker-dir> \
+  --service-uid <service-account-uid> --service-gid <service-account-gid> provision \
+  --name git-provider --command git --command gh \
+  --source <operator-reviewed-source-store> \
+  --env-path GIT_CONFIG_GLOBAL=gitconfig \
+  --env-path GH_CONFIG_DIR=gh
+```
+
+The source must be reviewed and staged by root before an operator applies the
+plan. `gh auth status` is a safe identity check for the brokered GitHub CLI
+configuration; it does not prove Git commit author/committer metadata. Never
+use a command that reads or prints credential contents.
+
 `ProtectHome=tmpfs` still applies outside the MCP process. Providers must use
 their broker subtrees, not stores under a personal home, so no home bind is
 needed for credential discovery. Keep `BindPaths=` limited to the generic
