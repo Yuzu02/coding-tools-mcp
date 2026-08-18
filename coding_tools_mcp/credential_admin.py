@@ -5,6 +5,8 @@ This module is intentionally not imported by the MCP runtime.
 from __future__ import annotations
 
 import os
+import grp
+import pwd
 import shutil
 import stat
 import subprocess
@@ -127,6 +129,7 @@ class CredentialAdmin:
         require_root(operation="provision", euid=euid)
         if self.service_uid is None or self.service_gid is None:
             raise CredentialAdminError("provision requires explicit service UID and GID")
+        self._validate_service_account()
         # Validate against the established parser before touching the broker.
         self._validate_fragment(text, request.name)
         self.broker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -154,11 +157,25 @@ class CredentialAdmin:
         with tempfile.TemporaryDirectory(prefix=".validate-", dir=self.registry_dir.parent) as validation_root:
             validation_dir = Path(validation_root) / "registry"
             validation_dir.mkdir()
+            if self.registry_dir.is_dir():
+                for existing in self.registry_dir.glob("*.toml"):
+                    if existing.name != f"{name}.toml":
+                        shutil.copyfile(existing, validation_dir / existing.name)
             temporary_fragment = validation_dir / f"{name}.toml"
             atomic_write_fragment(temporary_fragment, text)
             snapshot = CredentialProviderRegistry(validation_dir, self.broker_dir).snapshot()
             if snapshot.health != "healthy":
                 raise CredentialAdminError("proposed credential provider fragment is invalid")
+
+    def _validate_service_account(self) -> None:
+        assert self.service_uid is not None and self.service_gid is not None
+        if self.service_uid <= 0 or self.service_gid <= 0:
+            raise CredentialAdminError("service UID and GID must identify a non-root account")
+        try:
+            pwd.getpwuid(self.service_uid)
+            grp.getgrgid(self.service_gid)
+        except KeyError as exc:
+            raise CredentialAdminError("service UID and GID must identify an existing account") from exc
 
     def _copy_node(self, source: Path, destination: Path) -> None:
         mode = source.lstat().st_mode
@@ -196,8 +213,11 @@ class CredentialAdmin:
         report["checks"] = {"registry": self._audit_tree(self.registry_dir, expected_uid=0, expected_gid=0, is_registry=True), "broker": self._audit_tree(self.broker_dir, expected_uid=self.service_uid, expected_gid=self.service_gid)}
         if system:
             runner = systemctl_runner or subprocess.run
-            result = runner(["systemctl", "show", "--no-pager", "--property=LoadState,ActiveState,SubState", "coding-tools-mcp.service"], capture_output=True, text=True, check=False)
-            report["systemctl"] = {"returncode": int(result.returncode), "status": result.stdout.strip()[:512]}
+            try:
+                result = runner(["systemctl", "show", "--no-pager", "--property=LoadState,ActiveState,SubState", "coding-tools-mcp.service"], capture_output=True, text=True, check=False, timeout=5)
+                report["systemctl"] = {"returncode": int(result.returncode), "status": result.stdout.strip()[:512]}
+            except subprocess.TimeoutExpired:
+                report["systemctl"] = {"returncode": 124, "status": "timeout"}
         return report
 
     @staticmethod

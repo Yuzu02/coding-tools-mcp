@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from coding_tools_mcp.credential_admin import CredentialAdmin, ProvisionRequest
+from coding_tools_mcp.credential_admin import CredentialAdmin, CredentialAdminError, ProvisionRequest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,15 +35,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     admin = CredentialAdmin(args.registry_dir, args.broker_dir, service_uid=args.service_uid, service_gid=args.service_gid)
-    if args.command == "list":
-        report = admin.list()
-    elif args.command == "doctor":
-        report = admin.doctor(system=args.system)
-    elif args.command == "provision":
-        request = ProvisionRequest(args.name, tuple(args.commands), args.source, tuple(args.read_roots), tuple(args.write_roots))
-        report = admin.provision(request, apply=args.apply)
-    else:
-        report = admin.remove(args.name, apply=args.apply)
+    try:
+        if args.command == "list":
+            report = admin.list()
+        elif args.command == "doctor":
+            report = admin.doctor(system=args.system)
+        elif args.command == "provision":
+            request = ProvisionRequest(args.name, tuple(args.commands), args.source, tuple(args.read_roots), tuple(args.write_roots))
+            report = admin.provision(request, apply=args.apply)
+        else:
+            report = admin.remove(args.name, apply=args.apply)
+    except CredentialAdminError as exc:
+        build_parser().error(str(exc))
     print(json.dumps(report, sort_keys=True))
     return 0
 

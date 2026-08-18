@@ -47,9 +47,19 @@ class CredentialAdminTests(unittest.TestCase):
         with self.assertRaises(CredentialAdminError):
             self.admin.provision(malformed, apply=False)
 
+    def test_dry_run_rejects_invalid_existing_registry(self) -> None:
+        (self.registry / "broken.toml").write_text('name="broken"\ncommands=[]\n', encoding="utf-8")
+        with self.assertRaisesRegex(CredentialAdminError, "invalid"):
+            self.admin.provision(self.request(), apply=False)
+
     def test_apply_requires_explicit_service_account(self) -> None:
         admin = CredentialAdmin(self.registry, self.broker)
         with self.assertRaisesRegex(CredentialAdminError, "service UID and GID"):
+            admin.provision(self.request(), apply=True, euid=0)
+
+    def test_apply_rejects_root_or_unknown_service_identity(self) -> None:
+        admin = CredentialAdmin(self.registry, self.broker, service_uid=0, service_gid=0)
+        with self.assertRaisesRegex(CredentialAdminError, "non-root"):
             admin.provision(self.request(), apply=True, euid=0)
 
     def test_apply_requires_root(self) -> None:
@@ -103,6 +113,17 @@ class CredentialAdminTests(unittest.TestCase):
         report = self.admin.doctor(system=True, euid=0, systemctl_runner=runner)
         self.assertEqual(report["systemctl"]["returncode"], 0)
         self.assertEqual(calls[0][0:2], ["systemctl", "show"])
+
+    def test_doctor_system_uses_timeout(self) -> None:
+        seen: dict[str, object] = {}
+        class Result:
+            returncode = 0
+            stdout = ""
+        def runner(_command: list[str], **kwargs: object) -> Result:
+            seen.update(kwargs)
+            return Result()
+        self.admin.doctor(system=True, euid=0, systemctl_runner=runner)
+        self.assertEqual(seen["timeout"], 5)
 
 
 class CredentialAdminCliTests(unittest.TestCase):
