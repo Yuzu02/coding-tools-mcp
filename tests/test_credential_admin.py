@@ -104,6 +104,17 @@ class CredentialAdminTests(unittest.TestCase):
         self.assertEqual((self.registry / "example.toml").stat().st_mode & 0o777, 0o640)
         self.assertIn('name = "example"', (self.registry / "example.toml").read_text())
 
+    def test_apply_copies_nested_regular_directories(self) -> None:
+        request = self.request()
+        nested = request.source / "nested" / "deep"
+        nested.mkdir(parents=True)
+        (nested / "config.json").write_text("nested", encoding="utf-8")
+        self.admin.provision(request, apply=True, euid=0)
+        copied = self.broker / "example" / "state" / "nested" / "deep" / "config.json"
+        self.assertEqual(copied.read_text(encoding="utf-8"), "nested")
+        self.assertEqual((self.broker / "example" / "state" / "nested").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
+
     def test_remove_withdraws_fragment_before_broker_cleanup(self) -> None:
         self.admin.provision(self.request(), apply=True, euid=0)
         events: list[str] = []

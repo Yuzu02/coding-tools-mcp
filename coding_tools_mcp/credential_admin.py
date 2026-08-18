@@ -198,7 +198,15 @@ class CredentialAdmin:
 
     def _copy_node(self, source: Path, destination: Path) -> None:
         mode = source.lstat().st_mode
-        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        if stat.S_ISLNK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode) or stat.S_ISFIFO(mode):
+            raise CredentialAdminError("credential source contains unsafe filesystem node")
+        if stat.S_ISDIR(mode):
+            destination.mkdir(parents=True, mode=0o700, exist_ok=False)
+            for child in source.iterdir():
+                self._copy_node(child, destination / child.name)
+            os.chmod(destination, 0o700)
+            return
+        if not stat.S_ISREG(mode):
             raise CredentialAdminError("credential source contains unsafe filesystem node")
         destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         shutil.copyfile(source, destination)
