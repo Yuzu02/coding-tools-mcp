@@ -600,6 +600,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 name="vercel",
                 commands=("vercel",),
                 read_roots=(credential_root,),
+                write_roots=(),
                 env_passthrough=("VERCEL_TOKEN",),
                 env_paths=(("XDG_DATA_HOME", xdg_data),),
             )
@@ -659,6 +660,8 @@ class RuntimeHelperTests(unittest.TestCase):
                 commands=("neon",),
                 read_roots=(credential_root,),
                 write_roots=(writable_root,),
+                env_passthrough=(),
+                env_paths=(),
             )
             runtime = Runtime(workspace, exec_credentials=(provider,))
 
@@ -687,7 +690,10 @@ class RuntimeHelperTests(unittest.TestCase):
             provider = HostExecCredentialConfig(
                 name="printf-provider",
                 commands=("printf",),
+                read_roots=(),
                 write_roots=(writable_root,),
+                env_passthrough=(),
+                env_paths=(),
             )
             runtime = Runtime(workspace, exec_credentials=(provider,))
 

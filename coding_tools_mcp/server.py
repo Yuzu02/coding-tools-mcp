@@ -560,6 +560,15 @@ class RuntimeStoragePolicy:
     cache_root: Path | None = None
 
 
+@dataclass(frozen=True)
+class CredentialLandlockRoots:
+    """Roots used by the mandatory credential-isolation child profile."""
+
+    read_roots: tuple[Path, ...]
+    write_roots: tuple[Path, ...]
+    provider: CredentialProvider | None = None
+
+
 def default_runtime_parent_root() -> Path:
     return Path(tempfile.gettempdir()) / RUNTIME_ROOT_DIR_NAME
 
@@ -927,6 +936,7 @@ LANDLOCK_ACCESS_FS_MAKE_SYM = 1 << 12
 LANDLOCK_ACCESS_FS_REFER = 1 << 13
 LANDLOCK_ACCESS_FS_TRUNCATE = 1 << 14
 LANDLOCK_ACCESS_FS_IOCTL_DEV = 1 << 15
+CREDENTIAL_LANDLOCK_PREFLIGHT_MARKER = "__CODING_TOOLS_MCP_LANDLOCK_PREFLIGHT_OK__"
 
 
 def json_response_payload(payload: Any) -> bytes:
@@ -2125,6 +2135,92 @@ class Runtime:
     def landlock_write_roots(self, command: str | None = None) -> list[Path]:
         return [self.runtime_dir, *self._exec_credential_write_roots(command)]
 
+    def _credential_landlock_roots(self, command: str, workdir: Path) -> CredentialLandlockRoots:
+        """Build the narrow filesystem profile used by every host-config child."""
+
+        self._ensure_runtime_dirs()
+        environment = self._command_env({}, workdir=workdir, command=command)
+        provider = self._exec_credential_provider(command)
+        read_roots: list[Path] = []
+        write_roots: list[Path] = []
+
+        def add_unique(target: list[Path], raw: Path) -> None:
+            try:
+                resolved = raw.expanduser().resolve(strict=False)
+            except OSError as exc:
+                raise ToolFailure(
+                    "CREDENTIAL_SANDBOX_UNAVAILABLE",
+                    "Credential-isolation Landlock roots could not be resolved.",
+                    category="security",
+                    details={"path": str(raw), "reason": exc.strerror or str(exc)},
+                ) from exc
+            if resolved not in target:
+                target.append(resolved)
+
+        # These are the fixed OS/runtime roots needed by a regular shell and
+        # resolved executable.  In particular, this list intentionally does
+        # not consult guard_allow_roots or CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS.
+        for raw in (*TOOLCHAIN_READ_ROOTS, *OS_METADATA_READ_FILES, *GIT_READ_ROOTS, *DNS_RESOLVER_READ_ROOTS):
+            add_unique(read_roots, Path(raw))
+        for raw in (
+            self.runtime_dir,
+            self.command_home_dir(),
+            self.command_tmp_dir(),
+            self.state_dir,
+            self.cache_dir,
+        ):
+            add_unique(read_roots, raw)
+            add_unique(write_roots, raw)
+
+        # A command may be an executable supplied by a project or its PATH.
+        # Allow only the canonical parent needed to resolve that executable;
+        # never let a PATH entry encompass the credential broker itself.
+        try:
+            tokens = shlex_split(command)
+        except ValueError:
+            tokens = []
+        broker_dir = (
+            self.credential_registry.broker_dir.expanduser().resolve(strict=False)
+            if self.credential_registry is not None
+            else None
+        )
+        for executable in command_executables(tokens)[:1]:
+            if "/" in executable or "\\" in executable:
+                executable_path = Path(executable).expanduser()
+                if not executable_path.is_absolute():
+                    executable_path = workdir / executable_path
+            else:
+                resolved_executable = shutil.which(executable, path=environment.get("PATH"))
+                if resolved_executable is None:
+                    continue
+                executable_path = Path(resolved_executable)
+            try:
+                executable_parent = executable_path.resolve(strict=False).parent
+            except OSError as exc:
+                raise ToolFailure(
+                    "CREDENTIAL_SANDBOX_UNAVAILABLE",
+                    "Credential-isolation executable could not be resolved.",
+                    category="security",
+                    details={"path": str(executable_path), "reason": exc.strerror or str(exc)},
+                ) from exc
+            if broker_dir is not None and (executable_parent == broker_dir or is_relative_to(executable_parent, broker_dir)):
+                raise ToolFailure(
+                    "CREDENTIAL_SANDBOX_UNAVAILABLE",
+                    "Resolved executable path would encompass the credential broker.",
+                    category="security",
+                )
+            add_unique(read_roots, executable_parent)
+
+        add_unique(read_roots, self.workspace.root)
+        add_unique(write_roots, self.workspace.root)
+        if provider is not None:
+            for root in provider.read_roots:
+                add_unique(read_roots, root)
+            for root in provider.write_roots:
+                add_unique(read_roots, root)
+                add_unique(write_roots, root)
+        return CredentialLandlockRoots(tuple(read_roots), tuple(write_roots), provider)
+
     def is_allowed_command_tmp_path(self, candidate: str) -> bool:
         if self.capabilities.skip_all_permissions:
             return False
@@ -2236,7 +2332,11 @@ class Runtime:
             return {
                 "sensitive_env_filter": "enabled-when-registry-present",
                 "registry": {"health": "not-configured", "generation": None, "fingerprint": None, "error": None},
-                "filesystem_isolation": {"status": "placeholder-task-4"},
+                "filesystem_isolation": {
+                    "backend": "landlock",
+                    "status": "not-configured",
+                    "enforced_for": "none",
+                },
                 "providers": [],
                 "server_instance_id": self.server_instance_id,
                 "process_start_time": self.process_start_time,
@@ -2244,6 +2344,7 @@ class Runtime:
                     json.dumps(self.exposed_tool_names(), separators=(",", ":"), ensure_ascii=False).encode("utf-8")
                 ).hexdigest(),
             }
+        landlock = landlock_status_payload()
         return {
             "sensitive_env_filter": "enabled-when-registry-present",
             "registry": {
@@ -2252,7 +2353,11 @@ class Runtime:
                 "fingerprint": snapshot.fingerprint,
                 "error": snapshot.error,
             },
-            "filesystem_isolation": {"status": "placeholder-task-4"},
+            "filesystem_isolation": {
+                "backend": "landlock",
+                "status": "available" if landlock.get("available") else "unavailable",
+                "enforced_for": "all_exec",
+            },
             "providers": [
                 {
                     "name": provider.name,
@@ -2272,7 +2377,9 @@ class Runtime:
         }
 
     def _landlock_enforced(self, landlock: dict[str, Any]) -> bool:
-        return bool(landlock.get("available")) and self.landlock_enabled()
+        return bool(landlock.get("available")) and (
+            self.landlock_enabled() or self.credential_registry is not None
+        )
 
     def server_info_payload(self) -> dict[str, Any]:
         tools = self.exposed_tool_names()
@@ -3197,7 +3304,40 @@ class Runtime:
         popen_cmd: Any = cmd
         popen_shell = True
         popen_extra = process_group_popen_kwargs()
-        if self.landlock_enabled():
+        if self.credential_registry is not None:
+            try:
+                credential_roots = self._credential_landlock_roots(cmd, workdir.path)
+                landlock_fd = open_credential_landlock_ruleset(
+                    self.workspace.root,
+                    credential_roots,
+                )
+                verify_credential_landlock_application(
+                    landlock_fd,
+                    cwd=workdir.path,
+                    environment=env,
+                )
+                popen_cmd = landlock_exec_argv(landlock_fd, cmd)
+                popen_shell = False
+                popen_extra["pass_fds"] = (landlock_fd,)
+            except Exception as exc:
+                if landlock_fd is not None:
+                    try:
+                        os.close(landlock_fd)
+                    except OSError:
+                        pass
+                    landlock_fd = None
+                if client_request_id is not None and client_binding is not None:
+                    self.command_manager.release_client_request(client_request_id, client_binding)
+                if isinstance(exc, ToolFailure) and exc.code == "CREDENTIAL_SANDBOX_UNAVAILABLE":
+                    raise
+                reason = exc.message if isinstance(exc, ToolFailure) else str(exc)
+                raise ToolFailure(
+                    "CREDENTIAL_SANDBOX_UNAVAILABLE",
+                    "Credential-isolation Landlock sandbox is unavailable; command was not started.",
+                    category="security",
+                    details={"reason": reason or "unknown"},
+                ) from exc
+        elif self.landlock_enabled():
             try:
                 landlock_fd = open_landlock_ruleset(
                     self.workspace.root,
@@ -5280,6 +5420,87 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots
         os.close(ruleset_fd)
         raise
     return ruleset_fd
+
+
+def open_credential_landlock_ruleset(
+    workspace: Path,
+    runtime_roots: CredentialLandlockRoots | tuple[Path, ...] | list[Path],
+    provider: CredentialProvider | None = None,
+) -> int:
+    """Open a Landlock ruleset for the all-command credential boundary.
+
+    ``runtime_roots`` accepts the structured profile produced by Runtime; the
+    sequence form remains useful to callers that only need read roots.  Broker
+    roots are added only from the explicitly selected healthy provider.
+    """
+
+    if isinstance(runtime_roots, CredentialLandlockRoots):
+        read_roots = list(runtime_roots.read_roots)
+        write_roots = list(runtime_roots.write_roots)
+        selected_provider = runtime_roots.provider
+    else:
+        read_roots = list(runtime_roots)
+        write_roots = []
+        selected_provider = provider
+    if selected_provider is not None:
+        for root in selected_provider.read_roots:
+            if root not in read_roots:
+                read_roots.append(root)
+        for root in selected_provider.write_roots:
+            if root not in read_roots:
+                read_roots.append(root)
+            if root not in write_roots:
+                write_roots.append(root)
+    return open_landlock_ruleset(
+        workspace,
+        [str(root) for root in read_roots],
+        write_roots=write_roots,
+    )
+
+
+def verify_credential_landlock_application(
+    ruleset_fd: int,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> None:
+    """Prove a child can apply the credential ruleset before requested exec."""
+
+    try:
+        completed = subprocess.run(
+            landlock_exec_argv(
+                ruleset_fd,
+                f"printf '%s' {shlex.quote(CREDENTIAL_LANDLOCK_PREFLIGHT_MARKER)}",
+            ),
+            cwd=str(cwd),
+            shell=False,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+            pass_fds=(ruleset_fd,),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ToolFailure(
+            "SANDBOX_UNAVAILABLE",
+            "Credential-isolation Landlock restrict_self preflight failed.",
+            category="security",
+            details={"reason": str(exc) or "unknown"},
+        ) from exc
+    if completed.returncode != 0 or completed.stdout != CREDENTIAL_LANDLOCK_PREFLIGHT_MARKER:
+        reason = (completed.stderr or "").strip()[:240]
+        raise ToolFailure(
+            "SANDBOX_UNAVAILABLE",
+            "Credential-isolation Landlock restrict_self preflight failed.",
+            category="security",
+            details={
+                "returncode": completed.returncode,
+                "reason": reason or "preflight marker was not returned",
+            },
+        )
 
 
 def add_landlock_path(ruleset_fd: int, path: Path, allowed_access: int, *, required: bool = True) -> None:
