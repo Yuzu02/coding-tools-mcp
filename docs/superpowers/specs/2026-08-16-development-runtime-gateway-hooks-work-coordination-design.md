@@ -6,6 +6,12 @@ Date: 2026-08-16
 
 Repository: `coding-tools-mcp`
 
+**Supersession note:** its proposed global/workspace configuration precedence
+and `${ENV:NAME}` secret-reference syntax are superseded by the implemented
+HostConfig v2 / ProjectConfig v1 authority model. This document remains
+proposed for Hooks, Work Items, and Gateway only; it does not authorize those
+features or redefine the deployed v0.4 runtime.
+
 This document specifies an additive vNext architecture for `coding-tools-mcp`.
 It preserves the current v0.3 coding runtime while defining the next layer of
 workspace configuration, deterministic hooks, durable work coordination, MCP
@@ -167,6 +173,10 @@ timeouts, and lifecycle.
 ## 5. Configuration model
 
 ### 5.1 Files and precedence
+
+This section is historical proposal material. The implemented configuration
+authority is HostConfig v2, with `env:NAME` and `file:/absolute/path` secret
+references; it replaces the precedence and interpolation syntax below.
 
 Use two configuration layers:
 

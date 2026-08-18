@@ -2,9 +2,10 @@
 
 ## Status
 
-Approved for implementation on `feat/project-catalog-context`, stacked on
-`fix/http-session-exhaustion` (`c1c094e`). The branch may be pushed only to the
-user fork. No upstream pull request is part of this work.
+HISTORICAL EXECUTION PLAN. The project/skill context work is implemented and
+superseded as a standalone delivery by the configured multi-project `projects`
+extension and HostConfig v2. The historical branch/stack references below are
+not current repository state.
 
 ## Problem
 

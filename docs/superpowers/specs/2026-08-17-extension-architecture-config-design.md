@@ -1,8 +1,14 @@
 # Extension Architecture + TOML Configuration Design
 
 **Date:** 2026-08-17
-**Status:** Architecture approved; ready for implementation planning after written-spec review
+**Status:** IMPLEMENTED + VERIFIED
 **Scope:** Internal extension host and layered TOML configuration for the Yuzu02 coding-tools-mcp fork
+
+The Phase 0 foundation described here is implemented. Its execution history is
+preserved in the companion implementation plan; current deployed HostConfig
+authority is specified by
+[`2026-08-17-host-config-project-policy-single-unit.md`](../plans/2026-08-17-host-config-project-policy-single-unit.md)
+and [`../../runtime-contract-v0.4.md`](../../runtime-contract-v0.4.md).
 
 ## 1. Objective
 
@@ -313,6 +319,11 @@ Later layers override earlier layers through a schema-aware merge owned by the c
 - no layer may inject arbitrary extension names or arbitrary root tables.
 
 This avoids ad-hoc generic deep-merging while still allowing a local file to override one nested host-specific field without copying the complete public configuration.
+
+This is the implemented developer-mode v1 layering model. It is not the
+authority model for a deployed multi-project endpoint: HostConfig v2 is the
+single authority there, does not implicitly load `coding-tools.local.toml`, and
+only permits ProjectConfig v1 to reduce host authority.
 
 ## 10. Configuration schema
 

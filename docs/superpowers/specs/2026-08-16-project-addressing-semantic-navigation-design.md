@@ -4,7 +4,7 @@
 **Status:** Phase 0, Phase A, and Phase B are implemented and verified
 **Target:** fork-owned multi-project and semantic extensions composed through the internal ExtensionHost
 
-**Repository validation snapshot (2026-08-17, refreshed after Phase B acceptance):**
+**Historical validation snapshot (2026-08-17, refreshed after Phase B acceptance):**
 
 - fork `main`: `da89d81` after the four-project integration checkpoint
 - current original upstream `xyTom/main`: `66b3f19`
@@ -18,6 +18,10 @@
 - Phase B final acceptance on 2026-08-17 reran all semantic extension tests (73/73), then independently verified the exact isolated Serena environment (`serena-agent==1.5.3`, `mcp==1.27.0`) with the Python/TypeScript adapter and MCP integration suites (11/11). `mise run verify`, the explicit protocol/schema-drift/dispatch-input/integration/npm-launcher gate set, and the full compliance target all completed successfully from the final implementation state.
 - final static/privacy acceptance confirms only the private semantic worker imports `serena.*`, public-fork hygiene remains 2/2, generated compliance reports are restored after verification, and no host-specific configuration is tracked.
 - final upstream revalidation found remote and local `xyTom/main` unchanged at `66b3f19`; the fork remained a strict descendant with no missing upstream commits
+
+These commit IDs and test totals are historical evidence, not a claim about the
+current checkout. Current runtime/deployment authority is HostConfig v2 and the
+v0.4 contract; use fresh verification for live state.
 
 ## 1. Objective
 

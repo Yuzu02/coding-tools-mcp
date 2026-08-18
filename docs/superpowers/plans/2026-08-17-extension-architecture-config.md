@@ -1,5 +1,7 @@
 # Extension Architecture + TOML Configuration Implementation Plan
 
+**Status:** HISTORICAL EXECUTION PLAN — Phase 0 is IMPLEMENTED + VERIFIED.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the Phase 0 internal extension host and layered TOML configuration foundation that isolates fork-owned capabilities from the `xyTom/coding-tools-mcp` mother core, then prove the boundary by moving the existing project/skill discovery capability behind the first internal `projects` extension.

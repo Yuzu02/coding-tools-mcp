@@ -1,5 +1,7 @@
 # Project Addressing / Multi-Project Runtime Implementation Plan
 
+**Status:** HISTORICAL EXECUTION PLAN — Phase A is IMPLEMENTED + VERIFIED.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Evolve the Phase 0 extension foundation into one stateless Coding Tools MCP endpoint that serves multiple explicitly registered projects through stable `project_id` addressing, while reusing the existing mother-core filesystem/Git/process implementations and preserving concurrency safety.

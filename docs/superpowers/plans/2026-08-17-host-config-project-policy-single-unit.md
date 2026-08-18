@@ -1,5 +1,7 @@
 # Host Configuration, Project Policy, and Single-Unit Deployment Implementation Plan
 
+**Status:** HISTORICAL EXECUTION PLAN — Tasks 1–14 are IMPLEMENTED + VERIFIED; Tasks 15–16 record final documentation and verification work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement the strict HostConfig v2 / ProjectConfig v1 authority foundation, converge runtime and launcher configuration, add deterministic preflight, and migrate the current same-trust deployment to one live multi-project v0.4-capable service without losing rollback safety.
