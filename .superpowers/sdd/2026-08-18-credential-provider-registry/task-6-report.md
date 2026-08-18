@@ -3,6 +3,7 @@
 ## Result
 
 Commit: `62c261e` (docs: document credential provider migration)
+Follow-up: `bc1b2db` (docs: clarify credential service identity)
 
 Owned files:
 
