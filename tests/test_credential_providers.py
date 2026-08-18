@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from coding_tools_mcp.credential_providers import CredentialProviderRegistry
@@ -10,6 +11,41 @@ from coding_tools_mcp.credential_providers import CredentialProviderRegistry
 class CredentialProviderRegistryTests(unittest.TestCase):
     def test_server_module_imports(self) -> None:
         import coding_tools_mcp.server  # noqa: F401
+
+    def test_host_mode_build_runtime_has_no_static_credential_authority(self) -> None:
+        from coding_tools_mcp.server import build_parser, build_runtime, runtime_policy_from_args
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            host = root / "host.toml"
+            host.write_text(
+                "\n".join(
+                    (
+                        "config_version = 2",
+                        "[runtime]",
+                        f"bootstrap_workspace = {json.dumps(str(workspace))}",
+                        "[transport]",
+                        'kind = "stdio"',
+                        'host = "127.0.0.1"',
+                        "port = 8000",
+                        "[security]",
+                        'permission_mode = "dangerous"',
+                        'shell_env_inherit = "none"',
+                        "allow_network = false",
+                        'auth_mode = "noauth"',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            args = build_parser().parse_args(["--host-config", str(host)])
+            runtime = build_runtime(args, runtime_policy_from_args(args), emit_warning=False)
+            try:
+                self.assertEqual(runtime.exec_credentials, ())
+            finally:
+                runtime.close()
 
     def test_unknown_fragment_key_invalidates_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

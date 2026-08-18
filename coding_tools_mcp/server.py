@@ -6735,7 +6735,6 @@ def build_runtime(
         effective_policy = runtime_policy_from_host_config(host_config)
         enable_view_image = host_config.runtime.enable_view_image
         effective_transport = host_config.transport.kind
-        exec_credentials = host_config.security.exec_credentials
     runtime = Runtime(
         workspace,
         enable_view_image=enable_view_image,
