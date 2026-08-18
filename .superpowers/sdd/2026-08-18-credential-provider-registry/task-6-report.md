@@ -23,6 +23,10 @@ labelled `NEVER RUN`.
 The migration block now passes explicit service UID/GID to `provision --apply`
 and `doctor`, documents broker ownership checks and the separate root gate for
 `doctor --system`, and triggers rollback automatically on verification failure.
+Rollback now tracks only provider names newly reserved and provisioned by the
+block; complete pre-existing fragment/subtree pairs are skipped, partial pairs
+fail, and only tracked names are removed on error. This makes reruns safe
+without deleting pre-existing provider state.
 
 ## Documentation-safe checks
 
@@ -34,6 +38,10 @@ and `doctor`, documents broker ownership checks and the separate root gate for
 - `git diff --check` — passed.
 - Migration document contains one fenced block (the required migration/
   rollback block) and no unused `HOST_CONFIG` variable.
+- Reviewed the current CLI after the Task 5 parent-ownership fix (`07c6ead`):
+  `doctor` exposes redacted `checks.*.safe` results and `doctor --system` keeps
+  its explicit root gate. The documentation records the intended nonzero exit
+  contract for unsafe checks; no host or migration command was executed.
 - Reviewed owned docs for stale `security.exec_credentials` authority and
   secret/tunnel-specific migration values — none found in the new provider
   guidance or migration block.
