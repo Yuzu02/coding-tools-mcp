@@ -558,7 +558,9 @@ deployment property.
 
 The host-only CLI takes global registry, broker, and service identity options
 before `provision`. Its environment-path options are repeatable and use paths
-relative to the provider broker:
+relative to the provider broker. Repeat `--env-passthrough NAME` after the
+subcommand only for an explicitly allowlisted service variable; it accepts a
+name, not a value:
 
 ```sh
 uv run --locked python scripts/credentials.py \
@@ -567,7 +569,8 @@ uv run --locked python scripts/credentials.py \
   --name git-provider --command git --command gh \
   --source <operator-reviewed-source-store> \
   --env-path GIT_CONFIG_GLOBAL=gitconfig \
-  --env-path GH_CONFIG_DIR=gh
+  --env-path GH_CONFIG_DIR=gh \
+  --env-passthrough <approved-variable-name>
 ```
 
 The source must be reviewed and staged by root before an operator applies the

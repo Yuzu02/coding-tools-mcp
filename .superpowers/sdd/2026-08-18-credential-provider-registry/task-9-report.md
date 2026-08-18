@@ -4,8 +4,8 @@
 
 Updated the operator documentation for a generic Git credential provider.
 The docs now use the implemented repeatable `--env-path
-NAME=relative-broker-path` syntax, with global registry, broker, and service
-identity options before `provision`.
+NAME=relative-broker-path` and `--env-passthrough NAME` syntax, with global
+registry, broker, and service identity options before `provision`.
 
 The profile documents separate broker-owned configuration for Git commit
 author/committer metadata (`GIT_CONFIG_GLOBAL`) and GitHub CLI authentication

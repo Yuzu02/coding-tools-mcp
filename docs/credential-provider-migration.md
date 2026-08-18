@@ -23,7 +23,9 @@ under that provider's broker subtree when it publishes the fragment. All roots
 must stay inside `<state-root>/credentials/<name>`. Secret values, token files
 in the repository, and secret-like `env_paths` names are prohibited. The
 service environment supplies values for `env_passthrough` only when a matching
-simple command runs.
+simple command runs. If an operator explicitly needs an allowlisted service
+environment variable, pass the repeatable `--env-passthrough NAME` option after
+the subcommand; it accepts a variable name, not a value.
 
 ## Generic Git provider profile
 
