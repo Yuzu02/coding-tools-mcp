@@ -159,6 +159,24 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(credential_info["registry"]["health"], "invalid")
             self.assertNotIn("COMPLIANCE_SHOULD_NOT_LEAK", json.dumps(info))
             self.assertNotIn("not = [valid", json.dumps(info))
+
+    def test_registry_scrubs_sensitive_shell_env_set_before_provider_grants(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            registry_dir.mkdir()
+            registry = CredentialProviderRegistry(registry_dir, root / "state" / "credentials")
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=ShellEnvPolicy(inherit="none", set={"ALPHA_TOKEN": "set-secret", "SAFE": "ok"}),
+                credential_registry=registry,
+            )
+            ordinary = runtime._command_env({}, command="printf ok")
+            self.assertNotIn("ALPHA_TOKEN", ordinary)
+            self.assertEqual(ordinary.get("SAFE"), "ok")
     def test_windows_tty_request_reports_explicit_unsupported_error(self) -> None:
         with TemporaryDirectory() as tmp, patch.object(processes_module.os, "name", "nt"):
             with self.assertRaises(ToolFailure) as raised:

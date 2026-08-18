@@ -31,6 +31,7 @@ class CredentialProviderRegistryTests(unittest.TestCase):
                         "config_version = 2",
                         "[runtime]",
                         f"bootstrap_workspace = {json.dumps(str(workspace))}",
+                        f"state_root = {json.dumps(str(root / 'state'))}",
                         "[transport]",
                         'kind = "stdio"',
                         'host = "127.0.0.1"',

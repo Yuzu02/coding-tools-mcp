@@ -3581,6 +3581,8 @@ class Runtime:
                 if env_pattern_matches(key, self.shell_env_policy.include_only)
             }
         env.update({str(key): str(value) for key, value in self.shell_env_policy.set.items()})
+        if self.credential_registry is not None:
+            env = {key: value for key, value in env.items() if not is_filtered_env_var(key, value)}
         self._ensure_runtime_dirs()
         tmp_dir = self.command_tmp_dir()
         env["HOME"] = str(self.command_home_dir())
