@@ -26,20 +26,6 @@ from .extensions.config import EXTENSION_NAME_RE, RuntimeConfig
 HOST_CONFIG_VERSION = 2
 PROJECT_CONFIG_VERSION = 1
 ENV_SECRET_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-EXEC_CREDENTIAL_COMMAND_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
-SECRET_LIKE_ENV_NAME_RE = re.compile(
-    r"(?:token|secret|credential|api[_-]?key|password|passwd|private)",
-    re.I,
-)
-EXEC_CREDENTIAL_PATH_FORBIDDEN_ENV_NAMES = frozenset(
-    {"HOME", "PATH", "PATHEXT", "TMP", "TEMP", "TMPDIR", "COMSPEC", "SYSTEMROOT", "WINDIR"}
-)
-EXEC_CREDENTIAL_PASSTHROUGH_FORBIDDEN_ENV_NAMES = EXEC_CREDENTIAL_PATH_FORBIDDEN_ENV_NAMES | {
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-}
 PROJECT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 DEFAULT_PROJECT_CONFIG = ".coding-tools-mcp.toml"
 PROJECT_REDUCIBLE_CAPABILITIES = frozenset({"semantic"})
@@ -111,22 +97,11 @@ class HostTransportConfig:
 
 
 @dataclass(frozen=True)
-class HostExecCredentialConfig:
-    name: str
-    commands: tuple[str, ...]
-    read_roots: tuple[Path, ...] = ()
-    write_roots: tuple[Path, ...] = ()
-    env_passthrough: tuple[str, ...] = ()
-    env_paths: tuple[tuple[str, Path], ...] = ()
-
-
-@dataclass(frozen=True)
 class HostSecurityConfig:
     permission_mode: str
     shell_env_inherit: str
     allow_network: bool
     auth_mode: str
-    exec_credentials: tuple[HostExecCredentialConfig, ...] = ()
     auth_token_ref: SecretRef | None = None
     oauth_client_id: str | None = None
     oauth_client_secret_ref: SecretRef | None = None
@@ -177,6 +152,17 @@ class HostConfig:
     extensions: RuntimeConfig
     deployment: HostDeploymentConfig
     source: Path
+
+
+def credential_registry_dir(config: HostConfig) -> Path:
+    return config.source.parent / "credentials.d"
+
+
+def credential_broker_dir(config: HostConfig) -> Path:
+    runtime = config.runtime
+    if runtime is None or runtime.state_root is None:
+        raise ConfigError("HostConfig runtime.state_root is required for credential providers")
+    return runtime.state_root / "credentials"
 
 
 @dataclass(frozen=True)
@@ -255,18 +241,6 @@ def host_config_schema(extension_schemas: Mapping[str, ConfigNode]) -> ConfigNod
                     "shell_env_inherit": scalar(str),
                     "allow_network": scalar(bool),
                     "auth_mode": scalar(str),
-                    "exec_credentials": list_of(
-                        table(
-                            {
-                                "name": scalar(str),
-                                "commands": list_of(scalar(str)),
-                                "read_roots": list_of(scalar(str)),
-                                "write_roots": list_of(scalar(str)),
-                                "env_passthrough": list_of(scalar(str)),
-                                "env_paths": list_of(scalar(str)),
-                            }
-                        )
-                    ),
                     "auth_token_ref": scalar(str),
                     "oauth_client_id": scalar(str),
                     "oauth_client_secret_ref": scalar(str),
@@ -346,86 +320,6 @@ def _positive_number(raw: object, *, field_name: str) -> float:
     if type(raw) not in {int, float} or float(cast(int | float, raw)) <= 0:
         raise ConfigError(f"{field_name} must be a positive number")
     return float(cast(int | float, raw))
-
-
-def _parse_exec_credential_env_path(raw: str, *, field_name: str) -> tuple[str, Path]:
-    name, separator, value = raw.partition("=")
-    if not separator or not ENV_SECRET_RE.fullmatch(name):
-        raise ConfigError(f"{field_name} must use NAME=/absolute/path")
-    if SECRET_LIKE_ENV_NAME_RE.search(name):
-        raise ConfigError(f"{field_name} cannot set a secret-like environment variable")
-    if name.upper() in EXEC_CREDENTIAL_PATH_FORBIDDEN_ENV_NAMES:
-        raise ConfigError(f"{field_name} cannot override the isolated process environment")
-    return name, _absolute_path(value, field_name=field_name)
-
-
-def _normalize_exec_credentials(security_map: Mapping[str, object]) -> tuple[HostExecCredentialConfig, ...]:
-    raw_providers = security_map.get("exec_credentials", [])
-    if not isinstance(raw_providers, list):
-        raise ConfigError("host.security.exec_credentials must be a list")
-    providers: list[HostExecCredentialConfig] = []
-    names: set[str] = set()
-    command_owners: dict[str, str] = {}
-    for index, raw_provider in enumerate(raw_providers):
-        if not isinstance(raw_provider, dict):
-            raise ConfigError(f"host.security.exec_credentials[{index}] must be a table")
-        prefix = f"host.security.exec_credentials[{index}]"
-        name = str(raw_provider.get("name", "")).strip()
-        if not name:
-            raise ConfigError(f"{prefix}.name must be a non-empty string")
-        if name in names:
-            raise ConfigError(f"duplicate exec credential provider name: {name}")
-        names.add(name)
-
-        raw_commands = raw_provider.get("commands", [])
-        commands = tuple(str(item).strip() for item in cast(Sequence[object], raw_commands))
-        if not commands or any(not EXEC_CREDENTIAL_COMMAND_RE.fullmatch(item) for item in commands):
-            raise ConfigError(f"{prefix}.commands must contain executable basenames")
-        for command in commands:
-            owner = command_owners.get(command)
-            if owner is not None:
-                raise ConfigError(f'exec credential command "{command}" is already owned by provider "{owner}"')
-            command_owners[command] = name
-
-        raw_roots = cast(Sequence[object], raw_provider.get("read_roots", []))
-        read_roots = tuple(
-            _absolute_path(item, field_name=f"{prefix}.read_roots[{root_index}]")
-            for root_index, item in enumerate(raw_roots)
-        )
-        raw_write_roots = cast(Sequence[object], raw_provider.get("write_roots", []))
-        write_roots = tuple(
-            _absolute_path(item, field_name=f"{prefix}.write_roots[{root_index}]")
-            for root_index, item in enumerate(raw_write_roots)
-        )
-
-        raw_passthrough = cast(Sequence[object], raw_provider.get("env_passthrough", []))
-        env_passthrough = tuple(str(item).strip() for item in raw_passthrough)
-        if any(not ENV_SECRET_RE.fullmatch(item) for item in env_passthrough):
-            raise ConfigError(f"{prefix}.env_passthrough must contain environment variable names")
-        if any(item.upper() in EXEC_CREDENTIAL_PASSTHROUGH_FORBIDDEN_ENV_NAMES for item in env_passthrough):
-            raise ConfigError(f"{prefix}.env_passthrough cannot override the isolated process environment")
-        if len(set(env_passthrough)) != len(env_passthrough):
-            raise ConfigError(f"{prefix}.env_passthrough cannot contain duplicates")
-
-        raw_env_paths = cast(Sequence[object], raw_provider.get("env_paths", []))
-        env_paths = tuple(
-            _parse_exec_credential_env_path(str(item), field_name=f"{prefix}.env_paths[{path_index}]")
-            for path_index, item in enumerate(raw_env_paths)
-        )
-        if len({key for key, _value in env_paths}) != len(env_paths):
-            raise ConfigError(f"{prefix}.env_paths cannot set the same variable more than once")
-
-        providers.append(
-            HostExecCredentialConfig(
-                name=name,
-                commands=commands,
-                read_roots=read_roots,
-                write_roots=write_roots,
-                env_passthrough=env_passthrough,
-                env_paths=env_paths,
-            )
-        )
-    return tuple(providers)
 
 
 def _normalize_extensions(
@@ -622,7 +516,6 @@ def load_host_config(
         shell_env_inherit=shell_env_inherit,
         allow_network=allow_network,
         auth_mode=auth_mode,
-        exec_credentials=_normalize_exec_credentials(security_map),
         auth_token_ref=auth_token_ref,
         oauth_client_id=cast(str | None, oauth_client_id),
         oauth_client_secret_ref=optional_secret_ref("oauth_client_secret_ref"),
@@ -875,17 +768,6 @@ def _host_fingerprint_payload(config: HostConfig) -> dict[str, object]:
             "shell_env_inherit": config.security.shell_env_inherit,
             "allow_network": config.security.allow_network,
             "auth_mode": config.security.auth_mode,
-            "exec_credentials": [
-                {
-                    "name": provider.name,
-                    "commands": list(provider.commands),
-                    "read_roots": [str(root) for root in provider.read_roots],
-                    "write_roots": [str(root) for root in provider.write_roots],
-                    "env_passthrough": list(provider.env_passthrough),
-                    "env_paths": [[name, str(path)] for name, path in provider.env_paths],
-                }
-                for provider in config.security.exec_credentials
-            ],
             "auth_token_ref": _jsonable(config.security.auth_token_ref),
             "oauth_client_id": config.security.oauth_client_id,
             "oauth_client_secret_ref": _jsonable(config.security.oauth_client_secret_ref),
