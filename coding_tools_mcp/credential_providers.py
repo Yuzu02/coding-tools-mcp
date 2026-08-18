@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
+import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import Literal
+from types import MappingProxyType
+from typing import Literal, Mapping
 
 from .config_schema import ConfigError
 
@@ -38,6 +42,7 @@ class CredentialRegistrySnapshot:
     error: str | None = None
     generation: str = ""
     fingerprint: str = ""
+    command_owners: Mapping[str, str] = dataclass_field(default_factory=lambda: MappingProxyType({}))
 
 
 def _path(raw: object, field: str) -> Path:
@@ -136,25 +141,100 @@ class CredentialProviderRegistry:
     def __init__(self, registry_dir: Path, broker_dir: Path) -> None:
         self.registry_dir = registry_dir
         self.broker_dir = broker_dir
+        self._generation: str | None = None
+        self._snapshot: CredentialRegistrySnapshot | None = None
 
-    def snapshot(self) -> CredentialRegistrySnapshot:
+    def _directory_generation(self) -> tuple[tuple[str, int, int, int, int], ...]:
+        entries: list[tuple[str, int, int, int, int]] = []
+        for fragment in sorted(self.registry_dir.glob("*.toml"), key=lambda item: item.name):
+            metadata = fragment.stat()
+            if stat.S_ISREG(metadata.st_mode):
+                entries.append(
+                    (fragment.name, metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+                )
+        return tuple(entries)
+
+    @staticmethod
+    def _generation_fingerprint(generation: tuple[tuple[str, int, int, int, int], ...]) -> str:
+        return hashlib.sha256(repr(generation).encode("utf-8")).hexdigest()
+
+    def _load_generation(
+        self, generation: tuple[tuple[str, int, int, int, int], ...], generation_id: str
+    ) -> CredentialRegistrySnapshot:
         try:
-            fragments = tuple(sorted(self.registry_dir.glob("*.toml"), key=lambda item: item.name))
             providers: list[CredentialProvider] = []
             names: set[str] = set()
             commands: dict[str, str] = {}
             digest = hashlib.sha256()
-            for fragment in fragments:
+            for filename, _, _, _, _ in generation:
+                fragment = self.registry_dir / filename
                 digest.update(fragment.read_bytes())
                 provider = _parse_fragment(fragment, self.broker_dir)
                 if provider.name in names:
-                    raise ConfigError(f"duplicate credential provider name: {provider.name}")
+                    raise ConfigError("duplicate credential provider name")
                 names.add(provider.name)
                 for command in provider.commands:
                     if command in commands:
-                        raise ConfigError(f'credential command "{command}" is already owned by provider "{commands[command]}"')
+                        raise ConfigError("duplicate credential command ownership")
                     commands[command] = provider.name
                 providers.append(provider)
-            return CredentialRegistrySnapshot(tuple(providers), "healthy", fingerprint=digest.hexdigest())
-        except (ConfigError, OSError) as exc:
-            return CredentialRegistrySnapshot((), "invalid", str(exc)[:256])
+            return CredentialRegistrySnapshot(
+                tuple(providers),
+                "healthy",
+                generation=generation_id,
+                fingerprint=digest.hexdigest(),
+                command_owners=MappingProxyType(dict(commands)),
+            )
+        except (ConfigError, OSError, UnicodeError):
+            return CredentialRegistrySnapshot(
+                (),
+                "invalid",
+                "invalid credential provider registry",
+                generation_id,
+                digest.hexdigest() if "digest" in locals() else hashlib.sha256().hexdigest(),
+                MappingProxyType({}),
+            )
+
+    def snapshot(self) -> CredentialRegistrySnapshot:
+        try:
+            generation = self._directory_generation()
+            generation_id = self._generation_fingerprint(generation)
+            if generation_id != self._generation:
+                self._snapshot = self._load_generation(generation, generation_id)
+                self._generation = generation_id
+            assert self._snapshot is not None
+            return self._snapshot
+        except OSError:
+            generation_id = hashlib.sha256(b"registry directory unavailable").hexdigest()
+            self._generation = generation_id
+            self._snapshot = CredentialRegistrySnapshot(
+                (), "invalid", "invalid credential provider registry", generation_id, hashlib.sha256().hexdigest()
+            )
+            return self._snapshot
+
+
+def atomic_write_fragment(path: Path, text: str) -> None:
+    """Publish a registry fragment atomically and durably within its directory."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
