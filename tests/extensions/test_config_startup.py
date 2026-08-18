@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from coding_tools_mcp.credential_providers import atomic_write_fragment
 from coding_tools_mcp.extensions import ConfigError, ExtensionManifest, ExtensionRegistry, RuntimeConfig
 from coding_tools_mcp.host_config import build_developer_snapshot
 from coding_tools_mcp.server import (
@@ -63,6 +64,8 @@ def write_host_config(
         "[runtime]",
         f"bootstrap_workspace = {json.dumps(str(workspace))}",
     ]
+    if state_root is None:
+        state_root = path.parent / "state"
     if runtime_root is not None:
         lines.append(f"runtime_root = {json.dumps(str(runtime_root))}")
     if state_root is not None:
@@ -178,33 +181,41 @@ class ConfigStartupTests(unittest.TestCase):
             finally:
                 runtime.close()
 
-    def test_build_runtime_propagates_host_exec_credential_providers(self) -> None:
+    def test_build_runtime_loads_host_exec_credential_providers_from_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workspace = root / "workspace"
             workspace.mkdir()
-            credential_root = root / "credential-store"
-            credential_root.mkdir()
-            xdg_data = root / "xdg-data"
             host = root / "host.toml"
             write_host_config(
                 host,
                 workspace=workspace,
-                security_extra=(
-                    "[[security.exec_credentials]]",
-                    'name = "vercel"',
-                    'commands = ["vercel"]',
-                    f'read_roots = [{json.dumps(str(credential_root))}]',
-                    'env_passthrough = ["VERCEL_TOKEN"]',
-                    f'env_paths = ["XDG_DATA_HOME={xdg_data}"]',
+            )
+            broker_root = root / "state" / "credentials" / "vercel"
+            credential_root = broker_root / "read"
+            xdg_data = broker_root / "data"
+            credential_root.mkdir(parents=True)
+            xdg_data.mkdir(parents=True)
+            atomic_write_fragment(
+                root / "credentials.d" / "vercel.toml",
+                "\n".join(
+                    (
+                        'name = "vercel"',
+                        'commands = ["vercel"]',
+                        f'read_roots = [{json.dumps(str(credential_root))}]',
+                        'env_passthrough = ["VERCEL_TOKEN"]',
+                        f'env_paths = ["VERCEL_CONFIG_DIR={xdg_data}"]',
+                        "",
+                    )
                 ),
             )
             args = build_parser().parse_args(["--host-config", str(host)])
 
             runtime = build_runtime(args, runtime_policy_from_args(args), emit_warning=False)
             try:
-                self.assertEqual(len(runtime.exec_credentials), 1)
-                self.assertEqual(runtime.exec_credentials[0].name, "vercel")
+                self.assertEqual(runtime.exec_credentials, ())
+                self.assertEqual(len(runtime._active_exec_credentials()), 1)
+                self.assertEqual(runtime._active_exec_credentials()[0].name, "vercel")
                 self.assertEqual(
                     runtime._exec_credential_read_roots("vercel whoami"),
                     [str(credential_root.resolve())],
