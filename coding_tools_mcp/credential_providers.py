@@ -77,6 +77,11 @@ def _parse_fragment(path: Path, broker_dir: Path) -> CredentialProvider:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"invalid credential provider fragment {path.name}") from exc
+    unknown = set(data) - {
+        "name", "commands", "read_roots", "write_roots", "env_passthrough", "env_paths"
+    }
+    if unknown:
+        raise ConfigError(f"unknown credential provider keys: {', '.join(sorted(unknown))}")
     name = data.get("name")
     if not isinstance(name, str) or not name.strip() or Path(name).name != name or name in {".", ".."}:
         raise ConfigError("credential provider name must be a safe non-empty name")

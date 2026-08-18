@@ -118,6 +118,14 @@ class HostConfigTests(unittest.TestCase):
             self.assertEqual(credential_registry_dir(config), path.parent / "credentials.d")
             self.assertEqual(credential_broker_dir(config), state_root.resolve() / "credentials")
 
+    def test_credential_broker_requires_runtime_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text("config_version = 2\n", encoding="utf-8")
+            config = load_host_config(path, extension_schemas={}, default_enabled=())
+            with self.assertRaisesRegex(ConfigError, "runtime.state_root"):
+                credential_broker_dir(config)
+
     def test_host_config_rejects_legacy_static_exec_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

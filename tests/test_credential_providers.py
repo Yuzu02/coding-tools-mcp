@@ -8,6 +8,19 @@ from coding_tools_mcp.credential_providers import CredentialProviderRegistry
 
 
 class CredentialProviderRegistryTests(unittest.TestCase):
+    def test_server_module_imports(self) -> None:
+        import coding_tools_mcp.server  # noqa: F401
+
+    def test_unknown_fragment_key_invalidates_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry_dir = root / "credentials.d"
+            registry_dir.mkdir()
+            (registry_dir / "bad.toml").write_text('name = "bad"\ncommands = ["bad"]\nunknown = true\n', encoding="utf-8")
+            snapshot = CredentialProviderRegistry(registry_dir, root / "broker").snapshot()
+            self.assertEqual(snapshot.health, "invalid")
+            self.assertEqual(snapshot.providers, ())
+
     def test_registry_rejects_provider_root_outside_own_broker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

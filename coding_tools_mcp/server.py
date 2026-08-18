@@ -57,13 +57,13 @@ from .extensions import (
 from .host_config import (
     ConfigSnapshot,
     HostConfig,
-    HostExecCredentialConfig,
     HostRuntimeConfig,
     build_developer_snapshot,
     build_host_snapshot,
     load_host_config,
     resolve_secret_ref,
 )
+from .credential_providers import CredentialProvider
 from .landlock_exec import libc_syscall
 from .oauth import (
     OAUTH_CODE_TTL_SECONDS,
@@ -121,6 +121,9 @@ from .telemetry import SessionTelemetry
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
 from .transport_stdio import serve_stdio
+
+
+HostExecCredentialConfig = CredentialProvider
 
 
 SERVER_NAME = "coding-tools-mcp"
