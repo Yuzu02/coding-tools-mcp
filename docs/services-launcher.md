@@ -583,9 +583,12 @@ use a command that reads or prints credential contents.
 
 `ProtectHome=tmpfs` still applies outside the MCP process. Providers must use
 their broker subtrees, not stores under a personal home, so no home bind is
-needed for credential discovery. Keep `BindPaths=` limited to the generic
-state root required by the service and never bind an entire home or config
-directory.
+needed for credential discovery. A service that must inherit non-secret
+Mise-managed user tools may bind only the two Mise subtrees read-only
+(`~/.config/mise` and `~/.local/share/mise`), set `MISE_CONFIG_DIR` and
+`MISE_DATA_DIR` to those paths, and retain `ProtectHome=tmpfs`. Never bind the
+home root, Git/GitHub config, or any credential store; project `mise.toml`
+files are already available through the registered project binds.
 
 Provision the runtime/state/cache/log roots outside the source tree and make
 them writable by the service account before preflight.
@@ -606,6 +609,8 @@ WorkingDirectory=/opt/coding-tools-mcp/repository
 EnvironmentFile=/etc/coding-tools-mcp/service.env
 Environment=HOME=/home/codingtools
 Environment=PATH=/home/codingtools/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=MISE_CONFIG_DIR=/home/codingtools/.config/mise
+Environment=MISE_DATA_DIR=/home/codingtools/.local/share/mise
 ExecStartPre=/usr/bin/env mise exec -- uv run --locked python scripts/start_services.py --host-config /etc/coding-tools-mcp/config.toml --preflight
 ExecStart=/usr/bin/env mise exec -- uv run --locked python scripts/start_services.py --host-config /etc/coding-tools-mcp/config.toml
 Restart=on-failure
@@ -617,6 +622,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=tmpfs
+BindReadOnlyPaths=/home/codingtools/.config/mise
+BindReadOnlyPaths=/home/codingtools/.local/share/mise
 BindReadOnlyPaths=/srv/projects/example
 BindPaths=/var/lib/coding-tools-mcp
 
