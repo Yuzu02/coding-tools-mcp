@@ -2211,6 +2211,22 @@ class Runtime:
                     category="security",
                 )
             add_unique(read_roots, executable_parent)
+            # A Mise npm tool loads modules from its version directory, not
+            # just its ``bin`` directory.  This is deliberately derived only
+            # for the exact ``installs/<tool>/<version>`` layout; it grants no
+            # credential-broker visibility and does not use provider config.
+            installs_dir = next((parent for parent in executable_path.parents if parent.name == "installs"), None)
+            if installs_dir is not None:
+                try:
+                    parts = executable_path.resolve(strict=False).relative_to(installs_dir).parts
+                except ValueError:
+                    parts = ()
+                if len(parts) >= 3:
+                    tool_root = installs_dir.joinpath(*parts[:2])
+                    if tool_root.is_dir() and not (
+                        broker_dir is not None and is_relative_to(broker_dir, tool_root)
+                    ):
+                        add_unique(read_roots, tool_root)
 
         add_unique(read_roots, self.workspace.root)
         add_unique(write_roots, self.workspace.root)

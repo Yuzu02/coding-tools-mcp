@@ -242,6 +242,57 @@ class CredentialLandlockTests(unittest.TestCase):
             self.assertEqual(isolation["enforced_for"], "all_exec")
             self.assertIn(isolation["status"], {"available", "unavailable"})
 
+    def test_mise_node_cli_allows_exact_installed_tool_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            executable = root / "mise" / "installs" / "npm-neon" / "3.6.0" / "bin" / "neon"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                with patch.dict(server_module.os.environ, {"PATH": str(executable.parent)}, clear=True):
+                    roots = runtime._credential_landlock_roots("neon --version", workspace)
+            finally:
+                runtime.close()
+            self.assertIn(executable.parent.parent, roots.read_roots)
+            self.assertNotIn(broker_dir, roots.read_roots)
+
+    def test_mise_tool_root_never_encompasses_credential_broker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            executable = root / "mise" / "installs" / "npm-neon" / "3.6.0" / "bin" / "neon"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            registry_dir = root / "credentials.d"
+            broker_dir = executable.parent.parent / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                with patch.dict(server_module.os.environ, {"PATH": str(executable.parent)}, clear=True):
+                    roots = runtime._credential_landlock_roots("neon --version", workspace)
+            finally:
+                runtime.close()
+            self.assertNotIn(executable.parent.parent, roots.read_roots)
+
 
 if __name__ == "__main__":
     unittest.main()
