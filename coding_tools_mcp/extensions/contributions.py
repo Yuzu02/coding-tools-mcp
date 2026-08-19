@@ -27,6 +27,7 @@ class ToolContribution:
     description: str
     input_schema: Mapping[str, Any]
     handler: ToolHandler
+    output_schema: Mapping[str, Any] | None = None
     annotations: ToolAnnotations = ToolAnnotations()
     error_status: str | None = None
     content_builder: ContentBuilder | None = None
@@ -68,6 +69,7 @@ class ComposedTool:
     handler: ToolHandler
     annotations: ToolAnnotations
     origin: str
+    output_schema: Mapping[str, Any] | None = None
     error_status: str | None = None
     content_builder: ContentBuilder | None = None
     text_renderer: ToolTextRenderer | None = None
@@ -194,6 +196,10 @@ def _validate_composed_tool(tool: ComposedTool) -> None:
     if missing:
         raise ContributionError(f"tool schema requires unknown properties: {tool.name}: {missing}")
 
+    # MCP 2026-07-28 permits any JSON Schema type for outputSchema. Keep the
+    # contribution boundary generic; runtime result validation applies the
+    # declared schema to structuredContent when a precise schema is present.
+
 
 def compose_tools(
     core_tools: Mapping[str, ComposedTool],
@@ -201,7 +207,15 @@ def compose_tools(
     extension_order: Sequence[str],
 ) -> Mapping[str, ComposedTool]:
     tools = {
-        name: replace(tool, input_schema=deepcopy(dict(tool.input_schema)))
+        name: replace(
+            tool,
+            input_schema=deepcopy(dict(tool.input_schema)),
+            output_schema=(
+                deepcopy(dict(tool.output_schema))
+                if tool.output_schema is not None
+                else None
+            ),
+        )
         for name, tool in core_tools.items()
     }
     for extension, contribution in contributions.tool_entries():
@@ -218,6 +232,11 @@ def compose_tools(
             content_builder=contribution.content_builder,
             text_renderer=contribution.text_renderer,
             origin=extension,
+            output_schema=(
+                deepcopy(dict(contribution.output_schema))
+                if contribution.output_schema is not None
+                else None
+            ),
         )
 
     rank = {name: index for index, name in enumerate(extension_order)}

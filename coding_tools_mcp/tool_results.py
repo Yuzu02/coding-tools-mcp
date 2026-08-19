@@ -15,6 +15,7 @@ def make_tool_result(
     is_error: bool,
     content: list[dict[str, Any]] | None = None,
     text_renderer: ToolTextRenderer | None = None,
+    include_structured_content: bool = True,
 ) -> dict[str, Any]:
     """Build an MCP result without mirroring structured JSON into model text.
 
@@ -34,7 +35,10 @@ def make_tool_result(
         result_content.append(
             {"type": "text", "text": _bounded_model_text(text, tool_name)}
         )
-    return {"content": result_content, "structuredContent": payload, "isError": is_error}
+    result: dict[str, Any] = {"content": result_content, "isError": is_error}
+    if include_structured_content:
+        result["structuredContent"] = payload
+    return result
 
 
 def render_tool_text(

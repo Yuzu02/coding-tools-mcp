@@ -233,8 +233,13 @@ class MCPContractTests(ComplianceTestCase):
                 schema = tool.get("inputSchema")
                 self.assert_schema_object(schema)
                 output_schema = tool.get("outputSchema")
-                self.assert_schema_object(output_schema)
-                self.assertIn("ok", output_schema.get("required", []))
+                if output_schema is not None:
+                    self.assert_schema_object(output_schema)
+
+    def test_core_tools_do_not_repeat_a_generic_output_schema(self) -> None:
+        tools = {str(tool.get("name")): tool for tool in self.client.list_tools()}
+
+        self.assertNotIn("outputSchema", tools["read_file"])
 
     def test_tool_annotations_match_mcp_sdk_hint_shape(self) -> None:
         expected = {
@@ -509,7 +514,7 @@ class MCPContractTests(ComplianceTestCase):
         listed_status, listed = self.modern_http_post(modern_request(3, "tools/list"))
         self.assertEqual(listed_status, 200, listed)
         self.assert_modern_result(listed.get("result", {}))
-        self.assertEqual(listed.get("result", {}).get("ttlMs"), 0)
+        self.assertEqual(listed.get("result", {}).get("ttlMs"), 60_000)
         self.assertEqual(listed.get("result", {}).get("cacheScope"), "private")
 
         # A tool that failed still answered completely: isError is a
@@ -1517,7 +1522,7 @@ class MCPContractTests(ComplianceTestCase):
             listed = self.stdio_rpc(process, modern_request(1, "tools/list"))
             result = listed.get("result", {})
             self.assert_modern_result(result)
-            self.assertEqual(result.get("ttlMs"), 0)
+            self.assertEqual(result.get("ttlMs"), 60_000)
             self.assertEqual(result.get("cacheScope"), "private")
 
             tools = result.get("tools")

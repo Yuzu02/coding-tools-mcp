@@ -89,6 +89,17 @@ from .oauth import (
     validate_access_token,
     verify_pkce,
 )
+from .mrtr import (
+    MRTR_MAX_ROUNDS,
+    InputRequired,
+    MRTRRequestContext,
+    bind_mrtr_context,
+    required_capabilities,
+    response_methods,
+    seal_request_state,
+    unseal_request_state,
+    validate_input_responses,
+)
 from .patching import (
     AtomicPatchCommitter,
     FileBaseline,
@@ -111,6 +122,7 @@ from .protocol import (
     HEADER_MISMATCH,
     KNOWN_PROTOCOL_VERSIONS,
     LATEST_LEGACY_PROTOCOL_VERSION,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
     MODERN_ERA,
     MODERN_PROTOCOL_VERSIONS,
     UNSUPPORTED_PROTOCOL_VERSION,
@@ -1840,6 +1852,7 @@ class Runtime:
         self.allow_network = allow_network or self.capabilities.network
         self.auth_token = auth_token or None
         self.oauth_config = oauth_config
+        self._request_state_secret = secrets.token_bytes(32)
         self.extension_registry = extension_registry or builtin_extension_registry()
         if extension_config is not None:
             self.extension_config = extension_config
@@ -2544,6 +2557,8 @@ class Runtime:
         *,
         context: RequestContext | None = None,
         operation_context: OperationContext | None = None,
+        input_responses: dict[str, Any] | None = None,
+        request_state: str | None = None,
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
@@ -2551,14 +2566,84 @@ class Runtime:
         if tool is None:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         validate_arguments(tool, args)
+        mrtr_state: dict[str, Any] = {}
+        mrtr_round = 0
+        expected_responses: dict[str, str] = {}
+        if request_state is not None:
+            mrtr_state, mrtr_round, expected_responses = unseal_request_state(
+                self._request_state_secret,
+                request_state,
+                tool_name=name,
+                arguments=args,
+            )
+            if expected_responses:
+                if input_responses is None:
+                    raise JsonRpcError(
+                        -32602,
+                        "inputResponses are required for this requestState",
+                        {"reason": "missing_input_responses"},
+                    )
+                validate_input_responses(expected_responses, input_responses)
+        elif input_responses is not None:
+            raise JsonRpcError(
+                -32602,
+                "inputResponses require the requestState returned by this server",
+                {"reason": "missing_request_state"},
+            )
+        mrtr_context = MRTRRequestContext(
+            input_responses=input_responses or {},
+            state=mrtr_state,
+            round=mrtr_round,
+        )
         try:
             with bind_operation_context(operation_context):
                 if operation_context is not None:
                     operation_context.cancellation.raise_if_cancelled()
-                payload = tool.handler(args)
+                with bind_mrtr_context(mrtr_context):
+                    payload = tool.handler(args)
                 if operation_context is not None:
                     operation_context.cancellation.raise_if_cancelled()
+            if isinstance(payload, InputRequired):
+                if context is None or context.era != MODERN_ERA:
+                    raise ToolFailure(
+                        "MRTR_REQUIRES_MODERN_PROTOCOL",
+                        "This tool requires MCP 2026-07-28 multi round-trip input.",
+                        category="unsupported",
+                        retryable=False,
+                    )
+                missing = required_capabilities(payload.input_requests, context.client_capabilities)
+                if missing:
+                    raise JsonRpcError(
+                        MISSING_REQUIRED_CLIENT_CAPABILITY,
+                        "The client does not declare capabilities required by this input request.",
+                        {"requiredCapabilities": missing},
+                    )
+                next_round = mrtr_round + 1
+                if next_round > MRTR_MAX_ROUNDS:
+                    raise JsonRpcError(
+                        -32602,
+                        "Multi round-trip request exceeded the server round limit.",
+                        {"reason": "input_required_round_limit", "maxRounds": MRTR_MAX_ROUNDS},
+                    )
+                expected = response_methods(payload.input_requests)
+                sealed_state = seal_request_state(
+                    self._request_state_secret,
+                    tool_name=name,
+                    arguments=args,
+                    state=payload.state,
+                    expected_responses=expected,
+                    round=next_round,
+                )
+                result: dict[str, Any] = {
+                    "resultType": "input_required",
+                    "requestState": sealed_state,
+                }
+                if payload.input_requests:
+                    result["inputRequests"] = payload.input_requests
+                self.emit_tool_trace(name, args, result, started_at, context=context)
+                return result
             payload.setdefault("ok", True)
+            validate_output_payload(tool, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = tool.content_builder(payload) if tool.content_builder else None
             return make_tool_result(
@@ -2568,6 +2653,8 @@ class Runtime:
                 content=content,
                 text_renderer=tool.text_renderer,
             )
+        except JsonRpcError:
+            raise
         except ToolFailure as exc:
             payload = {
                 "ok": False,
@@ -2595,7 +2682,13 @@ class Runtime:
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
             self.emit_tool_trace(name, args, payload, started_at, context=context)
-            return make_tool_result(name, payload, is_error=True, text_renderer=tool.text_renderer)
+            return make_tool_result(
+                name,
+                payload,
+                is_error=True,
+                text_renderer=tool.text_renderer,
+                include_structured_content=tool.output_schema is None,
+            )
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
             payload = {
                 "ok": False,
@@ -2610,7 +2703,13 @@ class Runtime:
             if tool.error_status:
                 payload["status"] = tool.error_status
             self.emit_tool_trace(name, args, payload, started_at, context=context)
-            return make_tool_result(name, payload, is_error=True, text_renderer=tool.text_renderer)
+            return make_tool_result(
+                name,
+                payload,
+                is_error=True,
+                text_renderer=tool.text_renderer,
+                include_structured_content=tool.output_schema is None,
+            )
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
@@ -5925,29 +6024,6 @@ def object_schema(properties: dict[str, Any] | None = None, required: list[str] 
     }
 
 
-def tool_output_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "ok": {"type": "boolean"},
-            "error": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string"},
-                    "message": {"type": "string"},
-                    "category": {"type": "string"},
-                    "retryable": {"type": "boolean"},
-                    "details": {"type": "object", "additionalProperties": True},
-                },
-                "required": ["code", "message", "category", "retryable", "details"],
-                "additionalProperties": True,
-            },
-        },
-        "required": ["ok"],
-        "additionalProperties": True,
-    }
-
-
 def core_tool_contracts(runtime: Runtime) -> dict[str, ComposedTool]:
     schemas = input_schemas()
     contracts: dict[str, ComposedTool] = {}
@@ -5979,6 +6055,21 @@ def validate_arguments(tool: ComposedTool | str, args: dict[str, Any]) -> None:
         validate_schema_value(args, schema, path="arguments")
     except ToolFailure as exc:
         raise JsonRpcError(-32602, exc.message, {"reason": "invalid_arguments", "code": exc.code}) from exc
+
+
+def validate_output_payload(tool: ComposedTool, payload: dict[str, Any]) -> None:
+    if tool.output_schema is None:
+        return
+    try:
+        validate_schema_value(payload, dict(tool.output_schema), path="structuredContent")
+    except ToolFailure as exc:
+        raise ToolFailure(
+            "OUTPUT_SCHEMA_VIOLATION",
+            f"Tool {tool.name} produced structured content that violates its declared output schema.",
+            category="internal",
+            retryable=False,
+            details={"reason": exc.message},
+        ) from exc
 
 
 def validate_schema_value(value: Any, schema: dict[str, Any], *, path: str) -> None:
@@ -6051,14 +6142,16 @@ def schema_type_name(expected_type: str | list[str]) -> str:
 
 def tool_definition(tool: ComposedTool, *, fake_readonly: bool = False) -> dict[str, Any]:
     annotations = tool_annotations(tool, fake_readonly=fake_readonly)
-    return {
+    definition = {
         "name": tool.name,
         "title": annotations["title"],
         "description": tool.description,
         "inputSchema": deepcopy(dict(tool.input_schema)),
-        "outputSchema": tool_output_schema(),
         "annotations": annotations,
     }
+    if tool.output_schema is not None:
+        definition["outputSchema"] = deepcopy(dict(tool.output_schema))
+    return definition
 
 
 def tool_annotations(tool: ComposedTool | str, *, fake_readonly: bool = False) -> dict[str, Any]:

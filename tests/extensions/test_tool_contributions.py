@@ -52,6 +52,35 @@ class ToolContributionTests(unittest.TestCase):
         assert tools["extra_tool"].text_renderer is not None
         self.assertEqual(tools["extra_tool"].text_renderer({"source": "extra"}), "extra:extra")
 
+    def test_precise_output_schema_is_preserved_without_becoming_required_for_all_tools(self) -> None:
+        output_schema = {
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "source": {"type": "string"},
+            },
+            "required": ["ok", "source"],
+            "additionalProperties": False,
+        }
+        registry = ContributionRegistry()
+        registry.add_tool(
+            "extra",
+            ToolContribution(
+                name="precise_tool",
+                title="Precise",
+                description="precise",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                output_schema=output_schema,
+                handler=lambda args: {"source": "extra"},
+            ),
+        )
+
+        tools = compose_tools({"core_tool": CORE}, registry, ("extra",))
+
+        self.assertIsNone(tools["core_tool"].output_schema)
+        self.assertEqual(tools["precise_tool"].output_schema, output_schema)
+        self.assertIsNot(tools["precise_tool"].output_schema, output_schema)
+
     def test_extension_cannot_replace_core_tool(self) -> None:
         registry = ContributionRegistry()
         registry.add_tool(

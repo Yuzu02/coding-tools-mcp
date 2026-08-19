@@ -405,7 +405,7 @@ class ConcurrentClientTests(ComplianceTestCase):
         self.assertEqual(modern_status, 200)
         modern_result = modern_response["result"]
         self.assertEqual(modern_result.get("resultType"), "complete", modern_result)
-        self.assertEqual(modern_result.get("ttlMs"), 0)
+        self.assertEqual(modern_result.get("ttlMs"), 60_000)
         self.assertEqual(modern_result.get("cacheScope"), "private")
         self.assertEqual(
             [tool["name"] for tool in modern_result["tools"]],

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import JsonRpcError
+from .mrtr import ClientCapabilityView, client_capability_view
 from .operation_context import OperationContext
 
 
@@ -56,6 +57,7 @@ MODERN_METHODS = frozenset(
 )
 MODERN_CACHEABLE_METHODS = frozenset({DISCOVER_METHOD, "tools/list"})
 MODERN_RESULT_TYPE = "complete"
+TOOLS_LIST_CACHE_TTL_MS = 60_000
 
 # The only two ``clientInfo`` fields anything reads, and the length a label
 # built from one is worth carrying.
@@ -77,6 +79,7 @@ class RequestContext:
     era: str = LEGACY_ERA
     protocol_version: str = LATEST_LEGACY_PROTOCOL_VERSION
     client_info: Mapping[str, Any] | None = None
+    client_capabilities: ClientCapabilityView = ClientCapabilityView()
 
 
 def jsonrpc_error(
@@ -322,11 +325,15 @@ def modern_request_context(params: Mapping[str, Any]) -> RequestContext:
     """Validate a modern request's ``_meta`` and turn it into a context."""
 
     version = validate_modern_meta(params)
-    declared = params["_meta"].get(META_CLIENT_INFO)
+    meta = params["_meta"]
+    declared = meta.get(META_CLIENT_INFO)
+    raw_capabilities = meta.get(META_CLIENT_CAPABILITIES)
+    capabilities = raw_capabilities if isinstance(raw_capabilities, Mapping) else {}
     return RequestContext(
         era=MODERN_ERA,
         protocol_version=version,
         client_info=bounded_client_info(declared) if isinstance(declared, dict) else None,
+        client_capabilities=client_capability_view(capabilities),
     )
 
 
@@ -348,7 +355,8 @@ def shape_result(
     if context.era != MODERN_ERA:
         return result
     shaped = dict(result)
-    shaped["resultType"] = MODERN_RESULT_TYPE
+    if shaped.get("resultType") != "input_required":
+        shaped["resultType"] = MODERN_RESULT_TYPE
     carried = shaped.get("_meta")
     meta = dict(carried) if isinstance(carried, dict) else {}
     meta[META_SERVER_INFO] = dict(server_identity)
@@ -358,7 +366,7 @@ def shape_result(
         # served under, and a discover result quotes the workspace's own
         # instruction files, so the conservative defaults apply to both:
         # never shared, never reused.
-        shaped["ttlMs"] = 0
+        shaped["ttlMs"] = TOOLS_LIST_CACHE_TTL_MS if method == "tools/list" else 0
         shaped["cacheScope"] = "private"
     return shaped
 
@@ -501,9 +509,17 @@ def _call_tool(
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         raise JsonRpcError(-32602, "tools/call arguments must be an object")
+    input_responses = params.get("inputResponses")
+    if input_responses is not None and not isinstance(input_responses, dict):
+        raise JsonRpcError(-32602, "tools/call inputResponses must be an object")
+    request_state = params.get("requestState")
+    if request_state is not None and not isinstance(request_state, str):
+        raise JsonRpcError(-32602, "tools/call requestState must be a string")
     return runtime.call_tool(
         params["name"],
         arguments,
         context=context,
         operation_context=operation_context,
+        input_responses=input_responses,
+        request_state=request_state,
     )

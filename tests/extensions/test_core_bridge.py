@@ -16,6 +16,13 @@ from coding_tools_mcp.extensions import (
     ToolDecorator,
 )
 from coding_tools_mcp.extensions.contributions import ToolHandler
+from coding_tools_mcp.mrtr import current_mrtr_context, input_required
+from coding_tools_mcp.protocol import (
+    META_CLIENT_CAPABILITIES,
+    META_PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSIONS,
+    dispatch_rpc,
+)
 from coding_tools_mcp.server import Runtime
 
 
@@ -30,6 +37,34 @@ class EchoExtension:
         pass
 
     def register(self, context):
+        def confirm(args: dict[str, Any]) -> dict[str, Any]:
+            mrtr = current_mrtr_context()
+            response = mrtr.input_responses.get("confirm")
+            if not isinstance(response, dict):
+                return input_required(
+                    {
+                        "confirm": {
+                            "method": "elicitation/create",
+                            "params": {
+                                "mode": "form",
+                                "message": "Confirm the test action",
+                                "requestedSchema": {
+                                    "type": "object",
+                                    "properties": {"confirmed": {"type": "boolean"}},
+                                    "required": ["confirmed"],
+                                },
+                            },
+                        }
+                    },
+                    state={"value": args["value"]},
+                )
+            accepted = response.get("action") == "accept"
+            content = response.get("content") if isinstance(response.get("content"), dict) else {}
+            return {
+                "value": str(mrtr.state.get("value", args["value"])),
+                "confirmed": bool(accepted and content.get("confirmed") is True),
+            }
+
         context.add_tool(
             ToolContribution(
                 name="extension_echo",
@@ -41,9 +76,35 @@ class EchoExtension:
                     "required": ["value"],
                     "additionalProperties": False,
                 },
-                handler=lambda args: {"value": args["value"]},
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["ok", "value"],
+                    "additionalProperties": False,
+                },
+                handler=lambda args: {
+                    "value": 7 if args["value"] == "bad-output" else args["value"]
+                },
                 annotations=ToolAnnotations(read_only=True, idempotent=True),
                 text_renderer=lambda payload: f"echo:{payload['value']}",
+            )
+        )
+        context.add_tool(
+            ToolContribution(
+                name="extension_confirm",
+                title="Extension confirm",
+                description="Exercise modern input-required flow.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+                handler=confirm,
+                annotations=ToolAnnotations(read_only=True, idempotent=True),
             )
         )
 
@@ -111,6 +172,30 @@ class CoreBridgeTests(unittest.TestCase):
             extension_config=RuntimeConfig.defaults(enabled=enabled),
         )
 
+    def modern_tool_request(
+        self,
+        request_id: int,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        capabilities: dict[str, Any] | None = None,
+        input_responses: dict[str, Any] | None = None,
+        request_state: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "name": name,
+            "arguments": arguments,
+            "_meta": {
+                META_PROTOCOL_VERSION: MODERN_PROTOCOL_VERSIONS[0],
+                META_CLIENT_CAPABILITIES: capabilities or {},
+            },
+        }
+        if input_responses is not None:
+            params["inputResponses"] = input_responses
+        if request_state is not None:
+            params["requestState"] = request_state
+        return {"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": params}
+
     def test_tools_list_contains_extension_contribution(self) -> None:
         runtime = self.runtime(("echo",))
         try:
@@ -118,6 +203,10 @@ class CoreBridgeTests(unittest.TestCase):
             self.assertIn("extension_echo", tools)
             self.assertTrue(tools["extension_echo"]["annotations"]["readOnlyHint"])
             self.assertEqual(tools["extension_echo"]["inputSchema"]["required"], ["value"])
+            self.assertEqual(
+                tools["extension_echo"]["outputSchema"]["required"],
+                ["ok", "value"],
+            )
         finally:
             runtime.close()
 
@@ -141,6 +230,112 @@ class CoreBridgeTests(unittest.TestCase):
         try:
             with self.assertRaisesRegex(JsonRpcError, "arguments.value is required"):
                 runtime.call_tool("extension_echo", {})
+        finally:
+            runtime.close()
+
+    def test_declared_output_schema_is_enforced_without_leaking_invalid_structured_content(self) -> None:
+        runtime = self.runtime(("echo",))
+        try:
+            result = runtime.call_tool("extension_echo", {"value": "bad-output"})
+            self.assertTrue(result["isError"], result)
+            self.assertNotIn("structuredContent", result)
+            text = "\n".join(
+                str(item.get("text", ""))
+                for item in result["content"]
+                if item.get("type") == "text"
+            )
+            self.assertIn("OUTPUT_SCHEMA_VIOLATION", text)
+        finally:
+            runtime.close()
+
+    def test_modern_tool_call_can_round_trip_input_required_state_without_session_state(self) -> None:
+        runtime = self.runtime(("echo",))
+        try:
+            first = dispatch_rpc(
+                runtime,
+                self.modern_tool_request(
+                    1,
+                    "extension_confirm",
+                    {"value": "hello"},
+                    capabilities={"elicitation": {}},
+                ),
+            )
+            assert first is not None
+            result = first["result"]
+            self.assertEqual(result["resultType"], "input_required")
+            self.assertIn("confirm", result["inputRequests"])
+            state = result["requestState"]
+
+            second = dispatch_rpc(
+                runtime,
+                self.modern_tool_request(
+                    2,
+                    "extension_confirm",
+                    {"value": "hello"},
+                    capabilities={"elicitation": {}},
+                    input_responses={
+                        "confirm": {"action": "accept", "content": {"confirmed": True}}
+                    },
+                    request_state=state,
+                ),
+            )
+            assert second is not None
+            second_result = second["result"]
+            self.assertEqual(second_result["resultType"], "complete")
+            self.assertTrue(second_result["structuredContent"]["confirmed"])
+            self.assertEqual(second_result["structuredContent"]["value"], "hello")
+        finally:
+            runtime.close()
+
+    def test_modern_input_required_rejects_missing_capability_and_tampered_state(self) -> None:
+        runtime = self.runtime(("echo",))
+        try:
+            missing = dispatch_rpc(
+                runtime,
+                self.modern_tool_request(1, "extension_confirm", {"value": "hello"}),
+            )
+            assert missing is not None
+            self.assertEqual(missing["error"]["code"], -32021, missing)
+
+            first = dispatch_rpc(
+                runtime,
+                self.modern_tool_request(
+                    2,
+                    "extension_confirm",
+                    {"value": "hello"},
+                    capabilities={"elicitation": {}},
+                ),
+            )
+            assert first is not None
+            state = first["result"]["requestState"]
+            tampered = state[:-1] + ("A" if state[-1] != "A" else "B")
+            bad = dispatch_rpc(
+                runtime,
+                self.modern_tool_request(
+                    3,
+                    "extension_confirm",
+                    {"value": "hello"},
+                    capabilities={"elicitation": {}},
+                    input_responses={"confirm": {"action": "decline"}},
+                    request_state=tampered,
+                ),
+            )
+            assert bad is not None
+            self.assertEqual(bad["error"]["code"], -32602, bad)
+
+            wrong_args = dispatch_rpc(
+                runtime,
+                self.modern_tool_request(
+                    4,
+                    "extension_confirm",
+                    {"value": "different"},
+                    capabilities={"elicitation": {}},
+                    input_responses={"confirm": {"action": "decline"}},
+                    request_state=state,
+                ),
+            )
+            assert wrong_args is not None
+            self.assertEqual(wrong_args["error"]["code"], -32602, wrong_args)
         finally:
             runtime.close()
 
