@@ -434,7 +434,7 @@ class RuntimeHelperTests(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), f"__main__.py {server_module.__version__}")
+        self.assertEqual(result.stdout.strip(), f"coding-tools-mcp {server_module.__version__}")
 
     def test_workspace_init_tolerates_missing_home_lookup(self) -> None:
         with TemporaryDirectory() as tmp:

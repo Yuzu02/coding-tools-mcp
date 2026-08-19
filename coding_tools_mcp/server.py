@@ -7402,7 +7402,10 @@ def run_stdio(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Serve workspace-confined coding tools over MCP.")
+    parser = argparse.ArgumentParser(
+        prog="coding-tools-mcp",
+        description="Serve workspace-confined coding tools over MCP.",
+    )
     parser.add_argument(
         "--version",
         action="version",
