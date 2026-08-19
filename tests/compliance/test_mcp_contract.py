@@ -253,6 +253,8 @@ class MCPContractTests(ComplianceTestCase):
             "resolve_project": (True, False, True, False),
             "list_skills": (True, False, True, False),
             "read_skill": (True, False, True, False),
+            "project_context": (True, False, True, False),
+            "doctor": (True, False, True, False),
             "apply_patch": (False, True, False, False),
             "exec_command": (False, True, False, True),
             "list_commands": (True, False, True, False),
@@ -1527,7 +1529,7 @@ class MCPContractTests(ComplianceTestCase):
 
             tools = result.get("tools")
             self.assertIsInstance(tools, list)
-            self.assertEqual(len(tools), 24)
+            self.assertEqual(len(tools), 26)
             self.assertTrue({tool.get("name") for tool in tools} >= set(REQUIRED_TOOLS))
             for tool in tools:
                 # The cache hints describe the catalog, not the entries in it;
