@@ -6,7 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from coding_tools_mcp.errors import ToolFailure
 from coding_tools_mcp.extensions import RuntimeConfig
+from coding_tools_mcp.extensions.projects.extension import ProjectsExtension
+from coding_tools_mcp.recovery import recovery_call_tool
 from coding_tools_mcp.server import Runtime, WorkspaceCommandManager
 
 
@@ -211,6 +214,29 @@ class ProjectCommandRoutingTests(unittest.TestCase):
             self.assertEqual(conflict["structuredContent"]["error"]["code"], "IDEMPOTENCY_CONFLICT")
         finally:
             runtime.close()
+
+    def test_project_boundary_restores_explicit_project_id_into_client_request_recovery(self) -> None:
+        failure = ToolFailure(
+            "COMMAND_STARTING",
+            "still starting",
+            category="runtime",
+            retryable=True,
+            details={
+                "recovery": recovery_call_tool(
+                    "get_command",
+                    {"client_request_id": "request-1"},
+                    "Check the retained command.",
+                )
+            },
+        )
+
+        ProjectsExtension._restore_project_failure(failure, "alpha")
+
+        recovery = failure.details["recovery"]
+        self.assertEqual(
+            recovery["arguments"],
+            {"client_request_id": "request-1", "project_id": "alpha"},
+        )
 
     def test_get_command_by_command_id_needs_no_project_id(self) -> None:
         runtime = self.runtime()

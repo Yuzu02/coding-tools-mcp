@@ -24,6 +24,7 @@ META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
 META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
 META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
 META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+META_OPERATION_ID = "io.coding-tools/operationId"
 
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 MISSING_REQUIRED_CLIENT_CAPABILITY = -32021
@@ -342,6 +343,7 @@ def shape_result(
     method: str,
     result: dict[str, Any],
     server_identity: Mapping[str, Any],
+    operation_context: OperationContext | None = None,
 ) -> dict[str, Any]:
     """Encode one successful result for the era that asked for it.
 
@@ -360,6 +362,8 @@ def shape_result(
     carried = shaped.get("_meta")
     meta = dict(carried) if isinstance(carried, dict) else {}
     meta[META_SERVER_INFO] = dict(server_identity)
+    if method == "tools/call" and operation_context is not None:
+        meta[META_OPERATION_ID] = operation_context.operation_id
     shaped["_meta"] = meta
     if method in MODERN_CACHEABLE_METHODS:
         # A catalog is shaped by the workspace and the permission mode it was
@@ -422,7 +426,13 @@ def dispatch_rpc(
         return {
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": shape_result(context, method, result, runtime.server_identity()),
+            "result": shape_result(
+                context,
+                method,
+                result,
+                runtime.server_identity(),
+                operation_context,
+            ),
         }
     except JsonRpcError as exc:
         if is_notification:

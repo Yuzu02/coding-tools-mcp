@@ -118,6 +118,13 @@ from .processes import (
     start_command_watchdog,
     terminate_process_group,
 )
+from .recovery import continuation_call_tool, recovery_call_tool
+from .request_identity import (
+    REQUEST_ID_MAX_LENGTH,
+    REQUEST_ID_RE,
+    request_fingerprint,
+    validate_request_id,
+)
 from .protocol import (
     HEADER_MISMATCH,
     KNOWN_PROTOCOL_VERSIONS,
@@ -277,9 +284,9 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
-CLIENT_REQUEST_ID_MAX_LENGTH = 128
+CLIENT_REQUEST_ID_MAX_LENGTH = REQUEST_ID_MAX_LENGTH
 CLIENT_REQUEST_START_WAIT_SECONDS = 5.0
-CLIENT_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+CLIENT_REQUEST_ID_RE = REQUEST_ID_RE
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -1106,14 +1113,17 @@ def truncation_fields(truncation: TextTruncation) -> dict[str, Any]:
 
 
 def read_output_action(output_ref: str, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
-    return {
-        "tool": "read_output",
-        "arguments": {
+    return cast(
+        dict[str, Any],
+        continuation_call_tool(
+            "read_output",
+            {
             "output_ref": output_ref,
             "offset": offset,
             "limit": EXEC_PREVIEW_BYTES if limit is None else limit,
-        },
-    }
+            },
+        ),
+    )
 
 
 _TOOL_PATHS: dict[str, str] = {}
@@ -2910,14 +2920,14 @@ class Runtime:
             "warnings": warnings,
         }
         if next_start_line is not None:
-            result["next_action"] = {
-                "tool": "read_file",
-                "arguments": {
+            result["next_action"] = continuation_call_tool(
+                "read_file",
+                {
                     "path": requested_path,
                     "start_line": next_start_line,
                     "max_bytes": max_bytes,
                 },
-            }
+            )
         return result
 
     def list_dir(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -3466,15 +3476,7 @@ class Runtime:
             )
 
     def _validated_client_request_id(self, raw: Any) -> str | None:
-        if raw is None:
-            return None
-        if not isinstance(raw, str) or not CLIENT_REQUEST_ID_RE.fullmatch(raw):
-            raise ToolFailure(
-                "INVALID_ARGUMENT",
-                "client_request_id must be 1-128 characters using letters, digits, '.', '_', ':', or '-'.",
-                category="validation",
-            )
-        return raw
+        return validate_request_id(raw, field_name="client_request_id")
 
     def _command_request_fingerprint(
         self,
@@ -3491,7 +3493,7 @@ class Runtime:
             if isinstance(explicit_env, dict)
             else []
         )
-        canonical = json.dumps(
+        return request_fingerprint(
             {
                 "cmd": cmd,
                 "workdir": workdir.display,
@@ -3499,22 +3501,27 @@ class Runtime:
                 "tty": tty,
                 "stdin": stdin_text,
                 "env": env_items,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(canonical).hexdigest()
+            }
+        )
 
     def _recover_deduplicated_command(
         self, binding: ClientRequestBinding, args: dict[str, Any]
     ) -> dict[str, Any]:
         if not binding.ready.wait(CLIENT_REQUEST_START_WAIT_SECONDS):
+            client_request_id = self._validated_client_request_id(args.get("client_request_id"))
+            details: dict[str, Any] = {}
+            if client_request_id is not None:
+                details["recovery"] = recovery_call_tool(
+                    "get_command",
+                    {"client_request_id": client_request_id},
+                    "Check the existing idempotent command instead of starting another command.",
+                )
             raise ToolFailure(
                 "COMMAND_STARTING",
                 "The idempotent command is still starting; retry with the same client_request_id.",
                 category="runtime",
                 retryable=True,
+                details=details,
             )
         if binding.command_id is None:
             raise ToolFailure(
@@ -4304,7 +4311,19 @@ class Runtime:
             if binding is None:
                 raise ToolFailure("COMMAND_NOT_FOUND", "No command is retained for client_request_id.", category="not_found")
             if not binding.ready.is_set() or binding.command_id is None:
-                raise ToolFailure("COMMAND_STARTING", "The command is still starting; retry get_command with the same client_request_id.", category="runtime", retryable=True)
+                raise ToolFailure(
+                    "COMMAND_STARTING",
+                    "The command is still starting; retry get_command with the same client_request_id.",
+                    category="runtime",
+                    retryable=True,
+                    details={
+                        "recovery": recovery_call_tool(
+                            "get_command",
+                            {"client_request_id": client_request_id},
+                            "Re-check the same idempotent command without starting duplicate work.",
+                        )
+                    },
+                )
             command_id = binding.command_id
             recovered_by = "client_request_id"
         else:
@@ -4323,14 +4342,14 @@ class Runtime:
         if terminal:
             self._complete_command(command)
         if payload.get("status") == "running":
-            payload["next_action"] = {
-                "tool": "write_stdin",
-                "arguments": {
+            payload["next_action"] = continuation_call_tool(
+                "write_stdin",
+                {
                     "command_id": command.command_id,
                     "chars": "",
                     "yield_time_ms": 10000,
                 },
-            }
+            )
         output_refs = {
             "stdout": f"command:{command.command_id}:stdout",
             "stderr": f"command:{command.command_id}:stderr",
@@ -4588,7 +4607,10 @@ class Runtime:
             warnings = list(payload.get("warnings", []))
             warnings.append("Process did not exit after TERM/SIGKILL; command retained for retry or watchdog cleanup.")
             payload["warnings"] = warnings
-            payload["next_action"] = "retry kill_command or wait for watchdog cleanup"
+            payload["next_action"] = continuation_call_tool(
+                "get_command",
+                {"command_id": command.command_id},
+            )
         if evict:
             with self.commands_lock:
                 self.commands.pop(command_id, None)
@@ -4806,16 +4828,16 @@ class Runtime:
             "warnings": ["commit limit reached"] if truncated else [],
         }
         if truncated:
-            result["next_action"] = {
-                "tool": "git_log",
-                "arguments": {
+            result["next_action"] = continuation_call_tool(
+                "git_log",
+                {
                     **({"workdir": workdir.display} if workdir.display != "." else {}),
                     **({"path": path_filter} if path_filters else {}),
                     "ref": ref,
                     "max_count": max_count,
                     "skip": skip + max_count,
                 },
-            }
+            )
         return result
 
     def git_show(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -4929,10 +4951,7 @@ class Runtime:
             }
             if ref:
                 next_arguments["rev"] = ref
-            result["next_action"] = {
-                "tool": "git_blame",
-                "arguments": next_arguments,
-            }
+            result["next_action"] = continuation_call_tool("git_blame", next_arguments)
         return result
 
     def request_permissions(self, args: dict[str, Any]) -> dict[str, Any]:

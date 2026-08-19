@@ -28,6 +28,16 @@ from coding_tools_mcp.patching import (
     apply_update_hunks,
     parse_patch,
 )
+from coding_tools_mcp.operation_context import new_operation_context
+from coding_tools_mcp.protocol import (
+    META_CLIENT_CAPABILITIES,
+    META_OPERATION_ID,
+    META_PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSIONS,
+    dispatch_rpc,
+)
+from coding_tools_mcp.recovery import continuation_call_tool, recovery_call_tool
+from coding_tools_mcp.request_identity import request_fingerprint, validate_request_id
 from coding_tools_mcp.server import (
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
     LANDLOCK_ACCESS_FS_TRUNCATE,
@@ -1958,14 +1968,17 @@ Maven home: /usr/share/maven
             (workspace / "sample.txt").write_text("one\ntwo\nthree\n", encoding="utf-8")
             runtime = Runtime(workspace, permission_mode="trusted")
 
-            cwd_result = runtime.exec_command(
+            ignored_alias = runtime.exec_command(
                 {"cmd": "pwd", "cwd": "nested", "timeout_ms": 5000, "max_output_bytes": 4096}
             )
-            self.assertEqual(cwd_result.get("exit_code"), 0)
-            self.assertEqual(Path(str(cwd_result.get("stdout", "")).strip()).name, "nested")
+            self.assertEqual(ignored_alias.get("exit_code"), 0)
+            self.assertEqual(Path(str(ignored_alias.get("stdout", "")).strip()), workspace)
 
-            with self.assertRaises(ToolFailure):
-                runtime.exec_command({"cmd": "pwd", "workdir": ".", "cwd": "nested"})
+            canonical = runtime.exec_command(
+                {"cmd": "pwd", "workdir": "nested", "timeout_ms": 5000, "max_output_bytes": 4096}
+            )
+            self.assertEqual(canonical.get("exit_code"), 0)
+            self.assertEqual(Path(str(canonical.get("stdout", "")).strip()).name, "nested")
 
             read = runtime.read_file({"path": "sample.txt", "start_line": 2, "max_lines": 1})
             self.assertEqual(read.get("content"), "two\n")
@@ -2393,6 +2406,111 @@ class FakeReadonlyAnnotationTests(unittest.TestCase):
                 ]
                 args = parser.parse_args(argv)
                 self.assertEqual(server_module.run_http(args), 2)
+
+
+class OperationRecoveryIdentityTests(unittest.TestCase):
+    def test_modern_tool_call_exposes_bounded_server_operation_id_only_in_meta(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(
+                Path(tmp),
+                extension_config=server_module.RuntimeConfig.defaults(enabled=()),
+                permission_mode="dangerous",
+            )
+            try:
+                operation = new_operation_context(7)
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "server_info",
+                        "arguments": {},
+                        "_meta": {
+                            META_PROTOCOL_VERSION: MODERN_PROTOCOL_VERSIONS[0],
+                            META_CLIENT_CAPABILITIES: {},
+                        },
+                    },
+                }
+                response = dispatch_rpc(runtime, request, operation_context=operation)
+                assert response is not None
+                result = response["result"]
+                self.assertEqual(result["_meta"][META_OPERATION_ID], operation.operation_id)
+                self.assertLessEqual(len(operation.operation_id), 32)
+                self.assertNotIn(operation.operation_id, json.dumps(result.get("content", [])))
+                self.assertNotIn(
+                    "operation_id",
+                    runtime._tools["server_info"].input_schema.get("properties", {}),
+                )
+
+                legacy = dispatch_rpc(
+                    runtime,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 8,
+                        "method": "tools/call",
+                        "params": {"name": "server_info", "arguments": {}},
+                    },
+                    operation_context=new_operation_context(8),
+                )
+                assert legacy is not None
+                self.assertNotIn("_meta", legacy["result"])
+            finally:
+                runtime.close()
+
+    def test_structured_recovery_is_rendered_without_authorizing_it(self) -> None:
+        recovery = recovery_call_tool(
+            "get_command",
+            {"project_id": "alpha", "client_request_id": "request-1"},
+            "Re-check the existing idempotent command instead of starting another one.",
+        )
+        payload = {
+            "ok": False,
+            "error": {
+                "code": "COMMAND_STARTING",
+                "message": "Command is still starting.",
+                "category": "runtime",
+                "retryable": True,
+                "details": {"recovery": recovery},
+            },
+        }
+        text = render_tool_text("get_command", payload, is_error=True)
+        self.assertIn("Recovery: get_command(", text)
+        self.assertIn('project_id="alpha"', text)
+        self.assertIn('client_request_id="request-1"', text)
+        self.assertIn("Re-check the existing idempotent command", text)
+        self.assertNotIn("authorized", text.lower())
+
+    def test_continuation_helper_strips_root_workdir_and_rejects_host_paths(self) -> None:
+        self.assertEqual(
+            continuation_call_tool(
+                "git_log",
+                {"workdir": ".", "ref": "HEAD", "skip": 10},
+            ),
+            {"tool": "git_log", "arguments": {"ref": "HEAD", "skip": 10}},
+        )
+        for arguments in (
+            {"workdir": "/srv/project"},
+            {"path": "/srv/project/file.py"},
+            {"path": r"C:\\repo\\file.py"},
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(ValueError, "absolute"):
+                    continuation_call_tool("read_file", arguments)
+
+    def test_future_request_id_helper_is_shared_bounded_and_deterministic(self) -> None:
+        self.assertEqual(validate_request_id("work:abc-123"), "work:abc-123")
+        self.assertIsNone(validate_request_id(None))
+        for invalid in ("", "space here", "x" * 129, 123):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ToolFailure):
+                    validate_request_id(invalid)
+
+        first = request_fingerprint({"tool": "work_claim", "args": {"b": 2, "a": 1}})
+        second = request_fingerprint({"args": {"a": 1, "b": 2}, "tool": "work_claim"})
+        changed = request_fingerprint({"tool": "work_claim", "args": {"a": 1, "b": 3}})
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+        self.assertEqual(len(first), 64)
 
 
 def file_path(name: str):

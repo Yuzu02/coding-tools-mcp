@@ -353,7 +353,11 @@ class ProjectsExtension:
             project_id = str(args.get("project_id", ""))
             clean = dict(args)
             clean.pop("project_id", None)
-            payload = self._require_runtimes().invoke(project_id, next_handler, clean)
+            try:
+                payload = self._require_runtimes().invoke(project_id, next_handler, clean)
+            except ToolFailure as exc:
+                self._restore_project_failure(exc, project_id)
+                raise
             return self._restore_project_addressing(payload, project_id)
 
         return routed
@@ -406,7 +410,11 @@ class ProjectsExtension:
                         "project_id does not own the requested command_id.",
                         category="validation",
                     )
-                payload = runtimes.invoke(owner, next_handler, clean)
+                try:
+                    payload = runtimes.invoke(owner, next_handler, clean)
+                except ToolFailure as exc:
+                    self._restore_project_failure(exc, owner)
+                    raise
                 return self._restore_project_addressing(payload, owner)
 
             if supplied_project is None or not str(supplied_project):
@@ -424,7 +432,11 @@ class ProjectsExtension:
                     "No command is retained for client_request_id in the selected project.",
                     category="not_found",
                 )
-            payload = runtimes.workspace_runtimes.invoke(runtime.workspace, next_handler, clean)
+            try:
+                payload = runtimes.workspace_runtimes.invoke(runtime.workspace, next_handler, clean)
+            except ToolFailure as exc:
+                self._restore_project_failure(exc, project_id)
+                raise
             return self._restore_project_addressing(payload, project_id)
 
         return routed
@@ -624,6 +636,26 @@ class ProjectsExtension:
         if isinstance(raw_actions, list):
             restored["next_actions"] = [restore_action(action) for action in raw_actions]
         return restored
+
+    @staticmethod
+    def _restore_project_failure(exc: ToolFailure, project_id: str) -> None:
+        raw_recovery = exc.details.get("recovery")
+        if not isinstance(raw_recovery, dict) or raw_recovery.get("kind") != "call_tool":
+            return
+        tool = raw_recovery.get("tool")
+        raw_arguments = raw_recovery.get("arguments")
+        if not isinstance(tool, str) or not isinstance(raw_arguments, dict):
+            return
+        needs_project = tool in PROJECT_SCOPED_PUBLIC_TOOLS or (
+            tool in {"get_command", "list_commands"} and "client_request_id" in raw_arguments
+        )
+        if not needs_project:
+            return
+        recovery = dict(raw_recovery)
+        arguments = dict(raw_arguments)
+        arguments.setdefault("project_id", project_id)
+        recovery["arguments"] = arguments
+        exc.details["recovery"] = recovery
 
     def _require_registry(self) -> ProjectRegistry:
         if self._registry is None:

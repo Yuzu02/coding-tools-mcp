@@ -10,6 +10,9 @@ from typing import Iterator
 from .errors import ToolFailure
 
 
+OPERATION_ID_MAX_LENGTH = 32
+
+
 class CancellationToken:
     """Thread-safe request cancellation state shared with request-owned work."""
 
@@ -50,8 +53,11 @@ _CURRENT_OPERATION: contextvars.ContextVar[OperationContext | None] = contextvar
 
 
 def new_operation_context(request_id: str | int | None) -> OperationContext:
+    operation_id = secrets.token_urlsafe(12)
+    if len(operation_id) > OPERATION_ID_MAX_LENGTH:  # defensive if token encoding changes
+        operation_id = operation_id[:OPERATION_ID_MAX_LENGTH]
     return OperationContext(
-        operation_id=secrets.token_urlsafe(12),
+        operation_id=operation_id,
         request_id=request_id,
         cancellation=CancellationToken(),
     )

@@ -85,6 +85,15 @@ def _render_error(payload: dict[str, Any]) -> str:
     retry_hint = details.get("retry_hint")
     if isinstance(retry_hint, str) and retry_hint:
         lines.append(f"Retry: {retry_hint}")
+    recovery = details.get("recovery")
+    if isinstance(recovery, dict) and recovery.get("kind") == "call_tool":
+        tool = recovery.get("tool")
+        arguments = recovery.get("arguments")
+        reason = recovery.get("reason")
+        if isinstance(tool, str) and isinstance(arguments, dict):
+            call = _render_tool_call(tool, arguments)
+            suffix = f" Reason: {reason}" if isinstance(reason, str) and reason else ""
+            lines.append(f"Recovery: {call}.{suffix}")
     diagnostics = payload.get("diagnostics")
     if isinstance(diagnostics, list):
         for item in diagnostics:
