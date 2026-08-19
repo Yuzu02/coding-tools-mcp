@@ -6,6 +6,7 @@ from typing import Any, Callable, Mapping, cast
 
 from coding_tools_mcp.errors import ToolFailure
 from coding_tools_mcp.host_config import ConfigSnapshot
+from coding_tools_mcp.operation_context import observe_backend
 
 from ..api import ExtensionContext, ExtensionManifest
 from ..config import ConfigError, scalar, table
@@ -410,6 +411,7 @@ class SemanticExtension:
     def _services(self) -> tuple[ProjectRegistry, ProjectRuntimeManager, SemanticBackend]:
         if self._registry is None or self._runtimes is None or self._backend is None:
             raise RuntimeError("semantic extension is not registered")
+        observe_backend(self._backend.backend_name)
         return self._registry, self._runtimes, self._backend
 
     def _project(self, project_id: str) -> RegisteredProject:

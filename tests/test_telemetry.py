@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from coding_tools_mcp import telemetry
+from coding_tools_mcp.operation_context import new_operation_context
 from coding_tools_mcp.protocol import dispatch_rpc
 from coding_tools_mcp.server import Runtime
 from coding_tools_mcp.telemetry import ERROR_EVENTS_PER_SESSION, SessionTelemetry
@@ -200,6 +201,45 @@ def _run_probe_session() -> _CapturingSender:
 
 
 class SessionEventTests(unittest.TestCase):
+    def test_operation_event_is_closed_bounded_and_carries_no_operation_id_or_sensitive_values(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(), patch.object(telemetry, "_get_sender", lambda: sender):
+            session = SessionTelemetry(permission_mode="safe")
+            session.record_request("modern", "tools/call")
+            operation = new_operation_context(7)
+            operation.observability.set_project_id("alpha")
+            operation.observability.set_provider("neon")
+            operation.observability.set_backend("serena")
+            session.record_tool_call(
+                "exec_command",
+                ok=False,
+                error_code="COMMAND_START_FAILED",
+                duration_ms=1250,
+                truncated=False,
+                status="failed",
+                input_size_class="size_lt_4k",
+                output_size_class="size_lt_1k",
+                operation=operation,
+            )
+            session.finish()
+
+        events = [event for event in sender.events if event["event"] == "tool_operation"]
+        self.assertEqual(len(events), 1)
+        properties = _properties(events[0])
+        self.assertEqual(properties["tool"], "exec_command")
+        self.assertEqual(properties["project_id"], "alpha")
+        self.assertEqual(properties["provider"], "neon")
+        self.assertEqual(properties["backend"], "serena")
+        self.assertEqual(properties["duration_bucket"], "dur_lt_10s")
+        self.assertEqual(properties["input_size_class"], "size_lt_4k")
+        self.assertEqual(properties["output_size_class"], "size_lt_1k")
+        self.assertEqual(properties["status"], "failed")
+        serialized = json.dumps(events)
+        self.assertNotIn(operation.operation_id, serialized)
+        self.assertNotIn("command", properties)
+        self.assertNotIn("arguments", properties)
+        self.assertNotIn("path", properties)
+
     def test_payload_never_contains_paths_arguments_or_content(self) -> None:
         sender = _run_probe_session()
         serialized = json.dumps(sender.events)
@@ -508,7 +548,10 @@ class DocumentationDriftTests(unittest.TestCase):
     def test_documented_schema_matches_emitted_events(self) -> None:
         doc = (Path(__file__).resolve().parents[1] / "docs" / "telemetry.md").read_text(encoding="utf-8")
         emitted = {str(event["event"]) for event in _run_probe_session().events}
-        self.assertEqual(emitted, {"session_start", "handshake", "tool_error", "tool_summary", "session_end"})
+        self.assertEqual(
+            emitted,
+            {"session_start", "handshake", "tool_operation", "tool_error", "tool_summary", "session_end"},
+        )
         for name in emitted:
             self.assertIn(f"`{name}`", doc)
         self.assertIn(f"max {ERROR_EVENTS_PER_SESSION} per session", doc)

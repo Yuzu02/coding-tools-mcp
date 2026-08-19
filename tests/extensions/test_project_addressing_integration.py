@@ -75,10 +75,12 @@ class ProjectAddressingIntegrationTests(unittest.TestCase):
     def test_stdio_layered_config_exposes_fixed_multi_project_contract(self) -> None:
         with StdioMCPClient(self.bootstrap, extra_args=self.extra_args) as client:
             tools = {tool["name"]: tool for tool in client.rpc("tools/list")["tools"]}
-            self.assertEqual(len(tools), 24)
+            self.assertEqual(len(tools), 26)
             self.assertIn("list_projects", tools)
             self.assertIn("resolve_project", tools)
-            for name in (*PROJECT_SCOPED_CORE_TOOLS, "list_skills", "read_skill"):
+            self.assertIn("project_context", tools)
+            self.assertIn("doctor", tools)
+            for name in (*PROJECT_SCOPED_CORE_TOOLS, "list_skills", "read_skill", "project_context"):
                 with self.subTest(name=name):
                     self.assertIn("project_id", tools[name]["inputSchema"]["required"])
 

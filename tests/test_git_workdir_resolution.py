@@ -149,26 +149,20 @@ class GitWorkdirResolutionTests(unittest.TestCase):
             finally:
                 runtime.close()
 
-    def test_git_status_preserves_path_as_legacy_workdir_alias(self) -> None:
+    def test_git_status_uses_only_canonical_workdir_for_repository_selection(self) -> None:
         temporary, workspace, _, _ = self.make_workspace()
         with temporary:
             runtime = Runtime(workspace)
             try:
-                legacy = runtime.git_status({"path": "alpha"})
-                explicit = runtime.git_status({"workdir": "alpha"})
-                explicit_with_default_alias = runtime.git_status(
-                    {"workdir": "alpha", "path": "."}
-                )
-                legacy_with_default_workdir = runtime.git_status(
-                    {"workdir": ".", "path": "alpha"}
-                )
-                self.assertEqual(legacy["head"], explicit["head"])
-                self.assertEqual(explicit_with_default_alias["head"], explicit["head"])
-                self.assertEqual(legacy_with_default_workdir["head"], explicit["head"])
+                schema = input_schemas()["git_status"]
+                self.assertIn("workdir", schema["properties"])
+                self.assertNotIn("path", schema["properties"])
 
-                with self.assertRaises(ToolFailure) as captured:
-                    runtime.git_status({"path": "alpha", "workdir": "beta"})
-                self.assertEqual(captured.exception.code, "INVALID_ARGUMENT")
+                explicit = runtime.git_status({"workdir": "alpha"})
+                ignored_legacy_path = runtime.git_status({"path": "alpha"})
+                self.assertTrue(explicit["is_repo"])
+                self.assertEqual(explicit["workdir"], "alpha")
+                self.assertFalse(ignored_legacy_path["is_repo"])
             finally:
                 runtime.close()
 

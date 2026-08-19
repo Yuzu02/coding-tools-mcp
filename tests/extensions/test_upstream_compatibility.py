@@ -56,7 +56,14 @@ class UpstreamBridgeCompatibilityTests(unittest.TestCase):
                 self.assertEqual(
                     set(default_runtime.exposed_tool_names()),
                     set(TOOL_REGISTRY)
-                    | {"list_projects", "resolve_project", "list_skills", "read_skill"},
+                    | {
+                        "list_projects",
+                        "resolve_project",
+                        "list_skills",
+                        "read_skill",
+                        "project_context",
+                        "doctor",
+                    },
                 )
             finally:
                 default_runtime.close()

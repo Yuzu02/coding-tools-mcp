@@ -29,9 +29,11 @@ from .host import ExtensionHost
 from .registry import ExtensionRegistry, ExtensionRegistryError
 from .services import (
     CORE_CONFIG_SNAPSHOT,
+    CORE_OPERATION_POLICY_HEALTH,
     CORE_WORKSPACE,
     CORE_WORKSPACE_RUNTIMES,
     CapabilityKey,
+    OperationPolicyHealth,
     ServiceRegistry,
     ServiceRegistryError,
     WorkspaceAccess,
@@ -56,9 +58,11 @@ __all__ = [
     "ConfigError",
     "ConfigNode",
     "CORE_CONFIG_SNAPSHOT",
+    "CORE_OPERATION_POLICY_HEALTH",
     "CORE_WORKSPACE",
     "CORE_WORKSPACE_RUNTIMES",
     "CapabilityKey",
+    "OperationPolicyHealth",
     "ComposedTool",
     "ContributionError",
     "ContributionRegistry",

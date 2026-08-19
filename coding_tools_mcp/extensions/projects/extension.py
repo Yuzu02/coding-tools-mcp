@@ -14,9 +14,11 @@ from ..config import map_of, scalar, table
 from ..contributions import SchemaPatch, ToolAnnotations, ToolContribution, ToolDecorator, ToolHandler
 from ..services import (
     CORE_CONFIG_SNAPSHOT,
+    CORE_OPERATION_POLICY_HEALTH,
     CORE_WORKSPACE,
     CORE_WORKSPACE_RUNTIMES,
     CapabilityKey,
+    OperationPolicyHealth,
     ServiceRegistryError,
 )
 from .project_catalog import ProjectCatalog, build_project_catalog
@@ -77,6 +79,7 @@ class ProjectsExtension:
         self._registry: ProjectRegistry | None = None
         self._runtimes: ProjectRuntimeManager | None = None
         self._snapshot: ConfigSnapshot | None = None
+        self._operation_policy_health: OperationPolicyHealth | None = None
 
     def configure(self, config: Mapping[str, object]) -> None:
         self._config = config
@@ -87,6 +90,10 @@ class ProjectsExtension:
     def register(self, context: ExtensionContext) -> None:
         workspace = context.services.require(CORE_WORKSPACE)
         workspace_runtimes = context.services.require(CORE_WORKSPACE_RUNTIMES)
+        try:
+            self._operation_policy_health = context.services.require(CORE_OPERATION_POLICY_HEALTH)
+        except ServiceRegistryError:
+            self._operation_policy_health = None
         try:
             snapshot = context.services.require(CORE_CONFIG_SNAPSHOT)
         except ServiceRegistryError:
@@ -840,6 +847,21 @@ class ProjectsExtension:
                 f"{len(registry.projects())} project(s) are registered.",
             )
         )
+        if self._operation_policy_health is not None:
+            health = dict(self._operation_policy_health.operation_policy_health())
+            policy_status = str(health.pop("status", "warn"))
+            if policy_status not in {"pass", "warn", "fail"}:
+                policy_status = "warn"
+            checks.append(
+                self._doctor_check(
+                    "operation_policy",
+                    policy_status,
+                    "Execution policy and credential isolation are healthy."
+                    if policy_status == "pass"
+                    else "Execution policy or credential isolation needs operator attention.",
+                    details=health,
+                )
+            )
 
         payload: dict[str, Any] = {"ok": True, "checks": checks, "warnings": []}
         if project_id is None:

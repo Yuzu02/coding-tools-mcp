@@ -46,6 +46,8 @@ class BlockingHTTPRuntime:
         *,
         context=None,
         operation_context=None,
+        input_responses: dict[str, Any] | None = None,
+        request_state: str | None = None,
     ) -> dict[str, Any]:
         self.started.set()
         deadline = time.monotonic() + 2.0

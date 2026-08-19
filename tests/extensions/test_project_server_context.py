@@ -131,6 +131,14 @@ class ProjectServerContextTests(unittest.TestCase):
         try:
             global_payload = runtime.call_tool("doctor", {})["structuredContent"]
             self.assertIn("checks", global_payload)
+            operation_policy = next(
+                check for check in global_payload["checks"] if check["id"] == "operation_policy"
+            )
+            self.assertIn(operation_policy["status"], {"pass", "warn", "fail"})
+            serialized_policy = json.dumps(operation_policy)
+            self.assertNotIn(str(self.root), serialized_policy)
+            self.assertNotIn("read_roots", serialized_policy)
+            self.assertNotIn("write_roots", serialized_policy)
             self.assertLessEqual(
                 len(json.dumps(global_payload, separators=(",", ":")).encode()),
                 12 * 1024,

@@ -159,9 +159,11 @@ class ProjectAddressingToolTests(unittest.TestCase):
             extension_config=RuntimeConfig.defaults(enabled=()),
         )
         try:
-            self.assertEqual(len(default.exposed_tool_names()), 24)
+            self.assertEqual(len(default.exposed_tool_names()), 26)
             self.assertIn("list_projects", default.exposed_tool_names())
             self.assertIn("resolve_project", default.exposed_tool_names())
+            self.assertIn("project_context", default.exposed_tool_names())
+            self.assertIn("doctor", default.exposed_tool_names())
             listed = default.call_tool("list_projects", {})["structuredContent"]
             self.assertEqual(listed["projects"][0]["id"], "default")
             self.assertEqual(len(disabled.exposed_tool_names()), 20)

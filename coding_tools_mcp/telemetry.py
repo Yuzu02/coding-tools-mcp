@@ -44,6 +44,7 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 from .envutils import ENV_PREFIX, truthy_env, utc_now
+from .operation_context import OperationContext
 from .protocol import DISCOVER_METHOD, MODERN_ERA
 
 POSTHOG_ENDPOINT = "https://us.i.posthog.com/batch/"
@@ -70,6 +71,8 @@ _UNKNOWN_LABEL = "unknown"
 _OFF_VALUES = {"0", "off", "false", "no", "disable", "disabled"}
 _DURATION_BUCKETS = ((100, "dur_lt_100ms"), (1_000, "dur_lt_1s"), (10_000, "dur_lt_10s"))
 _DURATION_OVERFLOW = "dur_gte_10s"
+_SIZE_BUCKETS = ((1_024, "size_lt_1k"), (4_096, "size_lt_4k"), (16_384, "size_lt_16k"), (262_144, "size_lt_256k"))
+_SIZE_OVERFLOW = "size_gte_256k"
 _RETENTION_COUNTERS = (
     "evict_events",
     "evicted_bytes_total",
@@ -146,6 +149,28 @@ def _request_identity(context: Any) -> tuple[str | None, str | None]:
     if getattr(context, "era", None) != MODERN_ERA:
         return None, None
     return _client_identity(getattr(context, "client_info", None))
+
+
+def duration_bucket(duration_ms: int) -> str:
+    for limit, name in _DURATION_BUCKETS:
+        if duration_ms < limit:
+            return name
+    return _DURATION_OVERFLOW
+
+
+def size_class(value: object) -> str:
+    """Classify JSON-ish payload size without retaining any payload content."""
+
+    try:
+        size = len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        )
+    except Exception:  # noqa: BLE001 - classification must never affect a tool call
+        return "size_unknown"
+    for limit, name in _SIZE_BUCKETS:
+        if size < limit:
+            return name
+    return _SIZE_OVERFLOW
 
 
 _first_seen_lock = threading.Lock()
@@ -382,18 +407,19 @@ class SessionTelemetry:
         duration_ms: int,
         truncated: bool,
         context: Any = None,
+        status: str | None = None,
+        input_size_class: str | None = None,
+        output_size_class: str | None = None,
+        operation: OperationContext | None = None,
     ) -> None:
         emit_error: tuple[str, int] | None = None
+        emit_operation = False
+        bucket = duration_bucket(duration_ms)
         with self._lock:
             stats = self._tools.get(tool)
             if stats is None:
                 stats = self._tools[tool] = {"calls": 0, "errors": {}, "buckets": {}, "truncated": 0}
             stats["calls"] += 1
-            bucket = _DURATION_OVERFLOW
-            for limit, name in _DURATION_BUCKETS:
-                if duration_ms < limit:
-                    bucket = name
-                    break
             stats["buckets"][bucket] = stats["buckets"].get(bucket, 0) + 1
             if truncated:
                 stats["truncated"] += 1
@@ -412,6 +438,29 @@ class SessionTelemetry:
                         emit_error = (code, streak)
                     else:
                         self._errors_dropped += 1
+            emit_operation = self._active
+        if emit_operation and telemetry_mode() != "off":
+            observed = operation.observability.snapshot() if operation is not None else None
+            self._emit(
+                [
+                    self._event(
+                        "tool_operation",
+                        {
+                            "tool": _label(tool),
+                            "ok": ok,
+                            "error_code": _label(error_code),
+                            "duration_bucket": bucket,
+                            "status": _label(status),
+                            "input_size_class": _label(input_size_class),
+                            "output_size_class": _label(output_size_class),
+                            "project_id": _label(observed.project_id) if observed else None,
+                            "worktree_id": _label(observed.worktree_id) if observed else None,
+                            "backend": _label(observed.backend) if observed else None,
+                            "provider": _label(observed.provider) if observed else None,
+                        },
+                    )
+                ]
+            )
         if emit_error is not None and telemetry_mode() != "off":
             client_name, client_version = _request_identity(context)
             self._emit(
@@ -421,7 +470,7 @@ class SessionTelemetry:
                         {
                             "tool": _label(tool),
                             "error_code": emit_error[0],
-                            "duration_ms": duration_ms,
+                            "duration_bucket": bucket,
                             "consecutive_failures": emit_error[1],
                             "client_name": client_name,
                             "client_version": client_version,

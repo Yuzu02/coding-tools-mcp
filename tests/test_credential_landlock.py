@@ -5,14 +5,17 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from coding_tools_mcp import server as server_module
+from coding_tools_mcp.child_operation import child_operation_target
 from coding_tools_mcp.credential_providers import CredentialProviderRegistry, atomic_write_fragment
 from coding_tools_mcp.errors import ToolFailure
+from coding_tools_mcp.extensions import RuntimeConfig
 from coding_tools_mcp.server import Runtime
 
 
@@ -20,6 +23,33 @@ class CredentialLandlockTests(unittest.TestCase):
     def setUp(self) -> None:
         if sys.platform != "linux" or not Path("/proc").exists() or shutil.which("head") is None:
             self.skipTest("credential Landlock tests require a POSIX Linux host with head")
+        # Mise's system layer intentionally sets TMPDIR=/var/tmp. These tests
+        # create synthetic credential brokers, and a broker beneath a globally
+        # writable temp root must be rejected by the runtime. Keep fixtures in
+        # the repo's ignored tmp-run tree so the production /tmp + /var/tmp
+        # contract is exercised without placing the broker inside either root.
+        temp_root = Path(__file__).resolve().parents[1] / "tmp-run" / "credential-landlock"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        previous_tempdir = tempfile.tempdir
+        tempfile.tempdir = str(temp_root)
+        self.addCleanup(setattr, tempfile, "tempdir", previous_tempdir)
+
+    @staticmethod
+    def _credential_roots(runtime: Runtime, command: str, workdir: Path):
+        target = child_operation_target(runtime.workspace.root, workdir)
+        provider = runtime._exec_credential_provider(command)
+        environment = runtime._command_env(
+            {},
+            workdir=target.workdir,
+            command=command,
+            provider_override=provider,
+        )
+        return runtime._credential_landlock_roots(
+            command,
+            target,
+            environment=environment,
+            provider=provider,
+        )
 
     @staticmethod
     def _write_provider(
@@ -75,6 +105,106 @@ class CredentialLandlockTests(unittest.TestCase):
             self.assertEqual(result.get("exit_code"), 0, result)
             self.assertIn("A_BLOCKED", result.get("stdout", ""))
             self.assertIn("B_BLOCKED", result.get("stdout", ""))
+
+    def test_registered_project_rejects_workdir_escape_before_provider_selection(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap = root / "bootstrap"
+            project = root / "project"
+            outside = root / "outside"
+            for path in (bootstrap, project, outside):
+                path.mkdir()
+                (path / "pyproject.toml").write_text(
+                    "[project]\nname='fixture'\nversion='0'\n", encoding="utf-8"
+                )
+            (project / "escape").symlink_to(outside, target_is_directory=True)
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                bootstrap,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+                extension_config=RuntimeConfig.defaults(
+                    enabled=("projects",),
+                    settings={"projects": {"registry": {"alpha": {"root": str(project)}}}},
+                ),
+            )
+            try:
+                with patch.object(
+                    runtime,
+                    "_exec_credential_provider",
+                    wraps=runtime._exec_credential_provider,
+                ) as select:
+                    for workdir in ("../outside", "escape"):
+                        with self.subTest(workdir=workdir):
+                            result = runtime.call_tool(
+                                "exec_command",
+                                {"project_id": "alpha", "workdir": workdir, "cmd": "echo blocked"},
+                            )
+                            self.assertTrue(result["isError"], result)
+                    select.assert_not_called()
+            finally:
+                runtime.close()
+
+    def test_registered_project_nested_workdir_uses_same_command_provider_rule(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bootstrap = root / "bootstrap"
+            project = root / "project"
+            nested = project / "nested"
+            bootstrap.mkdir()
+            nested.mkdir(parents=True)
+            for path in (bootstrap, project):
+                (path / "pyproject.toml").write_text(
+                    "[project]\nname='fixture'\nversion='0'\n", encoding="utf-8"
+                )
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            read_root = broker_dir / "echo" / "read"
+            write_root = broker_dir / "echo" / "write"
+            self._write_provider(
+                registry_dir,
+                broker_dir,
+                "echo-provider",
+                "echo",
+                read_root,
+                write_root,
+            )
+            runtime = Runtime(
+                bootstrap,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+                extension_config=RuntimeConfig.defaults(
+                    enabled=("projects",),
+                    settings={"projects": {"registry": {"alpha": {"root": str(project)}}}},
+                ),
+            )
+            try:
+                with patch.object(
+                    runtime,
+                    "_exec_credential_provider",
+                    wraps=runtime._exec_credential_provider,
+                ) as select:
+                    root_result = runtime.call_tool(
+                        "exec_command", {"project_id": "alpha", "cmd": "echo root"}
+                    )
+                    nested_result = runtime.call_tool(
+                        "exec_command",
+                        {"project_id": "alpha", "workdir": "nested", "cmd": "echo nested"},
+                    )
+                self.assertFalse(root_result["isError"], root_result)
+                self.assertFalse(nested_result["isError"], nested_result)
+                self.assertGreaterEqual(len(select.call_args_list), 2)
+                self.assertEqual(
+                    {call.args[0] for call in select.call_args_list},
+                    {"echo root", "echo nested"},
+                )
+            finally:
+                runtime.close()
 
     def test_non_provider_can_read_its_own_proc_self_metadata(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -420,7 +550,7 @@ class CredentialLandlockTests(unittest.TestCase):
                 credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
             )
             try:
-                roots = runtime._credential_landlock_roots("echo ok", workspace)
+                roots = self._credential_roots(runtime, "echo ok", workspace)
                 isolation = runtime.server_info_payload()["credential_providers"]["filesystem_isolation"]
             finally:
                 runtime.close()
@@ -464,7 +594,7 @@ class CredentialLandlockTests(unittest.TestCase):
             }
             try:
                 with patch.dict(server_module.os.environ, host_env, clear=True):
-                    roots = runtime._credential_landlock_roots("mise run verify", workspace)
+                    roots = self._credential_roots(runtime, "mise run verify", workspace)
             finally:
                 runtime.close()
 
@@ -494,7 +624,7 @@ class CredentialLandlockTests(unittest.TestCase):
                 credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
             )
             try:
-                roots = runtime._credential_landlock_roots("mise run verify", workspace)
+                roots = self._credential_roots(runtime, "mise run verify", workspace)
             finally:
                 runtime.close()
 
@@ -527,7 +657,7 @@ class CredentialLandlockTests(unittest.TestCase):
                     clear=True,
                 ):
                     with self.assertRaises(ToolFailure) as raised:
-                        runtime._credential_landlock_roots("mise run verify", workspace)
+                        self._credential_roots(runtime, "mise run verify", workspace)
             finally:
                 runtime.close()
 
@@ -562,7 +692,7 @@ class CredentialLandlockTests(unittest.TestCase):
                     {"PATH": "/usr/bin", "MISE_CONFIG_DIR": str(user_config)},
                     clear=True,
                 ):
-                    roots = runtime._credential_landlock_roots("mise run verify", workspace)
+                    roots = self._credential_roots(runtime, "mise run verify", workspace)
             finally:
                 runtime.close()
 
@@ -589,7 +719,7 @@ class CredentialLandlockTests(unittest.TestCase):
             )
             try:
                 with patch.dict(server_module.os.environ, {"PATH": str(executable.parent)}, clear=True):
-                    roots = runtime._credential_landlock_roots("neon --version", workspace)
+                    roots = self._credential_roots(runtime, "neon --version", workspace)
             finally:
                 runtime.close()
             self.assertIn(executable.parent.parent, roots.read_roots)
@@ -615,7 +745,7 @@ class CredentialLandlockTests(unittest.TestCase):
             )
             try:
                 with patch.dict(server_module.os.environ, {"PATH": str(executable.parent)}, clear=True):
-                    roots = runtime._credential_landlock_roots("neon --version", workspace)
+                    roots = self._credential_roots(runtime, "neon --version", workspace)
             finally:
                 runtime.close()
             self.assertNotIn(executable.parent.parent, roots.read_roots)

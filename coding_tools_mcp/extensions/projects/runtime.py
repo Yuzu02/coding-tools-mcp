@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 
 from coding_tools_mcp.errors import ToolFailure
+from coding_tools_mcp.operation_context import observe_project_id
 from coding_tools_mcp.execution_target import ExecutionTarget, bind_execution_target
 from coding_tools_mcp.project_context import ProjectContext, load_project_context
 
@@ -85,6 +86,7 @@ class ProjectRuntimeManager:
             project = self.registry.require_available(project_id)
         except ProjectRegistryError as exc:
             raise _project_failure(exc) from exc
+        observe_project_id(project.project_id)
 
         with self._lock:
             if self._closed:

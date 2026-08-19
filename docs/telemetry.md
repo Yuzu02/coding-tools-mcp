@@ -43,11 +43,15 @@ whichever client connected first.
 | --- | --- | --- |
 | `session_start` | the first request or notification of the session, `ping` excepted | — |
 | `handshake` | every MCP `initialize` | negotiated protocol version, the client's `clientInfo` name and version |
-| `tool_error` | a tool call fails (max 20 per session) | tool name, error code, duration ms, consecutive-failure count, and for a 2026-07-28 request the `clientInfo` name and version it carried |
+| `tool_operation` | every tool call while the session is active | tool name, success flag, error code, bounded status, duration bucket, input/output size classes, and bounded non-secret project/worktree/backend/provider labels observed while serving the call |
+| `tool_error` | a tool call fails (max 20 per session) | tool name, error code, duration bucket, consecutive-failure count, and for a 2026-07-28 request the `clientInfo` name and version it carried |
 | `tool_summary` | session ends, one per tool used | calls, ok, errors, per-error-code counts, duration buckets, truncation count |
 | `session_end` | session ends | session duration, total calls, distinct tools, dropped error-event count, handshake-era and 2026-07-28 request counts, `server/discover` probe count, retained-output eviction and omitted-read counters |
 
-A typical session produces 5–15 events totalling a few kilobytes.
+`tool_operation` is intentionally one event per tool call; the remaining event
+types are session-, handshake-, error-budget-, or summary-scoped. Operation
+events contain only closed labels and buckets, never the tool arguments or
+result body used to derive the size classes.
 
 ## What a session is
 
@@ -78,6 +82,12 @@ make up an address or a path, so that neither can travel verbatim — and then
 truncated to 40 characters. Only `name` and `version` are read; a handshake-era
 `tool_error` carries no identity at all, because the request that failed did
 not name one.
+
+`project_id`, `worktree_id`, `backend`, and credential-provider name on a
+`tool_operation` are bounded routing labels, not paths or credential values.
+The operation id itself is never emitted. Input and output sizes are emitted
+only as coarse buckets (`<1 KiB`, `<4 KiB`, `<16 KiB`, `<256 KiB`, or
+`>=256 KiB`), and duration is emitted only as a bucket.
 
 ## First-appearance server log
 

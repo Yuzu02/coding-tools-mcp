@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
@@ -115,6 +115,12 @@ class WorkspaceRuntimeService(Protocol):
         raise NotImplementedError
 
 
+class OperationPolicyHealth(Protocol):
+    def operation_policy_health(self) -> Mapping[str, object]:
+        raise NotImplementedError
+
+
 CORE_WORKSPACE = CapabilityKey[WorkspaceAccess]("core.workspace")
 CORE_WORKSPACE_RUNTIMES = CapabilityKey[WorkspaceRuntimeService]("core.workspace_runtimes")
 CORE_CONFIG_SNAPSHOT = CapabilityKey["ConfigSnapshot"]("core.config_snapshot")
+CORE_OPERATION_POLICY_HEALTH = CapabilityKey[OperationPolicyHealth]("core.operation_policy_health")

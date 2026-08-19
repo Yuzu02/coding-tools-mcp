@@ -36,16 +36,19 @@ from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 from . import __version__
+from .child_operation import ChildOperationTarget, child_operation_target
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
 from .operation_context import (
     OperationContext,
     bind_operation_context,
     new_operation_context,
+    observe_provider,
     raise_if_operation_cancelled,
 )
 from .extensions import (
     CORE_CONFIG_SNAPSHOT,
+    CORE_OPERATION_POLICY_HEALTH,
     CORE_WORKSPACE,
     CORE_WORKSPACE_RUNTIMES,
     ComposedTool,
@@ -146,13 +149,14 @@ from .protocol import (
 )
 from .project_context import ProjectContext, load_project_context
 from .runtime_contract import RUNTIME_CONTRACT_VERSION
-from .telemetry import SessionTelemetry
+from .telemetry import SessionTelemetry, size_class
 from .textutils import DEFAULT_MAX_LINES, TextTruncation, truncate_text_head
 from .tool_results import make_tool_result
 from .transport_stdio import serve_stdio
 
 
 HostExecCredentialConfig = CredentialProvider
+_PROVIDER_UNSET = object()
 
 
 SERVER_NAME = "coding-tools-mcp"
@@ -1943,6 +1947,7 @@ class Runtime:
                 core_tools=core_tool_contracts(self),
                 seed_services=(
                     (CORE_CONFIG_SNAPSHOT, self.config_snapshot),
+                    (CORE_OPERATION_POLICY_HEALTH, self),
                     (CORE_WORKSPACE, bootstrap_workspace),
                     (CORE_WORKSPACE_RUNTIMES, self.workspace_runtime_service),
                 ),
@@ -2193,12 +2198,17 @@ class Runtime:
     def landlock_write_roots(self, command: str | None = None) -> list[Path]:
         return [self.runtime_dir, *self._exec_credential_write_roots(command)]
 
-    def _credential_landlock_roots(self, command: str, workdir: Path) -> CredentialLandlockRoots:
+    def _credential_landlock_roots(
+        self,
+        command: str,
+        target: ChildOperationTarget,
+        *,
+        environment: dict[str, str],
+        provider: HostExecCredentialConfig | None,
+    ) -> CredentialLandlockRoots:
         """Build the narrow filesystem profile used by every host-config child."""
 
         self._ensure_runtime_dirs()
-        environment = self._command_env({}, workdir=workdir, command=command)
-        provider = self._exec_credential_provider(command)
         read_roots: list[Path] = []
         write_roots: list[Path] = []
         broker_dir = (
@@ -2291,7 +2301,7 @@ class Runtime:
             if "/" in executable or "\\" in executable:
                 executable_path = Path(executable).expanduser()
                 if not executable_path.is_absolute():
-                    executable_path = workdir / executable_path
+                    executable_path = target.workdir / executable_path
             else:
                 resolved_executable = shutil.which(executable, path=environment.get("PATH"))
                 if resolved_executable is None:
@@ -2330,8 +2340,8 @@ class Runtime:
                     ):
                         add_unique(read_roots, tool_root)
 
-        add_unique(read_roots, self.workspace.root)
-        add_unique(write_roots, self.workspace.root)
+        add_unique(read_roots, target.root)
+        add_unique(write_roots, target.root)
         if provider is not None:
             for root in provider.read_roots:
                 add_unique(read_roots, root)
@@ -2700,11 +2710,25 @@ class Runtime:
                 }
                 if payload.input_requests:
                     result["inputRequests"] = payload.input_requests
-                self.emit_tool_trace(name, args, result, started_at, context=context)
+                self.emit_tool_trace(
+                    name,
+                    args,
+                    result,
+                    started_at,
+                    context=context,
+                    operation_context=operation_context,
+                )
                 return result
             payload.setdefault("ok", True)
             validate_output_payload(tool, payload)
-            self.emit_tool_trace(name, args, payload, started_at, context=context)
+            self.emit_tool_trace(
+                name,
+                args,
+                payload,
+                started_at,
+                context=context,
+                operation_context=operation_context,
+            )
             content = tool.content_builder(payload) if tool.content_builder else None
             return make_tool_result(
                 name,
@@ -2741,7 +2765,14 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
-            self.emit_tool_trace(name, args, payload, started_at, context=context)
+            self.emit_tool_trace(
+                name,
+                args,
+                payload,
+                started_at,
+                context=context,
+                operation_context=operation_context,
+            )
             return make_tool_result(
                 name,
                 payload,
@@ -2762,7 +2793,14 @@ class Runtime:
             }
             if tool.error_status:
                 payload["status"] = tool.error_status
-            self.emit_tool_trace(name, args, payload, started_at, context=context)
+            self.emit_tool_trace(
+                name,
+                args,
+                payload,
+                started_at,
+                context=context,
+                operation_context=operation_context,
+            )
             return make_tool_result(
                 name,
                 payload,
@@ -2803,6 +2841,31 @@ class Runtime:
             "warnings": warnings,
         }
 
+    def operation_policy_health(self) -> dict[str, object]:
+        """Return a path-free health summary for doctor/operator surfaces."""
+
+        landlock = landlock_status_payload()
+        registry = self._credential_registry_snapshot()
+        registry_health = registry.health if registry is not None else "not-configured"
+        landlock_enforced = self._landlock_enforced(landlock)
+        status = "pass"
+        if registry_health == "invalid" or (
+            self.credential_registry is not None and not landlock_enforced
+        ):
+            status = "fail"
+        elif not landlock_enforced and self.landlock_enabled():
+            status = "warn"
+        return {
+            "status": status,
+            "permission_mode": self.permission_mode,
+            "landlock_available": bool(landlock.get("available")),
+            "landlock_enforced": landlock_enforced,
+            "landlock_abi": landlock.get("abi_version"),
+            "credential_registry_health": registry_health,
+            "credential_provider_count": len(registry.providers) if registry is not None else 0,
+            "secret_env_filter": self.secret_env_filter_policy(),
+        }
+
     def emit_tool_trace(
         self,
         name: str,
@@ -2811,6 +2874,7 @@ class Runtime:
         started_at: float,
         *,
         context: RequestContext | None = None,
+        operation_context: OperationContext | None = None,
     ) -> None:
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
@@ -2824,6 +2888,10 @@ class Runtime:
             duration_ms=duration_ms,
             truncated=bool(payload.get("truncated")),
             context=context,
+            status=(str(payload.get("status")) if payload.get("status") is not None else None),
+            input_size_class=size_class(args),
+            output_size_class=size_class(payload),
+            operation=operation_context,
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return
@@ -3546,6 +3614,7 @@ class Runtime:
         workdir = self.resolve_existing(str(workdir_arg))
         if not workdir.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
+        child_target = child_operation_target(self.workspace.root, workdir.path)
         self._check_command_policy(cmd, args)
         timeout_ms = int(args.get("timeout_ms", 30000))
         yield_ms = int(args.get("yield_time_ms", 10000))
@@ -3553,7 +3622,14 @@ class Runtime:
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
         explicit_env = args.get("env", {})
-        env = self._command_env(explicit_env, workdir=workdir.path, command=cmd)
+        provider = self._exec_credential_provider(cmd)
+        observe_provider(provider.name if provider is not None else None)
+        env = self._command_env(
+            explicit_env,
+            workdir=child_target.workdir,
+            command=cmd,
+            provider_override=provider,
+        )
         client_request_id = self._validated_client_request_id(args.get("client_request_id"))
         client_binding: ClientRequestBinding | None = None
         if client_request_id is not None:
@@ -3579,14 +3655,19 @@ class Runtime:
         popen_extra = process_group_popen_kwargs()
         if self.credential_registry is not None:
             try:
-                credential_roots = self._credential_landlock_roots(cmd, workdir.path)
+                credential_roots = self._credential_landlock_roots(
+                    cmd,
+                    child_target,
+                    environment=env,
+                    provider=provider,
+                )
                 landlock_fd = open_credential_landlock_ruleset(
-                    self.workspace.root,
+                    child_target.root,
                     credential_roots,
                 )
                 verify_credential_landlock_application(
                     landlock_fd,
-                    cwd=workdir.path,
+                    cwd=child_target.workdir,
                     environment=env,
                 )
                 popen_cmd = landlock_exec_argv(landlock_fd, cmd)
@@ -3613,7 +3694,7 @@ class Runtime:
         elif self.landlock_enabled():
             try:
                 landlock_fd = open_landlock_ruleset(
-                    self.workspace.root,
+                    child_target.root,
                     guard_allow_roots() + self._exec_credential_read_roots(cmd),
                     write_roots=self.landlock_write_roots(cmd),
                 )
@@ -3652,7 +3733,7 @@ class Runtime:
         try:
             process, pty_master_fd = spawn_process(
                 popen_cmd,
-                cwd=str(workdir.path),
+                cwd=str(child_target.workdir),
                 shell=popen_shell,
                 env=env,
                 tty=tty,
@@ -3981,6 +4062,7 @@ class Runtime:
         *,
         workdir: Path | None = None,
         command: str | None = None,
+        provider_override: HostExecCredentialConfig | None | object = _PROVIDER_UNSET,
     ) -> dict[str, str]:
         inherited_bootstrap_roots = (
             mcp_bootstrap_venv_roots({str(key): str(value) for key, value in os.environ.items()})
@@ -4044,7 +4126,11 @@ class Runtime:
                 if not self.dangerously_skip_all_permissions and is_filtered_env_var(key_text, value_text):
                     continue
                 env[key_text] = value_text
-        provider = self._exec_credential_provider(command)
+        provider = (
+            self._exec_credential_provider(command)
+            if provider_override is _PROVIDER_UNSET
+            else cast(HostExecCredentialConfig | None, provider_override)
+        )
         if provider is not None:
             for key in provider.env_passthrough:
                 value = os.environ.get(key)
