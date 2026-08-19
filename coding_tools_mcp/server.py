@@ -6033,7 +6033,7 @@ def resize_image_bytes(
     except Exception:
         return None
     try:
-        image = Image.open(BytesIO(data))
+        image: Any = Image.open(BytesIO(data))
         image.thumbnail((max_width, max_height))
         output = BytesIO()
         output_format = "JPEG" if mime_type == "image/jpeg" else "PNG" if mime_type == "image/png" else "WEBP"
