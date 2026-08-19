@@ -574,6 +574,23 @@ broker-owned CLI directory. Pass them to matching commands with
 directory. This repository's locally pinned identity is not an automatic
 deployment property.
 
+GitHub HTTPS authentication is bridged by the host-wide Git config rather than
+duplicated in the broker-owned Git config. `/etc/gitconfig` must retain the
+canonical SICOTI helper:
+
+```gitconfig
+[credential]
+    helper = !/usr/local/bin/sicoti-gh-credential
+```
+
+The wrapper resolves `gh` through `/usr/local/share/mise/shims/gh` and then
+executes `gh auth git-credential`, so Mise can move the concrete `gh` install
+without invalidating Git authentication. The broker still supplies
+`GIT_CONFIG_GLOBAL` for canonical commit identity and `GH_CONFIG_DIR` for the
+GitHub CLI session, while helper selection remains system-wide. Do not add a
+second helper with `gh auth setup-git` inside the broker; doing so bypasses the
+system wrapper contract and can reintroduce a version-pinned path.
+
 The host-only CLI takes global registry, broker, and service identity options
 before `provision`. Its environment-path options are repeatable and use paths
 relative to the provider broker. Repeat `--env-passthrough NAME` after the
@@ -593,8 +610,12 @@ uv run --locked python scripts/credentials.py \
 
 The source must be reviewed and staged by root before an operator applies the
 plan. `gh auth status` is a safe identity check for the brokered GitHub CLI
-configuration; it does not prove Git commit author/committer metadata. Never
-use a command that reads or prints credential contents.
+configuration; it does not prove Git commit author/committer metadata or the
+Git credential helper. Verify the system helper with
+`git config --system --get-all credential.helper`, then verify the end-to-end
+flow with a non-secret network operation such as
+`git ls-remote <reviewed-remote> HEAD`. Never use a command that reads or
+prints credential contents.
 
 `ProtectHome=tmpfs` still applies outside the MCP process. Providers must use
 their broker subtrees, not stores under a personal home, so no home bind is

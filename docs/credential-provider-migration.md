@@ -38,6 +38,26 @@ operator must choose and stage one canonical commit author/committer identity
 in the Git configuration before applying the provider. This repository's
 locally pinned identity is not an automatic deployment property.
 
+GitHub HTTPS credentials are bridged by the host-wide Git configuration, not
+duplicated inside the broker-owned Git config. `/etc/gitconfig` must retain the
+canonical SICOTI helper below, and the child sandbox must keep that exact
+system Git config readable:
+
+```gitconfig
+[credential]
+    helper = !/usr/local/bin/sicoti-gh-credential
+```
+
+`/usr/local/bin/sicoti-gh-credential` is the canonical host wrapper. It
+resolves `gh` through the stable Mise shim at
+`/usr/local/share/mise/shims/gh` and then executes `gh auth git-credential`.
+Do not replace it with the absolute path of the currently installed `gh`
+version, and do not add a parallel helper with `gh auth setup-git` inside the
+broker. The broker continues to own commit identity through
+`GIT_CONFIG_GLOBAL` and GitHub CLI state through `GH_CONFIG_DIR`; credential
+helper selection remains a system-wide host policy. This avoids coupling a
+provider reprovision to one concrete `gh` installation path.
+
 The corresponding host-only plan uses the generic Git executable and repeats
 the relative environment-path option for both broker-owned locations:
 
@@ -53,11 +73,16 @@ uv run --locked python scripts/credentials.py \
 ```
 
 The source is staged by root and must already contain the canonical identity
-selected by the operator. The command above is a dry-run plan unless `--apply`
-is added after the subcommand options; review the plan and source first, and do
-not rerun an apply blindly. `gh auth status` is a safe identity check for the
-brokered GitHub CLI configuration, but it does not prove the Git commit
-author/committer metadata. Do not use commands that print credential contents.
+selected by the operator. It must not add a competing GitHub credential helper
+to the broker-owned Git config. The command above is a dry-run plan unless
+`--apply` is added after the
+subcommand options; review the plan and source first, and do not rerun an apply
+blindly. `gh auth status` is a safe identity check for the brokered GitHub CLI
+configuration, but it does not prove the Git commit author/committer metadata
+or the system credential bridge. Verify the latter with
+`git config --system --get-all credential.helper` and a non-secret Git network
+operation such as `git ls-remote <reviewed-remote> HEAD`. Do not use commands
+that print credential contents.
 
 The host-only `credentials` CLI takes `--registry-dir <dir>` and
 `--broker-dir <dir>` before its subcommand. Its four commands are:
