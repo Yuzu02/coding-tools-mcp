@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,7 +98,54 @@ class ProjectServerContextTests(unittest.TestCase):
             self.assertEqual(payload["projects"]["count"], 2)
             self.assertEqual(payload["projects"]["ids"], ["alpha", "beta"])
             self.assertEqual(payload["projects"]["available"], 2)
-            self.assertEqual(payload["tool_count"], 24)
+            self.assertLessEqual(len(json.dumps(payload, separators=(",", ":")).encode()), 4096)
+            self.assertNotIn("tools", payload)
+            self.assertNotIn("credential_providers", payload)
+            self.assertGreater(payload["tool_count"], 0)
+
+            full = runtime.call_tool("server_info", {"detail": "full"})["structuredContent"]
+            self.assertIn("tools", full)
+            self.assertIn("credential_providers", full)
+        finally:
+            runtime.close()
+
+    def test_project_context_is_a_bounded_orientation_view(self) -> None:
+        runtime = self.runtime()
+        try:
+            payload = runtime.call_tool(
+                "project_context",
+                {"project_id": "alpha"},
+            )["structuredContent"]
+
+            self.assertEqual(payload["project_id"], "alpha")
+            self.assertTrue(payload["available"])
+            self.assertIn("git", payload)
+            self.assertIn("instructions", payload)
+            self.assertNotIn("root", payload)
+            self.assertLessEqual(len(json.dumps(payload, separators=(",", ":")).encode()), 8192)
+        finally:
+            runtime.close()
+
+    def test_doctor_is_bounded_read_only_and_project_scoped_when_requested(self) -> None:
+        runtime = self.runtime()
+        try:
+            global_payload = runtime.call_tool("doctor", {})["structuredContent"]
+            self.assertIn("checks", global_payload)
+            self.assertLessEqual(
+                len(json.dumps(global_payload, separators=(",", ":")).encode()),
+                12 * 1024,
+            )
+
+            project_payload = runtime.call_tool(
+                "doctor",
+                {"project_id": "alpha"},
+            )["structuredContent"]
+            self.assertEqual(project_payload["project_id"], "alpha")
+            self.assertTrue(project_payload["checks"])
+            for check in project_payload["checks"]:
+                self.assertIn(check["status"], {"pass", "warn", "fail"})
+                self.assertIn("id", check)
+                self.assertIn("summary", check)
         finally:
             runtime.close()
 

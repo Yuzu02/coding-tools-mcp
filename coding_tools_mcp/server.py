@@ -2551,6 +2551,55 @@ class Runtime:
             "tool_count": len(tools),
         }
 
+    def server_info_summary_payload(self) -> dict[str, Any]:
+        tools = self.exposed_tool_names()
+        landlock = landlock_status_payload()
+        landlock_enabled = self._landlock_enforced(landlock)
+        credential = self._credential_providers_payload()
+        extension_metadata = self.extension_host.metadata()
+        raw_registry = credential.get("registry")
+        registry = raw_registry if isinstance(raw_registry, dict) else {}
+        raw_isolation = credential.get("filesystem_isolation")
+        isolation = raw_isolation if isinstance(raw_isolation, dict) else {}
+        raw_enabled = extension_metadata.get("enabled")
+        enabled_extensions = list(raw_enabled) if isinstance(raw_enabled, list) else []
+        raw_order = extension_metadata.get("order")
+        extension_order = list(raw_order) if isinstance(raw_order, list) else []
+        return {
+            "server": SERVER_NAME,
+            "title": SERVER_TITLE,
+            "version": __version__,
+            "package_version": __version__,
+            "runtime_contract_version": RUNTIME_CONTRACT_VERSION,
+            "configuration": {
+                "mode": self.config_snapshot.resolution_mode,
+                "fingerprint": self.config_snapshot.fingerprint,
+                "versions": dict(self.config_snapshot.config_versions),
+                "warning_count": len(self.config_snapshot.warnings),
+            },
+            "supported_protocol_versions": list(KNOWN_PROTOCOL_VERSIONS),
+            "auth_enabled": self.auth_enabled(),
+            "permission_mode": self.permission_mode,
+            "dangerously_skip_all_permissions": self.dangerously_skip_all_permissions,
+            "landlock": {
+                "available": bool(landlock.get("available")),
+                "enabled": landlock_enabled,
+                "abi_version": landlock.get("abi_version"),
+            },
+            "credential_registry": {
+                "health": registry.get("health", "not-configured"),
+                "generation": registry.get("generation"),
+                "fingerprint": registry.get("fingerprint"),
+                "filesystem_isolation": isolation.get("status", "not-configured"),
+            },
+            "extensions": {
+                "enabled": enabled_extensions,
+                "order": extension_order,
+            },
+            "tool_count": len(tools),
+            "tool_names_fingerprint": credential.get("tool_names_fingerprint"),
+        }
+
     def call_tool(
         self,
         name: str,
@@ -2713,7 +2762,16 @@ class Runtime:
             )
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.server_info_payload()
+        detail = str(args.get("detail", "summary"))
+        if detail == "summary":
+            return self.server_info_summary_payload()
+        if detail == "full":
+            return self.server_info_payload()
+        raise ToolFailure(
+            "INVALID_ARGUMENT",
+            "detail must be one of: summary, full.",
+            category="validation",
+        )
 
     def check_exec_environment(self, args: dict[str, Any]) -> dict[str, Any]:
         landlock = landlock_status_payload()
@@ -6188,7 +6246,15 @@ def input_schemas() -> dict[str, dict[str, Any]]:
     boolean = {"type": "boolean"}
     string_array = {"type": "array", "items": {"type": "string"}}
     return {
-        "server_info": object_schema(),
+        "server_info": object_schema(
+            {
+                "detail": {
+                    **string,
+                    "enum": ["summary", "full"],
+                    "default": "summary",
+                }
+            }
+        ),
         "check_exec_environment": object_schema(),
         "read_file": object_schema(
             {

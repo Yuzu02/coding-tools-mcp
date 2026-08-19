@@ -16,11 +16,11 @@ Coding Tools MCP 是一个**模型中立的编程运行时**，通过
 文件读取与搜索、结构化多文件补丁、命令执行、交互式命令、git 操作——
 一个服务器，任何 MCP 客户端都能驱动。Claude Desktop、Claude Code、Codex、
 Cursor、Cline、VS Code、Windsurf、Gemini CLI，或你自己写的 agent，拿到的
-都是同一套久经考验的 24 个工具：通过显式 `project_id` 访问同一信任域内已配置
+都是同一套久经考验的 26 个工具：通过显式 `project_id` 访问同一信任域内已配置
 的多个项目，并由权限模式层层把关。
 
 可选的 `semantic` 扩展通过精确固定的 Serena 1.5.3 增加 4 个只读的符号、定义与
-引用导航工具；显式启用且后端启动可用时目录为 28 个工具。默认仍保持 24 个工具，
+引用导航工具；显式启用且后端启动可用时目录为 30 个工具。默认仍保持 26 个工具，
 且不依赖 Serena。详见 [内部扩展](docs/extensions.md)。
 
 [![观看演示](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)

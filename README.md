@@ -16,15 +16,15 @@ Coding Tools MCP is a **model-neutral coding runtime** served over the
 search, structured multi-file patches, command execution, interactive
 sessions, and git — one server that any MCP client can drive. Claude Desktop,
 Claude Code, Codex, Cursor, Cline, VS Code, Windsurf, Gemini CLI, or an agent
-you build yourself all get the default 24 battle-tested tools, with explicit
+you build yourself all get the default 26 battle-tested tools, with explicit
 `project_id` addressing across configured projects in one trust domain and
 permission-mode gating. This fork composes its own internal extensions once at
 startup; the resulting catalog is then frozen for that process.
 
 An optional `semantic` extension adds four read-only symbol, definition, and
 reference tools through exact-pinned Serena 1.5.3. When explicitly enabled and
-available at startup the catalog contains 28 tools; the default remains
-Serena-independent at 24. See [internal extensions](docs/extensions.md).
+available at startup the catalog contains 30 tools; the default remains
+Serena-independent at 26. See [internal extensions](docs/extensions.md).
 
 [![Watch the demo](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)
 

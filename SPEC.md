@@ -22,7 +22,7 @@ extension enable/disable operation. `apply_patch` is the structured direct
 file-edit primitive. `safe`, `trusted`, and `dangerous` are command permission
 policies and never alter `tools/list`.
 
-The default catalog contains 24 tools:
+The default catalog contains 26 tools:
 
 - runtime/context: `server_info`, project-scoped `check_exec_environment`
 - project discovery: `list_projects`, `resolve_project`

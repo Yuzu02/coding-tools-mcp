@@ -6,7 +6,7 @@ properties, annotations, and error codes with the contract.
 
 ## Fixed inventory
 
-The committed/default composition contains exactly 24 tools:
+The committed/default composition contains exactly 26 tools:
 
 - `server_info`: global server, auth, protocol, policy, extension, and configured
   project metadata without project-specific instruction contents.
@@ -42,6 +42,10 @@ The committed/default composition contains exactly 24 tools:
 - `list_skills`: list effective skills/instruction files for one project and
   explicit relative workdir.
 - `read_skill`: load an effective named skill from one project scope.
+- `project_context`: return one compact bounded project orientation view without
+  reconstructing it through several independent probes.
+- `doctor`: run bounded read-only server/project health checks with structured
+  status and recovery metadata.
 
 The fork composes mother-core definitions plus enabled internal extension
 contributions once during process startup. `tools/list`, argument validation,
@@ -50,9 +54,10 @@ and `tools/call` all consume the same frozen composed catalog, so
 runtime profile switching or dynamic extension activation.
 
 The default `projects` extension contributes `list_projects`,
-`resolve_project`, `list_skills`, and `read_skill`, and decorates the 13
-project-addressed mother-core operations plus `view_image` when exposed. The
-normal default therefore contains 24 tools. Starting the fork with
+`resolve_project`, `list_skills`, `read_skill`, `project_context`, and `doctor`,
+and decorates the 13 project-addressed mother-core operations plus `view_image`
+when exposed. The
+normal default therefore contains 26 tools. Starting the fork with
 `--extensions ''` intentionally exposes only the 20 mother-core tools for that
 process and removes project-addressing decoration. `view_image` remains
 independently gated by installation capability. V1 tool decorators are
@@ -63,7 +68,7 @@ replace existing schema properties.
 
 The built-in `semantic` extension is disabled by default and depends on
 `projects`. When it is enabled and exact-pinned `serena-agent==1.5.3` is
-available at startup, the frozen catalog grows from 24 to 28 tools:
+available at startup, the frozen catalog grows from 26 to 30 tools:
 
 - **`list_symbols`** — list normalized semantic symbols in one project file;
 - **`find_symbol`** — locate symbols by semantic name path, optionally returning a
@@ -78,7 +83,7 @@ explicit `project_id`; there is no Serena activation/current-project API.
 
 If the semantic extension is enabled but Serena is absent or not version
 1.5.3, startup still succeeds without these four tools. If a worker later
-fails after a 28-tool catalog was composed, the catalog stays fixed and the
+fails after a 30-tool catalog was composed, the catalog stays fixed and the
 semantic call returns a typed `SEMANTIC_*` failure. Filesystem, Git, and command
 tools remain usable.
 

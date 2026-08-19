@@ -52,7 +52,7 @@ class ProjectsExtensionTests(unittest.TestCase):
             self.assertIn("resolve_project", runtime.exposed_tool_names())
             self.assertIn("list_skills", runtime.exposed_tool_names())
             self.assertIn("read_skill", runtime.exposed_tool_names())
-            self.assertEqual(len(runtime.exposed_tool_names()), 24)
+            self.assertEqual(len(runtime.exposed_tool_names()), 26)
 
     def test_disabled_projects_extension_contributes_neither_skill_tool(self) -> None:
         config = RuntimeConfig.defaults(enabled=())

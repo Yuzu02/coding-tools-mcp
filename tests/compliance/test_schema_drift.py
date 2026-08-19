@@ -26,6 +26,8 @@ EXPECTED_STATELESS_TOOL_NAMES = frozenset(
         "search_text",
         "list_skills",
         "read_skill",
+        "project_context",
+        "doctor",
         "apply_patch",
         "exec_command",
         "list_commands",

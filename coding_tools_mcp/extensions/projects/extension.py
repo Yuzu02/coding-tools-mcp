@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
 from coding_tools_mcp.errors import ToolFailure
+from coding_tools_mcp.host_config import ConfigSnapshot
 
 from ..api import ExtensionContext, ExtensionManifest
 from ..config import map_of, scalar, table
@@ -73,6 +76,7 @@ class ProjectsExtension:
         self._config: Mapping[str, object] = {}
         self._registry: ProjectRegistry | None = None
         self._runtimes: ProjectRuntimeManager | None = None
+        self._snapshot: ConfigSnapshot | None = None
 
     def configure(self, config: Mapping[str, object]) -> None:
         self._config = config
@@ -86,12 +90,14 @@ class ProjectsExtension:
         try:
             snapshot = context.services.require(CORE_CONFIG_SNAPSHOT)
         except ServiceRegistryError:
+            snapshot = None
             registry = build_project_registry(
                 self._config,
                 fallback_root=workspace.root,
                 validate_root=workspace_runtimes.validate_root,
             )
         else:
+            assert snapshot is not None
             registry = build_project_registry_from_records(
                 snapshot.registered_projects,
                 validate_root=workspace_runtimes.validate_root,
@@ -100,6 +106,7 @@ class ProjectsExtension:
         catalog = build_project_catalog(workspace.root)
         self._registry = registry
         self._runtimes = runtimes
+        self._snapshot = snapshot
         context.services.provide(PROJECT_REGISTRY, registry)
         context.services.provide(PROJECT_RUNTIMES, runtimes)
         context.services.provide(PROJECT_CATALOG, catalog)
@@ -107,6 +114,8 @@ class ProjectsExtension:
         context.add_tool(self._resolve_project_tool())
         context.add_tool(self._list_skills_tool())
         context.add_tool(self._read_skill_tool())
+        context.add_tool(self._project_context_tool())
+        context.add_tool(self._doctor_tool())
         context.add_server_instructions(
             (
                 "This endpoint serves multiple explicitly registered projects. "
@@ -221,6 +230,53 @@ class ProjectsExtension:
             annotations=ToolAnnotations(read_only=True, idempotent=True),
             error_status="failed",
             text_renderer=self._render_read_skill,
+        )
+
+    def _project_context_tool(self) -> ToolContribution:
+        return ToolContribution(
+            name="project_context",
+            title="Project context",
+            description=(
+                "Return one compact, bounded orientation view for an explicitly selected project."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "project_id": self._project_id_schema(),
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "full"],
+                        "default": "summary",
+                    },
+                },
+                "required": ["project_id"],
+                "additionalProperties": False,
+            },
+            handler=self.project_context,
+            annotations=ToolAnnotations(read_only=True, idempotent=True),
+        )
+
+    def _doctor_tool(self) -> ToolContribution:
+        return ToolContribution(
+            name="doctor",
+            title="Doctor",
+            description=(
+                "Run bounded read-only runtime/project health checks and return structured recovery hints."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "project_id": self._project_id_schema(),
+                    "detail": {
+                        "type": "string",
+                        "enum": ["summary", "full"],
+                        "default": "summary",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=self.doctor,
+            annotations=ToolAnnotations(read_only=True, idempotent=True),
         )
 
     def _project_routing_decorator(self) -> ToolDecorator:
@@ -639,6 +695,158 @@ class ProjectsExtension:
             "available": project.available,
             "warnings": [*project.warnings, *runtime.catalog.warnings],
         }
+
+    @staticmethod
+    def _git_summary(root: Path) -> dict[str, Any]:
+        git = shutil.which("git")
+        if git is None:
+            return {"available": False, "is_repo": False, "warnings": ["git executable is unavailable"]}
+
+        def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [git, "-C", str(root), *arguments],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+            )
+
+        inside = run("rev-parse", "--is-inside-work-tree")
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return {"available": True, "is_repo": False, "warnings": []}
+
+        head = run("rev-parse", "--short=12", "HEAD")
+        branch = run("symbolic-ref", "--short", "-q", "HEAD")
+        status = run("status", "--porcelain=v1", "--untracked-files=no")
+        upstream = run("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+        ahead = 0
+        behind = 0
+        upstream_name = upstream.stdout.strip() if upstream.returncode == 0 else ""
+        if upstream_name:
+            counts = run("rev-list", "--left-right", "--count", f"{upstream_name}...HEAD")
+            if counts.returncode == 0:
+                fields = counts.stdout.strip().split()
+                if len(fields) == 2 and all(field.isdigit() for field in fields):
+                    behind, ahead = (int(fields[0]), int(fields[1]))
+        return {
+            "available": True,
+            "is_repo": True,
+            "branch": branch.stdout.strip() if branch.returncode == 0 else "",
+            "head": head.stdout.strip() if head.returncode == 0 else "",
+            "upstream": upstream_name,
+            "ahead": ahead,
+            "behind": behind,
+            "clean_tracked": status.returncode == 0 and not status.stdout.strip(),
+            "warnings": [],
+        }
+
+    def _semantic_configured(self, project_id: str) -> bool | None:
+        snapshot = self._snapshot
+        if snapshot is None:
+            return None
+        effective = snapshot.projects.get(project_id)
+        if effective is None:
+            return None
+        return "semantic" in effective.enabled_capabilities
+
+    def project_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(args.get("project_id", ""))
+        runtime = self._require_runtimes().require(project_id)
+        project = runtime.project
+        skills = runtime.skills.list_for(".")
+        warnings = [*project.warnings, *runtime.catalog.warnings, *skills.warnings]
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "available": project.available,
+            "markers": list(project.markers),
+            "git": self._git_summary(project.root),
+            "semantic": {"configured": self._semantic_configured(project_id)},
+            "instructions": {
+                "instruction_files": list(skills.instruction_files[:32]),
+                "skill_count": len(skills.skills),
+                "warning_count": len(skills.warnings),
+            },
+            "warnings": warnings[:32],
+        }
+
+    @staticmethod
+    def _doctor_check(
+        check_id: str,
+        status: str,
+        summary: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+        recovery: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        check: dict[str, Any] = {"id": check_id, "status": status, "summary": summary}
+        if details:
+            check["details"] = dict(details)
+        if recovery:
+            check["recovery"] = dict(recovery)
+        return check
+
+    def doctor(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = args.get("project_id")
+        checks: list[dict[str, Any]] = []
+        registry = self._require_registry()
+        snapshot = self._snapshot
+        config_warnings = tuple(snapshot.warnings) if snapshot is not None else ()
+        checks.append(
+            self._doctor_check(
+                "configuration",
+                "warn" if config_warnings else "pass",
+                "Configuration is loaded with warnings." if config_warnings else "Configuration is valid.",
+                details={"warning_count": len(config_warnings)},
+            )
+        )
+        checks.append(
+            self._doctor_check(
+                "project_registry",
+                "pass" if registry.projects() else "warn",
+                f"{len(registry.projects())} project(s) are registered.",
+            )
+        )
+
+        payload: dict[str, Any] = {"ok": True, "checks": checks, "warnings": []}
+        if project_id is None:
+            return payload
+        selected_id = str(project_id)
+        runtime = self._require_runtimes().require(selected_id)
+        project = runtime.project
+        payload["project_id"] = selected_id
+        checks.append(
+            self._doctor_check(
+                "project_root",
+                "pass" if project.root.is_dir() else "fail",
+                "Registered project root is accessible." if project.root.is_dir() else "Registered project root is unavailable.",
+            )
+        )
+        git = self._git_summary(project.root)
+        git_status = "pass" if git.get("is_repo") else "warn"
+        checks.append(
+            self._doctor_check(
+                "git",
+                git_status,
+                "Git repository is available." if git_status == "pass" else "Project root is not a usable Git worktree.",
+                details={
+                    "available": git.get("available"),
+                    "is_repo": git.get("is_repo"),
+                },
+            )
+        )
+        skills = runtime.skills.list_for(".")
+        checks.append(
+            self._doctor_check(
+                "instructions_skills",
+                "warn" if skills.warnings else "pass",
+                "Instructions/skills parsed with warnings." if skills.warnings else "Instructions/skills parsed successfully.",
+                details={"skill_count": len(skills.skills), "warning_count": len(skills.warnings)},
+            )
+        )
+        payload["ok"] = not any(check["status"] == "fail" for check in checks)
+        return payload
 
     def list_skills(self, args: dict[str, Any]) -> dict[str, Any]:
         project_id = str(args.get("project_id", ""))

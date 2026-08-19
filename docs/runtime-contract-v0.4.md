@@ -295,13 +295,15 @@ source files.
 
 ## Stable tool inventory
 
-The following 24 sections are checked against the live default composed
+The following 26 sections are checked against the live default composed
 catalog by CI. Input-property names and annotation values are intentionally
 spelled out so drift is reviewable.
 
 ### server_info
 
-Global server/runtime/extension/project summary. Input properties: none.
+Global server/runtime/extension/project summary. The default is compact and
+model-facing; `detail="full"` opts into bounded operator diagnostics. Input
+properties: `"detail"`. Required: none.
 
 Annotations: `"title": "Server info"`, `readOnlyHint=true`,
 `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false`.
@@ -364,7 +366,7 @@ Annotations: `"title": "Apply patch"`, `readOnlyHint=false`,
 ### exec_command
 
 Run a bounded command in one selected project. Input properties:
-`"client_request_id"`, `"cmd"`, `"cwd"`, `"env"`, `"max_output_bytes"`,
+`"client_request_id"`, `"cmd"`, `"env"`, `"max_output_bytes"`,
 `"preview_bytes"`, `"project_id"`, `"stdin"`, `"timeout_ms"`, `"tty"`,
 `"verbosity"`, `"workdir"`, `"yield_time_ms"`. Required: `"cmd"`,
 `"project_id"`.
@@ -427,7 +429,7 @@ Annotations: `"title": "Read output"`, `readOnlyHint=true`,
 ### git_status
 
 Return bounded structured status for one project. Input properties:
-`"include_untracked"`, `"max_entries"`, `"path"`, `"project_id"`, `"workdir"`.
+`"include_untracked"`, `"max_entries"`, `"project_id"`, `"workdir"`.
 Required: `"project_id"`.
 
 Annotations: `"title": "Git status"`, `readOnlyHint=true`,
@@ -519,6 +521,24 @@ Read one effective project-scoped skill. Input properties: `"project_id"`,
 `"skill"`, `"workdir"`. Required: `"project_id"`, `"skill"`.
 
 Annotations: `"title": "Read skill"`, `readOnlyHint=true`,
+`destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false`.
+
+### project_context
+
+Return a compact bounded orientation view for one logical project without
+requiring clients to reconstruct context through multiple probes. Input
+properties: `"detail"`, `"project_id"`. Required: `"project_id"`.
+
+Annotations: `"title": "Project context"`, `readOnlyHint=true`,
+`destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false`.
+
+### doctor
+
+Run bounded read-only runtime/project health checks. `project_id` is optional;
+omitting it returns server/global checks. Input properties: `"detail"`,
+`"project_id"`. Required: none.
+
+Annotations: `"title": "Doctor"`, `readOnlyHint=true`,
 `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false`.
 
 ## Compatibility and historical contracts
