@@ -221,13 +221,30 @@ Expected before repair: ancestry may fail; the fetched tip and sync branch must 
 
 - [ ] **Step 4: Reconnect equivalent/reparented upstream history with an explicit integration merge**
 
-Use a normal merge commit, preserving fork history instead of rebasing hundreds of fork commits:
+If the freshly fetched upstream tip is **not** content-equivalent to an
+already-integrated fork ancestor, use a normal merge commit, preserving fork
+history instead of rebasing hundreds of fork commits:
 
 ```bash
 git merge --no-ff --no-edit xyTom/main
 ```
 
 If Git reports content conflicts, resolve each against the existing fork architecture; never discard fork functionality just to prefer upstream text. If the tips are tree-equivalent at the relevant boundary, the merge should primarily reconnect ancestry.
+
+If a previous integrated upstream commit is already an ancestor of `HEAD` and
+its complete tree is byte-identical to the freshly fetched upstream tip, a
+normal three-way merge may manufacture conflicts solely because the upstream
+parents were rewritten. In that proven case, preserve the current fork tree
+and connect genealogy explicitly:
+
+```bash
+git merge-base --is-ancestor <prior-integrated-upstream-tip> HEAD
+git diff --quiet <prior-integrated-upstream-tip> xyTom/main
+git merge -s ours --no-ff --no-edit xyTom/main
+```
+
+The `ours` strategy is valid only when the first two checks succeed; it is not
+a shortcut for ignoring real upstream content.
 
 - [ ] **Step 5: Prove ancestry and bridge behavior**
 

@@ -282,6 +282,17 @@ They verify, among other things, that project/skill tools and their renderers
 remain extension-owned and that schema decorators affect both `tools/list` and
 dispatch.
 
+If upstream history is rewritten or reparented, do not use tree/patch
+equivalence as a permanent substitute for ancestry. Diagnose the case first:
+compare the merge base, range counts, tree IDs, and stable patch IDs. When the
+current upstream tip has an exact tree match with an already-integrated fork
+ancestor, reconnect the graph with an explicit merge whose first-parent tree is
+preserved (for example `git merge -s ours --no-ff xyTom/main`). Use that
+strategy only after exact equivalence is proven; otherwise perform a normal
+content merge and resolve conflicts deliberately. In both cases, finish by
+proving `git merge-base --is-ancestor xyTom/main HEAD` and rerunning the bridge
+and relevant full gates.
+
 ## Adding a new internal extension
 
 For V1, add an extension deliberately in code:
