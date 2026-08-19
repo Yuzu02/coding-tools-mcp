@@ -114,7 +114,7 @@ make benchmark-real-workloads
 | `make test-e2e` | End-to-end coding loops through the runtime |
 | `make test-runtime-semantics` | Patch/command/image behavior vectors |
 | `make test-docs-required` | Required docs, evidence artifacts, and CI workflow gate checks |
-| `make test-schema-drift` | Live 24-tool composed schema/annotation names compared against runtime contract v0.4/current docs, while historical contracts remain frozen |
+| `make test-schema-drift` | Live 26-tool composed schema/annotation names compared against runtime contract v0.4/current docs, while historical contracts remain frozen |
 | `make dogfood-mcp` | Unittest MCP-only dogfood cases |
 | `make dogfood-runner` | Full deterministic HTTP dogfood transcript and report |
 | `make dogfood-smoke` | Both dogfood suites |

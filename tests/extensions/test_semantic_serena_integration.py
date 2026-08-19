@@ -10,8 +10,10 @@ from coding_tools_mcp.extensions.projects.registry import ProjectRegistry, Regis
 from coding_tools_mcp.extensions.semantic.extension import SemanticConfig
 from coding_tools_mcp.extensions.semantic.model import (
     FindDefinitionRequest,
+    FindImplementationsRequest,
     FindReferencesRequest,
     FindSymbolRequest,
+    GetDiagnosticsRequest,
     ListSymbolsRequest,
 )
 from coding_tools_mcp.extensions.semantic.serena import SerenaSemanticBackend, detect_serena
@@ -188,6 +190,45 @@ class SerenaWorkerIntegrationTests(unittest.TestCase):
 
         self.assertIn("Greeter", [symbol.name_path for symbol in listed.symbols])
         self.assertEqual([symbol.name_path for symbol in found.symbols], ["Greeter/hello"])
+
+    def test_typescript_find_implementations_uses_real_serena_lsp(self) -> None:
+        project, backend = self.backend_for_fixture("typescript")
+        self.addCleanup(backend.close)
+
+        result = backend.find_implementations(
+            project,
+            FindImplementationsRequest(path="sample.ts", line=15, column=18),
+        )
+
+        self.assertIn("LoudSpeaker", [symbol.name_path for symbol in result.implementations])
+        self.assertTrue(all(symbol.path == "sample.ts" for symbol in result.implementations))
+        self.assertTrue(
+            all(
+                symbol.range is None or symbol.range.start.line >= 1
+                for symbol in result.implementations
+            )
+        )
+
+    def test_typescript_get_diagnostics_uses_real_serena_lsp_and_closed_severity(self) -> None:
+        project, backend = self.backend_for_fixture("typescript")
+        self.addCleanup(backend.close)
+
+        result = backend.get_diagnostics(
+            project,
+            GetDiagnosticsRequest(path="diagnostics.ts", min_severity="hint"),
+        )
+
+        self.assertTrue(result.diagnostics, result)
+        self.assertTrue(all(item.path == "diagnostics.ts" for item in result.diagnostics))
+        self.assertTrue(
+            all(
+                item.severity in {"error", "warning", "information", "hint"}
+                for item in result.diagnostics
+            )
+        )
+        self.assertTrue(
+            any("str" in item.message.lower() or "int" in item.message.lower() for item in result.diagnostics)
+        )
 
     def test_parent_project_ignores_registered_nested_child_sources(self) -> None:
         parent, child, backend = self.backend_for_nested_projects()

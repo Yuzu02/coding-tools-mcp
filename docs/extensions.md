@@ -26,22 +26,24 @@ addressing and project/skill discovery:
 - `resolve_project`;
 - `list_skills`;
 - `read_skill`;
+- `project_context`;
+- `doctor`;
 - project-addressing decorators for filesystem/Git/process/image/environment
   tools;
 - opaque command/output routing; and
 - project-neutral server discovery instructions.
 
-The default composition therefore exposes 24 tools. If `projects` is disabled
-before startup, its four contributed tools are absent and that process exposes
+The default composition therefore exposes 26 tools. If `projects` is disabled
+before startup, its six contributed tools are absent and that process exposes
 the 20 mother-core tools, subject to the existing `view_image` capability gate.
 
 `semantic` is a second built-in extension, disabled by default. It requires
 `projects` and contributes `list_symbols`, `find_symbol`, `find_definition`,
-and `find_references` only when the exact supported Serena backend is available
+`find_references`, `find_implementations`, and `get_diagnostics` only when the exact supported Serena backend is available
 at startup. The supported backend is `serena-agent==1.5.3`; with both
-extensions enabled and Serena available the frozen catalog contains 28 tools.
+extensions enabled and Serena available the frozen catalog contains 32 tools.
 If Serena is unavailable or the version is unsupported, the process still
-starts and semantic metadata reports the backend unavailable, but the four
+starts and semantic metadata reports the backend unavailable, but the six
 semantic tools are absent for that process.
 
 Semantic backend state is isolated behind one lazy worker per active project.

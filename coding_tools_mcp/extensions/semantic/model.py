@@ -84,6 +84,33 @@ class SemanticReference:
 
 
 @dataclass(frozen=True)
+class SemanticDiagnostic:
+    path: str
+    range: SemanticRange
+    severity: str
+    message: str
+    code: str | None = None
+    source: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.severity not in {"error", "warning", "information", "hint"}:
+            raise ValueError("diagnostic severity is unsupported")
+
+    def payload(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "path": self.path,
+            "range": self.range.payload(),
+            "severity": self.severity,
+            "message": self.message,
+        }
+        if self.code is not None:
+            value["code"] = self.code
+        if self.source is not None:
+            value["source"] = self.source
+        return value
+
+
+@dataclass(frozen=True)
 class ListSymbolsRequest:
     path: str
     depth: int = 1
@@ -120,6 +147,41 @@ class FindReferencesRequest:
     def __post_init__(self) -> None:
         if self.line < 1 or self.column < 1:
             raise ValueError("semantic positions are one-based")
+
+
+@dataclass(frozen=True)
+class FindImplementationsRequest:
+    path: str
+    line: int
+    column: int
+    max_results: int = 200
+
+    def __post_init__(self) -> None:
+        if self.line < 1 or self.column < 1:
+            raise ValueError("semantic positions are one-based")
+
+
+@dataclass(frozen=True)
+class GetDiagnosticsRequest:
+    path: str
+    start_line: int | None = None
+    end_line: int | None = None
+    min_severity: str = "hint"
+    max_results: int = 500
+
+    def __post_init__(self) -> None:
+        if self.start_line is not None and self.start_line < 1:
+            raise ValueError("diagnostic line ranges are one-based")
+        if self.end_line is not None and self.end_line < 1:
+            raise ValueError("diagnostic line ranges are one-based")
+        if (
+            self.start_line is not None
+            and self.end_line is not None
+            and self.end_line < self.start_line
+        ):
+            raise ValueError("diagnostic end_line precedes start_line")
+        if self.min_severity not in {"error", "warning", "information", "hint"}:
+            raise ValueError("diagnostic severity is unsupported")
 
 
 @dataclass(frozen=True)
@@ -173,6 +235,34 @@ class FindReferencesResult:
     def payload(self) -> dict[str, object]:
         return {
             "references": [reference.payload() for reference in self.references],
+            "truncated": self.truncated,
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True)
+class FindImplementationsResult:
+    implementations: tuple[SemanticSymbol, ...]
+    truncated: bool = False
+    warnings: tuple[str, ...] = ()
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "implementations": [symbol.payload() for symbol in self.implementations],
+            "truncated": self.truncated,
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass(frozen=True)
+class GetDiagnosticsResult:
+    diagnostics: tuple[SemanticDiagnostic, ...]
+    truncated: bool = False
+    warnings: tuple[str, ...] = ()
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "diagnostics": [diagnostic.payload() for diagnostic in self.diagnostics],
             "truncated": self.truncated,
             "warnings": list(self.warnings),
         }

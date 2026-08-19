@@ -5,6 +5,7 @@ import contextlib
 import os
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO, cast
@@ -447,6 +448,136 @@ def _find_references(runtime: _WorkerRuntime, params: dict[str, object]) -> dict
     return {"references": references, "truncated": truncated, "warnings": []}
 
 
+def _find_implementations(runtime: _WorkerRuntime, params: dict[str, object]) -> dict[str, object]:
+    path = str(params.get("path", ""))
+    line = cast(int, params.get("line", 0))
+    column = cast(int, params.get("column", 0))
+    maximum = cast(int, params.get("max_results", 200))
+    symbol = _definition_symbol(runtime, path, line, column)
+    assert runtime.retriever is not None
+    found = runtime.retriever.find_implementing_symbols_by_location(
+        symbol.location,
+        include_body=False,
+    )
+    budget = _NodeBudget(maximum)
+    implementations: list[dict[str, object]] = []
+    for implementation in found:
+        normalized = _normalize_symbol(
+            implementation,
+            project_root=runtime.project_root,
+            excluded_roots=runtime.excluded_roots,
+            include_body=False,
+            depth=0,
+            budget=budget,
+        )
+        if normalized is not None:
+            implementations.append(normalized)
+        if budget.truncated:
+            break
+    return {
+        "implementations": implementations,
+        "truncated": len(found) > len(implementations) or budget.truncated,
+        "warnings": [],
+    }
+
+
+_DIAGNOSTIC_SEVERITY_VALUES = {
+    "error": 1,
+    "warning": 2,
+    "information": 3,
+    "hint": 4,
+}
+_DIAGNOSTIC_SEVERITY_NAMES = {value: name for name, value in _DIAGNOSTIC_SEVERITY_VALUES.items()}
+
+
+def _diagnostic_payload(runtime: _WorkerRuntime, path: str, diagnostic: object) -> dict[str, object] | None:
+    safe_path = _safe_relative_path(runtime.project_root, runtime.excluded_roots, path)
+    if safe_path is None:
+        return None
+    def field(value: object, name: str) -> object:
+        if isinstance(value, Mapping):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    diagnostic_range = field(diagnostic, "range")
+    start = field(diagnostic_range, "start") if diagnostic_range is not None else None
+    end = field(diagnostic_range, "end") if diagnostic_range is not None else None
+    if start is None or end is None:
+        return None
+    start_line = field(start, "line")
+    start_character = field(start, "character")
+    end_line = field(end, "line")
+    end_character = field(end, "character")
+    if not (
+        type(start_line) is int
+        and type(start_character) is int
+        and type(end_line) is int
+        and type(end_character) is int
+    ):
+        return None
+    start_line_int = cast(int, start_line)
+    start_character_int = cast(int, start_character)
+    end_line_int = cast(int, end_line)
+    end_character_int = cast(int, end_character)
+    severity_raw = field(diagnostic, "severity")
+    severity_value = getattr(severity_raw, "value", severity_raw)
+    if type(severity_value) is not int:
+        return None
+    severity = _DIAGNOSTIC_SEVERITY_NAMES.get(severity_value)
+    if severity is None:
+        return None
+    message, _ = _truncate_utf8(str(field(diagnostic, "message") or ""), 4096)
+    payload: dict[str, object] = {
+        "path": safe_path,
+        "range": {
+            "start": _position(start_line_int, start_character_int),
+            "end": _position(end_line_int, end_character_int),
+        },
+        "severity": severity,
+        "message": message,
+    }
+    code = field(diagnostic, "code")
+    if code is not None:
+        payload["code"] = str(code)[:256]
+    source = field(diagnostic, "source")
+    if source:
+        payload["source"] = str(source)[:256]
+    return payload
+
+
+def _get_diagnostics(runtime: _WorkerRuntime, params: dict[str, object]) -> dict[str, object]:
+    path = str(params.get("path", ""))
+    _require_supported_file(runtime, path)
+    assert runtime.retriever is not None
+    start_line = params.get("start_line")
+    end_line = params.get("end_line")
+    severity_name = str(params.get("min_severity", "hint"))
+    maximum = cast(int, params.get("max_results", 500))
+    severity = _DIAGNOSTIC_SEVERITY_VALUES.get(severity_name)
+    if severity is None:
+        raise WorkerSemanticError(
+            SEMANTIC_BACKEND_ERROR,
+            f"Unsupported diagnostic severity: {severity_name}",
+        )
+    raw = runtime.retriever.get_file_diagnostics(
+        path,
+        start_line=(int(start_line) - 1 if isinstance(start_line, int) else 0),
+        end_line=(int(end_line) - 1 if isinstance(end_line, int) else -1),
+        min_severity=severity,
+    )
+    diagnostics: list[dict[str, object]] = []
+    truncated = False
+    for diagnostic in raw:
+        payload = _diagnostic_payload(runtime, path, diagnostic)
+        if payload is None:
+            continue
+        if len(diagnostics) >= maximum:
+            truncated = True
+            break
+        diagnostics.append(payload)
+    return {"diagnostics": diagnostics, "truncated": truncated, "warnings": []}
+
+
 def _dispatch(runtime: _WorkerRuntime, operation: str, params: dict[str, object]) -> dict[str, object]:
     if operation == "list_symbols":
         return _list_symbols(runtime, params)
@@ -456,6 +587,10 @@ def _dispatch(runtime: _WorkerRuntime, operation: str, params: dict[str, object]
         return _find_definition(runtime, params)
     if operation == "find_references":
         return _find_references(runtime, params)
+    if operation == "find_implementations":
+        return _find_implementations(runtime, params)
+    if operation == "get_diagnostics":
+        return _get_diagnostics(runtime, params)
     raise WorkerSemanticError(
         SEMANTIC_BACKEND_ERROR,
         f"Unsupported semantic operation: {operation}",

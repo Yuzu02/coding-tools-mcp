@@ -12,6 +12,8 @@ SEMANTIC_OPERATIONS = frozenset(
         "find_symbol",
         "find_definition",
         "find_references",
+        "find_implementations",
+        "get_diagnostics",
     }
 )
 

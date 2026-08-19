@@ -27,6 +27,8 @@ SEMANTIC_TOOL_NAMES = (
     "find_symbol",
     "find_definition",
     "find_references",
+    "find_implementations",
+    "get_diagnostics",
 )
 
 
@@ -78,7 +80,7 @@ class SemanticContractDocsTests(unittest.TestCase):
             finally:
                 runtime.close()
 
-        self.assertEqual(len(tools), 28)
+        self.assertEqual(len(tools), 32)
         for name in SEMANTIC_TOOL_NAMES:
             tool = tools[name]
             schema = tool["inputSchema"]
@@ -109,8 +111,8 @@ class SemanticContractDocsTests(unittest.TestCase):
                 self.assertIn(code, text)
 
         for statement in (
-            "default projects-only composition: 24 tools",
-            "projects + semantic with Serena 1.5.3 available at startup: 28 tools",
+            "default projects-only composition: 26 tools",
+            "projects + semantic with Serena 1.5.3 available at startup: 32 tools",
             "semantic enabled but Serena unavailable at startup: process starts without semantic tools",
             "runtime semantic worker failure: semantic tools remain in the frozen catalog",
         ):

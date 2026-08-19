@@ -2,7 +2,7 @@
 
 **Contract:** v0.4
 **Default internal extension:** `projects` enabled
-**Default composed catalog:** 24 tools
+**Default composed catalog:** 26 tools
 **Project addressing:** explicit `project_id`; no active/current project state
 
 This is the current runtime contract for the Yuzu02 fork. The historical
@@ -215,27 +215,29 @@ changes therefore require restart; heavy project/Serena resources remain lazy.
 Semantic navigation is an optional internal extension layered on top of the
 default `projects` extension. The contract states are explicit:
 
-- default projects-only composition: 24 tools
-- projects + semantic with Serena 1.5.3 available at startup: 28 tools
+- default projects-only composition: 26 tools
+- projects + semantic with Serena 1.5.3 available at startup: 32 tools
 - semantic enabled but Serena unavailable at startup: process starts without semantic tools
 - runtime semantic worker failure: semantic tools remain in the frozen catalog
 - a project may reduce host authority with `capabilities.disabled = ["semantic"]`
 
 Project capability reduction does not mutate the frozen catalog. When semantic
-is globally enabled and available, all four semantic tools remain published.
+is globally enabled and available, all six semantic tools remain published.
 A semantic request for a project that disabled the capability fails before
 path resolution or backend work with `PROJECT_CAPABILITY_DISABLED`, category
 `permission`, `retryable=false`, and bounded details containing only
 `project_id` and `capability`. Other projects in the same runtime remain
 unaffected.
 
-The four optional semantic tools are read-only and project-addressed. Their
+The six optional semantic tools are read-only and project-addressed. Their
 live schemas and annotations are drift-checked against these canonical lines:
 
 - `list_symbols` properties=`depth,max_results,path,project_id` required=`path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
 - `find_symbol` properties=`include_body,max_results,path,project_id,query` required=`project_id,query` readOnly=true destructive=false idempotent=true openWorld=false
 - `find_definition` properties=`column,line,path,project_id` required=`column,line,path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
 - `find_references` properties=`column,include_declaration,line,max_results,path,project_id` required=`column,line,path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
+- `find_implementations` properties=`column,line,max_results,path,project_id` required=`column,line,path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
+- `get_diagnostics` properties=`end_line,max_results,min_severity,path,project_id,start_line` required=`path,project_id` readOnly=true destructive=false idempotent=true openWorld=false
 
 Semantic failures use the normal MCP tool-error envelope with category
 `semantic`. The complete semantic error catalog is:

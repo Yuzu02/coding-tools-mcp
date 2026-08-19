@@ -7,10 +7,14 @@ from ..services import CapabilityKey
 from .model import (
     FindDefinitionRequest,
     FindDefinitionResult,
+    FindImplementationsRequest,
+    FindImplementationsResult,
     FindReferencesRequest,
     FindReferencesResult,
     FindSymbolRequest,
     FindSymbolResult,
+    GetDiagnosticsRequest,
+    GetDiagnosticsResult,
     ListSymbolsRequest,
     ListSymbolsResult,
 )
@@ -74,6 +78,20 @@ class SemanticBackend(Protocol):
         project: RegisteredProject,
         request: FindReferencesRequest,
     ) -> FindReferencesResult:
+        raise NotImplementedError
+
+    def find_implementations(
+        self,
+        project: RegisteredProject,
+        request: FindImplementationsRequest,
+    ) -> FindImplementationsResult:
+        raise NotImplementedError
+
+    def get_diagnostics(
+        self,
+        project: RegisteredProject,
+        request: GetDiagnosticsRequest,
+    ) -> GetDiagnosticsResult:
         raise NotImplementedError
 
     def close_project(self, project_id: str) -> None:

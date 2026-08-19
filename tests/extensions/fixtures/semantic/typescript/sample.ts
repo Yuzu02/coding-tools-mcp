@@ -11,3 +11,13 @@ export function formatName(name: string): string {
 export function run(): string {
   return new Greeter().hello("world")
 }
+
+export interface Speaker {
+  speak(value: string): string
+}
+
+export class LoudSpeaker implements Speaker {
+  speak(value: string): string {
+    return value.toUpperCase()
+  }
+}

@@ -26,12 +26,17 @@ from .extension import SemanticConfig
 from .model import (
     FindDefinitionRequest,
     FindDefinitionResult,
+    FindImplementationsRequest,
+    FindImplementationsResult,
     FindReferencesRequest,
     FindReferencesResult,
     FindSymbolRequest,
     FindSymbolResult,
+    GetDiagnosticsRequest,
+    GetDiagnosticsResult,
     ListSymbolsRequest,
     ListSymbolsResult,
+    SemanticDiagnostic,
     SemanticPosition,
     SemanticRange,
     SemanticReference,
@@ -556,6 +561,33 @@ def _reference(value: object, *, path: str, operation: str) -> SemanticReference
     )
 
 
+def _diagnostic(value: object, *, path: str, operation: str) -> SemanticDiagnostic:
+    raw = _require_mapping(value, path=path, operation=operation)
+    source_path = raw.get("path")
+    severity = raw.get("severity")
+    message = raw.get("message")
+    if not isinstance(source_path, str):
+        raise _protocol_error(f"worker result {path}.path must be a string", operation=operation)
+    if not isinstance(severity, str):
+        raise _protocol_error(f"worker result {path}.severity must be a string", operation=operation)
+    if not isinstance(message, str):
+        raise _protocol_error(f"worker result {path}.message must be a string", operation=operation)
+    code = raw.get("code")
+    source = raw.get("source")
+    if code is not None and not isinstance(code, str):
+        raise _protocol_error(f"worker result {path}.code must be a string", operation=operation)
+    if source is not None and not isinstance(source, str):
+        raise _protocol_error(f"worker result {path}.source must be a string", operation=operation)
+    return SemanticDiagnostic(
+        path=source_path,
+        range=_range(raw.get("range"), path=f"{path}.range", operation=operation),
+        severity=severity,
+        message=message,
+        code=code,
+        source=source,
+    )
+
+
 def _result_common(
     raw: Mapping[str, object],
     *,
@@ -857,6 +889,64 @@ class SerenaSemanticBackend:
             tuple(
                 _reference(item, path=f"references[{index}]", operation=operation)
                 for index, item in enumerate(references)
+            ),
+            truncated=truncated,
+            warnings=warnings,
+        )
+
+    def find_implementations(
+        self,
+        project: RegisteredProject,
+        request: FindImplementationsRequest,
+    ) -> FindImplementationsResult:
+        operation = "find_implementations"
+        raw = self._request(
+            project,
+            operation,
+            {
+                "path": request.path,
+                "line": request.line,
+                "column": request.column,
+                "max_results": request.max_results,
+            },
+        )
+        implementations = raw.get("implementations")
+        if not isinstance(implementations, list):
+            raise _protocol_error("worker result implementations must be an array", operation=operation)
+        truncated, warnings = _result_common(raw, operation=operation)
+        return FindImplementationsResult(
+            tuple(
+                _symbol(item, path=f"implementations[{index}]", operation=operation)
+                for index, item in enumerate(implementations)
+            ),
+            truncated=truncated,
+            warnings=warnings,
+        )
+
+    def get_diagnostics(
+        self,
+        project: RegisteredProject,
+        request: GetDiagnosticsRequest,
+    ) -> GetDiagnosticsResult:
+        operation = "get_diagnostics"
+        params: dict[str, object] = {
+            "path": request.path,
+            "min_severity": request.min_severity,
+            "max_results": request.max_results,
+        }
+        if request.start_line is not None:
+            params["start_line"] = request.start_line
+        if request.end_line is not None:
+            params["end_line"] = request.end_line
+        raw = self._request(project, operation, params)
+        diagnostics = raw.get("diagnostics")
+        if not isinstance(diagnostics, list):
+            raise _protocol_error("worker result diagnostics must be an array", operation=operation)
+        truncated, warnings = _result_common(raw, operation=operation)
+        return GetDiagnosticsResult(
+            tuple(
+                _diagnostic(item, path=f"diagnostics[{index}]", operation=operation)
+                for index, item in enumerate(diagnostics)
             ),
             truncated=truncated,
             warnings=warnings,

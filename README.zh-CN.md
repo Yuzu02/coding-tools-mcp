@@ -19,8 +19,8 @@ Cursor、Cline、VS Code、Windsurf、Gemini CLI，或你自己写的 agent，�
 都是同一套久经考验的 26 个工具：通过显式 `project_id` 访问同一信任域内已配置
 的多个项目，并由权限模式层层把关。
 
-可选的 `semantic` 扩展通过精确固定的 Serena 1.5.3 增加 4 个只读的符号、定义与
-引用导航工具；显式启用且后端启动可用时目录为 30 个工具。默认仍保持 26 个工具，
+可选的 `semantic` 扩展通过精确固定的 Serena 1.5.3 增加 6 个只读的符号、定义、
+实现、引用与诊断工具；显式启用且后端启动可用时目录为 32 个工具。默认仍保持 26 个工具，
 且不依赖 Serena。详见 [内部扩展](docs/extensions.md)。
 
 [![观看演示](https://img.youtube.com/vi/N9lQaXt1eqQ/maxresdefault.jpg)](https://youtu.be/N9lQaXt1eqQ?si=LyEwvzzQF6QjUxR0)

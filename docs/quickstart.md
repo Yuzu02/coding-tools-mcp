@@ -57,7 +57,7 @@ CLI > environment > local TOML > public TOML > built-in defaults
 ```
 
 The default configuration enables the internal `projects` extension and
-exposes the current 24-tool composed catalog. Override the enabled list for one
+exposes the current 26-tool composed catalog. Override the enabled list for one
 process with:
 
 ```bash
@@ -99,8 +99,8 @@ to combine `dev` and `semantic` in one uv environment. Keep normal development
 gates on `--extra dev` and semantic integration on an isolated
 `--extra semantic` environment.
 
-With Serena available at startup, `projects + semantic` exposes 28 tools. If
-Serena is unavailable, the process still starts with the 24-tool
+With Serena available at startup, `projects + semantic` exposes 32 tools. If
+Serena is unavailable, the process still starts with the 26-tool
 projects-only catalog. Worker/runtime state is kept outside project roots, and
 semantic operations do not modify source files.
 

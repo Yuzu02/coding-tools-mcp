@@ -4,6 +4,7 @@ import unittest
 
 from coding_tools_mcp.extensions.semantic.protocol import (
     MAX_WORKER_MESSAGE_BYTES,
+    SEMANTIC_OPERATIONS,
     WORKER_PROTOCOL_VERSION,
     WorkerProtocolError,
     decode_message,
@@ -40,6 +41,31 @@ class SemanticWorkerProtocolTests(unittest.TestCase):
         }
 
         self.assertEqual(decode_message(encode_message(message)), message)
+
+    def test_protocol_exposes_exact_read_only_semantic_operation_set(self) -> None:
+        self.assertEqual(
+            SEMANTIC_OPERATIONS,
+            frozenset(
+                {
+                    "list_symbols",
+                    "find_symbol",
+                    "find_definition",
+                    "find_references",
+                    "find_implementations",
+                    "get_diagnostics",
+                }
+            ),
+        )
+        for operation in ("find_implementations", "get_diagnostics"):
+            with self.subTest(operation=operation):
+                message = {
+                    "type": "request",
+                    "protocol": 1,
+                    "id": f"r-{operation}",
+                    "op": operation,
+                    "params": {"path": "a.py"},
+                }
+                self.assertEqual(decode_message(encode_message(message)), message)
 
     def test_success_response_requires_object_result(self) -> None:
         valid = {

@@ -15,10 +15,14 @@ from coding_tools_mcp.extensions.semantic.extension import SemanticExtension
 from coding_tools_mcp.extensions.semantic.model import (
     FindDefinitionRequest,
     FindDefinitionResult,
+    FindImplementationsRequest,
+    FindImplementationsResult,
     FindReferencesRequest,
     FindReferencesResult,
     FindSymbolRequest,
     FindSymbolResult,
+    GetDiagnosticsRequest,
+    GetDiagnosticsResult,
     ListSymbolsRequest,
     ListSymbolsResult,
 )
@@ -33,6 +37,8 @@ SEMANTIC_TOOLS = {
     "find_symbol",
     "find_definition",
     "find_references",
+    "find_implementations",
+    "get_diagnostics",
 }
 
 
@@ -76,6 +82,20 @@ class UnavailableBackend:
         project: RegisteredProject,
         request: FindReferencesRequest,
     ) -> FindReferencesResult:
+        self._unavailable()
+
+    def find_implementations(
+        self,
+        project: RegisteredProject,
+        request: FindImplementationsRequest,
+    ) -> FindImplementationsResult:
+        self._unavailable()
+
+    def get_diagnostics(
+        self,
+        project: RegisteredProject,
+        request: GetDiagnosticsRequest,
+    ) -> GetDiagnosticsResult:
         self._unavailable()
 
     def close_project(self, project_id: str) -> None:
@@ -129,7 +149,7 @@ class SemanticUnavailableStartupTests(unittest.TestCase):
                 tools = {tool["name"] for tool in runtime.list_tools()["tools"]}
                 metadata = runtime.server_info_payload()["extensions"]
 
-                self.assertEqual(len(tools), 24)
+                self.assertEqual(len(tools), 26)
                 self.assertTrue(SEMANTIC_TOOLS.isdisjoint(tools))
                 self.assertFalse(metadata["metadata"]["semantic"]["available"])
                 self.assertEqual(
@@ -204,11 +224,11 @@ class SemanticMCPIntegrationTests(unittest.TestCase):
         )
         return project
 
-    def test_stdio_semantic_catalog_has_28_tools(self) -> None:
+    def test_stdio_semantic_catalog_has_32_tools(self) -> None:
         with StdioMCPClient(self.bootstrap, extra_args=self.extra_args) as client:
             tools = client.rpc("tools/list")["tools"]
             names = {tool["name"] for tool in tools}
-            self.assertEqual(len(tools), 28)
+            self.assertEqual(len(tools), 32)
             self.assertTrue(SEMANTIC_TOOLS <= names)
 
     def test_semantic_schemas_are_coding_tools_owned(self) -> None:

@@ -24,9 +24,12 @@ from coding_tools_mcp.extensions.semantic.backend import (
 from coding_tools_mcp.extensions.semantic.extension import SemanticExtension
 from coding_tools_mcp.extensions.semantic.model import (
     FindDefinitionResult,
+    FindImplementationsResult,
     FindReferencesResult,
     FindSymbolResult,
+    GetDiagnosticsResult,
     ListSymbolsResult,
+    SemanticDiagnostic,
     SemanticPosition,
     SemanticRange,
     SemanticReference,
@@ -137,6 +140,37 @@ class FakeBackend:
             )
         )
 
+    def find_implementations(self, project, request):
+        self._maybe_fail()
+        self.calls.append(("find_implementations", project.project_id, request))
+        return FindImplementationsResult(
+            (
+                SemanticSymbol(
+                    name="Impl",
+                    name_path="Impl",
+                    kind="class",
+                    path=request.path,
+                    range=SemanticRange(SemanticPosition(5, 1), SemanticPosition(7, 1)),
+                ),
+            )
+        )
+
+    def get_diagnostics(self, project, request):
+        self._maybe_fail()
+        self.calls.append(("get_diagnostics", project.project_id, request))
+        return GetDiagnosticsResult(
+            (
+                SemanticDiagnostic(
+                    path=request.path,
+                    range=SemanticRange(SemanticPosition(2, 1), SemanticPosition(2, 5)),
+                    severity="warning",
+                    message="example diagnostic",
+                    code="W001",
+                    source="fake",
+                ),
+            )
+        )
+
     def close_project(self, project_id: str) -> None:
         self.calls.append(("close_project", project_id, None))
 
@@ -243,7 +277,7 @@ class SemanticExtensionTests(unittest.TestCase):
             },
         )
 
-    def test_available_backend_contributes_four_read_only_idempotent_tools(self) -> None:
+    def test_available_backend_contributes_six_read_only_idempotent_tools(self) -> None:
         backend = FakeBackend()
         _extension, services, contributions = self.build_extension(backend)
         tools = {tool.name: tool for _owner, tool in contributions.tool_entries()}
@@ -251,7 +285,14 @@ class SemanticExtensionTests(unittest.TestCase):
         self.assertIs(services.require(SEMANTIC_BACKEND), backend)
         self.assertEqual(
             set(tools),
-            {"list_symbols", "find_symbol", "find_definition", "find_references"},
+            {
+                "list_symbols",
+                "find_symbol",
+                "find_definition",
+                "find_references",
+                "find_implementations",
+                "get_diagnostics",
+            },
         )
         for tool in tools.values():
             self.assertTrue(tool.annotations.read_only)
@@ -274,6 +315,14 @@ class SemanticExtensionTests(unittest.TestCase):
             tools["find_references"].input_schema["required"],
             ["project_id", "path", "line", "column"],
         )
+        self.assertEqual(
+            tools["find_implementations"].input_schema["required"],
+            ["project_id", "path", "line", "column"],
+        )
+        self.assertEqual(
+            tools["get_diagnostics"].input_schema["required"],
+            ["project_id", "path"],
+        )
         self.assertNotIn("name_path_pattern", tools["find_symbol"].input_schema["properties"])
 
     def test_handlers_pass_canonical_project_relative_paths_to_backend(self) -> None:
@@ -292,9 +341,23 @@ class SemanticExtensionTests(unittest.TestCase):
                 "column": 1,
             }
         )
+        implementations = tools["find_implementations"].handler(
+            {
+                "project_id": "alpha",
+                "path": "src/../src/sample.py",
+                "line": 2,
+                "column": 1,
+            }
+        )
+        diagnostics = tools["get_diagnostics"].handler(
+            {"project_id": "alpha", "path": "src/../src/sample.py"}
+        )
 
         self.assertEqual(listed["symbols"][0]["path"], "src/sample.py")
         self.assertEqual(definition["definitions"][0]["path"], "src/sample.py")
+        self.assertEqual(implementations["implementations"][0]["path"], "src/sample.py")
+        self.assertEqual(diagnostics["diagnostics"][0]["path"], "src/sample.py")
+        self.assertEqual(diagnostics["diagnostics"][0]["severity"], "warning")
         self.assertEqual(backend.calls[0][2].path, "src/sample.py")
         self.assertEqual(backend.calls[1][2].path, "src/sample.py")
 
@@ -355,7 +418,14 @@ class SemanticExtensionTests(unittest.TestCase):
 
         self.assertEqual(
             set(tools),
-            {"list_symbols", "find_symbol", "find_definition", "find_references"},
+            {
+                "list_symbols",
+                "find_symbol",
+                "find_definition",
+                "find_references",
+                "find_implementations",
+                "get_diagnostics",
+            },
         )
         with self.assertRaises(ToolFailure) as raised:
             tools["find_symbol"].handler({"project_id": "blocked", "query": "target"})

@@ -24,8 +24,10 @@ from .backend import (
 )
 from .model import (
     FindDefinitionRequest,
+    FindImplementationsRequest,
     FindReferencesRequest,
     FindSymbolRequest,
+    GetDiagnosticsRequest,
     ListSymbolsRequest,
 )
 
@@ -102,6 +104,34 @@ FIND_REFERENCES_SCHEMA = {
         "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 500},
     },
     "required": ["project_id", "path", "line", "column"],
+    "additionalProperties": False,
+}
+
+FIND_IMPLEMENTATIONS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        **POSITION_SCHEMA_PROPERTIES,
+        "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200},
+    },
+    "required": ["project_id", "path", "line", "column"],
+    "additionalProperties": False,
+}
+
+GET_DIAGNOSTICS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "project_id": PROJECT_ID_SCHEMA,
+        "path": PATH_SCHEMA,
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "min_severity": {
+            "type": "string",
+            "enum": ["error", "warning", "information", "hint"],
+            "default": "hint",
+        },
+        "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 500},
+    },
+    "required": ["project_id", "path"],
     "additionalProperties": False,
 }
 
@@ -208,6 +238,29 @@ def _render_references(payload: dict[str, Any]) -> str:
         lines.append(f"{path}{suffix}{container}")
     if len(raw_items) > 100:
         lines.append(f"… {len(raw_items) - 100} more references omitted from model text.")
+    return "\n".join(lines)
+
+
+def _render_diagnostics(payload: dict[str, Any]) -> str:
+    raw_items = payload.get("diagnostics")
+    if not isinstance(raw_items, list) or not raw_items:
+        return "No diagnostics found."
+    lines: list[str] = []
+    for item in raw_items[:100]:
+        if not isinstance(item, Mapping):
+            continue
+        path = str(item.get("path") or "?")
+        severity = str(item.get("severity") or "unknown")
+        message = str(item.get("message") or "")
+        raw_range = item.get("range")
+        suffix = ""
+        if isinstance(raw_range, Mapping):
+            raw_start = raw_range.get("start")
+            if isinstance(raw_start, Mapping) and isinstance(raw_start.get("line"), int):
+                suffix = f":{raw_start['line']}"
+        lines.append(f"{severity} {path}{suffix} — {message}")
+    if len(raw_items) > 100:
+        lines.append(f"… {len(raw_items) - 100} more diagnostics omitted from model text.")
     return "\n".join(lines)
 
 
@@ -319,6 +372,28 @@ class SemanticExtension:
                 handler=self._find_references,
                 annotations=annotations,
                 text_renderer=_render_references,
+            )
+        )
+        context.add_tool(
+            ToolContribution(
+                name="find_implementations",
+                title="Find implementations",
+                description="Find implementations for the semantic symbol at a one-based source position.",
+                input_schema=FIND_IMPLEMENTATIONS_SCHEMA,
+                handler=self._find_implementations,
+                annotations=annotations,
+                text_renderer=lambda payload: _render_symbol_collection(payload, "implementations"),
+            )
+        )
+        context.add_tool(
+            ToolContribution(
+                name="get_diagnostics",
+                title="Get diagnostics",
+                description="Return bounded semantic diagnostics for one project file.",
+                input_schema=GET_DIAGNOSTICS_SCHEMA,
+                handler=self._get_diagnostics,
+                annotations=annotations,
+                text_renderer=_render_diagnostics,
             )
         )
 
@@ -453,6 +528,41 @@ class SemanticExtension:
         _registry, _runtimes, backend = self._services()
         try:
             result = backend.find_references(project, request)
+        except SemanticBackendError as exc:
+            raise self._backend_failure(project_id, exc) from exc
+        return {"project_id": project_id, "backend": backend.backend_name, **result.payload()}
+
+    def _find_implementations(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(args.get("project_id", ""))
+        project = self._project(project_id)
+        path = self._canonical_path(project_id, str(args.get("path", "")), require_file=True)
+        request = FindImplementationsRequest(
+            path=path,
+            line=int(args.get("line", 0)),
+            column=int(args.get("column", 0)),
+            max_results=int(args.get("max_results", 200)),
+        )
+        _registry, _runtimes, backend = self._services()
+        try:
+            result = backend.find_implementations(project, request)
+        except SemanticBackendError as exc:
+            raise self._backend_failure(project_id, exc) from exc
+        return {"project_id": project_id, "backend": backend.backend_name, **result.payload()}
+
+    def _get_diagnostics(self, args: dict[str, Any]) -> dict[str, Any]:
+        project_id = str(args.get("project_id", ""))
+        project = self._project(project_id)
+        path = self._canonical_path(project_id, str(args.get("path", "")), require_file=True)
+        request = GetDiagnosticsRequest(
+            path=path,
+            start_line=(int(args["start_line"]) if "start_line" in args else None),
+            end_line=(int(args["end_line"]) if "end_line" in args else None),
+            min_severity=str(args.get("min_severity", "hint")),
+            max_results=int(args.get("max_results", 500)),
+        )
+        _registry, _runtimes, backend = self._services()
+        try:
+            result = backend.get_diagnostics(project, request)
         except SemanticBackendError as exc:
             raise self._backend_failure(project_id, exc) from exc
         return {"project_id": project_id, "backend": backend.backend_name, **result.payload()}

@@ -8,12 +8,17 @@ from coding_tools_mcp.extensions.semantic.backend import SemanticBackendError
 from coding_tools_mcp.extensions.semantic.model import (
     FindDefinitionRequest,
     FindDefinitionResult,
+    FindImplementationsRequest,
+    FindImplementationsResult,
     FindReferencesRequest,
     FindReferencesResult,
     FindSymbolRequest,
     FindSymbolResult,
+    GetDiagnosticsRequest,
+    GetDiagnosticsResult,
     ListSymbolsRequest,
     ListSymbolsResult,
+    SemanticDiagnostic,
     SemanticPosition,
     SemanticRange,
     SemanticReference,
@@ -106,6 +111,24 @@ class SemanticModelTests(unittest.TestCase):
         self.assertEqual(FindDefinitionRequest("a.py", 3, 4).line, 3)
         self.assertEqual(FindReferencesRequest("a.py", 3, 4).max_results, 500)
         self.assertFalse(FindReferencesRequest("a.py", 3, 4).include_declaration)
+        self.assertEqual(FindImplementationsRequest("a.py", 3, 4).max_results, 200)
+        self.assertEqual(GetDiagnosticsRequest("a.py").min_severity, "hint")
+        self.assertEqual(GetDiagnosticsRequest("a.py").max_results, 500)
+
+    def test_diagnostic_request_validates_one_based_ranges_and_closed_severity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "one-based"):
+            GetDiagnosticsRequest("a.py", start_line=0)
+        with self.assertRaisesRegex(ValueError, "precedes"):
+            GetDiagnosticsRequest("a.py", start_line=4, end_line=3)
+        with self.assertRaisesRegex(ValueError, "severity"):
+            GetDiagnosticsRequest("a.py", min_severity="critical")
+        with self.assertRaisesRegex(ValueError, "severity"):
+            SemanticDiagnostic(
+                path="a.py",
+                range=SemanticRange(SemanticPosition(1, 1), SemanticPosition(1, 2)),
+                severity="unknown",
+                message="unsupported",
+            )
 
     def test_result_payloads_use_normalized_collections(self) -> None:
         symbol = SemanticSymbol.summary(name="A", name_path="A", kind="class", path="a.py")
@@ -126,6 +149,22 @@ class SemanticModelTests(unittest.TestCase):
         self.assertEqual(
             FindReferencesResult((reference,)).payload()["references"],
             [reference.payload()],
+        )
+        diagnostic = SemanticDiagnostic(
+            path="a.py",
+            range=SemanticRange(SemanticPosition(3, 2), SemanticPosition(3, 8)),
+            severity="warning",
+            message="example",
+            code="W1",
+            source="test",
+        )
+        self.assertEqual(
+            FindImplementationsResult((symbol,)).payload()["implementations"],
+            [symbol.payload()],
+        )
+        self.assertEqual(
+            GetDiagnosticsResult((diagnostic,)).payload()["diagnostics"],
+            [diagnostic.payload()],
         )
 
     def test_backend_error_and_capability_are_stable(self) -> None:

@@ -68,7 +68,7 @@ replace existing schema properties.
 
 The built-in `semantic` extension is disabled by default and depends on
 `projects`. When it is enabled and exact-pinned `serena-agent==1.5.3` is
-available at startup, the frozen catalog grows from 26 to 30 tools:
+available at startup, the frozen catalog grows from 26 to 32 tools:
 
 - **`list_symbols`** — list normalized semantic symbols in one project file;
 - **`find_symbol`** — locate symbols by semantic name path, optionally returning a
@@ -76,14 +76,18 @@ available at startup, the frozen catalog grows from 26 to 30 tools:
 - **`find_definition`** — resolve a one-based project-relative source position;
 - **`find_references`** — return project-relative one-based references, optionally
   including the declaration.
+- **`find_implementations`** — resolve implementations for the symbol at a
+  project-relative one-based source position;
+- **`get_diagnostics`** — return bounded, normalized file diagnostics with a
+  closed severity vocabulary.
 
-All four are `readOnlyHint=true`, `destructiveHint=false`,
+All six are `readOnlyHint=true`, `destructiveHint=false`,
 `idempotentHint=true`, and `openWorldHint=false`. They always require an
 explicit `project_id`; there is no Serena activation/current-project API.
 
 If the semantic extension is enabled but Serena is absent or not version
-1.5.3, startup still succeeds without these four tools. If a worker later
-fails after a 30-tool catalog was composed, the catalog stays fixed and the
+1.5.3, startup still succeeds without these six tools. If a worker later
+fails after a 32-tool catalog was composed, the catalog stays fixed and the
 semantic call returns a typed `SEMANTIC_*` failure. Filesystem, Git, and command
 tools remain usable.
 
