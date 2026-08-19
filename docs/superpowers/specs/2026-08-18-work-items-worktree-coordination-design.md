@@ -25,6 +25,13 @@ The implemented prerequisite runtime is the current v0.4 architecture:
 - recoverable command handles; and
 - the `projects` and `semantic` extensions.
 
+Before **any WT0 implementation begins**, the separate
+[`2026-08-18-pre-worktree-runtime-modernization-design.md`](2026-08-18-pre-worktree-runtime-modernization-design.md)
+must be implemented and freshly accepted. In particular, Worktrees must not be
+used as the place to fix protocol-era drift, upstream-sync topology,
+`cwd`/`workdir` schema ambiguity, request cancellation, context bloat, or
+provider policy seams. Those are preconditions, not Worktree responsibilities.
+
 No part of this document changes the deployed v0.4 contract until a later
 implementation plan is accepted and implemented.
 
@@ -1203,6 +1210,26 @@ Required properties:
 
 Implementation should be split so repository-layout support is proven before
 durable coordination depends on it.
+
+### Hard prerequisite — PW0-PW6 modernization gate
+
+The full pre-Worktree gate defined in
+`2026-08-18-pre-worktree-runtime-modernization-design.md` must be GREEN first.
+
+Required proof includes:
+
+- current `xyTom/main` is deliberately integrated and is an ancestor of fork
+  `main`;
+- MCP 2026-07-28 dispatch/cancellation behavior is exact;
+- project operations use one canonical `ExecutionTarget` resolver;
+- public `cwd`/`workdir`/Git path semantics are normalized;
+- `server_info` is summary-first;
+- `project_context` and `doctor` provide bounded orientation/diagnostics;
+- future provider operations inherit one policy/credential/confinement path;
+  and
+- full protocol/bridge/runtime/live gates are fresh.
+
+WT0 must not absorb unfinished work from that list.
 
 ### WT0 — Read-only repository/worktree identity
 
