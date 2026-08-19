@@ -8,12 +8,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SERVER = (ROOT / "coding_tools_mcp" / "server.py").read_text(encoding="utf-8")
 TOOL_RESULTS = (ROOT / "coding_tools_mcp" / "tool_results.py").read_text(encoding="utf-8")
+EXTENSION_HOST = (ROOT / "coding_tools_mcp" / "extensions" / "host.py").read_text(encoding="utf-8")
 
 
 class UpstreamBridgeCompatibilityTests(unittest.TestCase):
     def test_mother_core_does_not_import_extension_private_packages(self) -> None:
-        self.assertNotIn("extensions.projects", SERVER)
-        self.assertNotIn("extensions.semantic", SERVER)
+        for private_package in (
+            "extensions.projects",
+            "extensions.semantic",
+            "extensions.work",
+            "extensions.gateway",
+        ):
+            with self.subTest(private_package=private_package):
+                self.assertNotIn(private_package, SERVER)
+
+    def test_mother_core_uses_the_generic_composed_tool_bridge(self) -> None:
+        self.assertIn("def core_tool_contracts(", SERVER)
+        self.assertIn("compose_tools(core_tools, contributions, order)", EXTENSION_HOST)
 
     def test_projects_tools_are_not_authored_in_core_tool_registry(self) -> None:
         for name in ("list_projects", "resolve_project", "list_skills", "read_skill"):
