@@ -675,7 +675,7 @@ Allowed: sanitized tool name, project id, future worktree id, duration bucket, s
 
 Doctor summaries surface health states, not secret paths. Full detail may identify a generic failing component but still obey public/runtime redaction rules.
 
-- [ ] **Step 5: Run policy/telemetry gates and commit**
+- [x] **Step 5: Run policy/telemetry gates and commit**
 
 Run:
 
@@ -698,11 +698,11 @@ Commit: `refactor: converge operation policy and observability`.
 **Interfaces:**
 - Produces: one fresh evidence set proving PW0-PW6 GREEN and permitting WT0 to begin.
 
-- [ ] **Step 1: Reconcile current contract/tool-count docs from the live composed catalog**
+- [x] **Step 1: Reconcile current contract/tool-count docs from the live composed catalog**
 
 Do not edit historical v0.3 snapshots. Update current docs only. Ensure all new error codes, input properties, annotations, and tool names are represented.
 
-- [ ] **Step 2: Run focused architectural gates**
+- [x] **Step 2: Run focused architectural gates**
 
 ```bash
 uv run --locked python -m unittest tests.extensions.test_upstream_compatibility -v
@@ -711,7 +711,7 @@ uv run --locked python -m unittest tests.extensions.test_project_tool_routing te
 uv run --locked python -m unittest tests.extensions.test_semantic_mcp_integration tests.extensions.test_semantic_serena_integration -v
 ```
 
-- [ ] **Step 3: Run static/full repository gates**
+- [x] **Step 3: Run static/full repository gates**
 
 ```bash
 uv run --locked --extra dev python -m ruff check scripts tests coding_tools_mcp
@@ -722,7 +722,7 @@ git diff --check
 
 Expected: zero failures. If `mise run verify` exposes an environmental/deployment problem, investigate it rather than weakening tests.
 
-- [ ] **Step 4: Prove upstream topology freshly**
+- [x] **Step 4: Prove upstream topology freshly**
 
 ```bash
 git fetch --prune xyTom main
@@ -733,7 +733,7 @@ git rev-list --left-right --count xyTom/main...HEAD
 
 Expected: upstream ancestry exit zero and left-side count zero.
 
-- [ ] **Step 5: Exercise the deployed connector after code deployment/restart**
+- [x] **Step 5: Exercise the deployed connector after code deployment/restart**
 
 Using the canonical connector, verify:
 
@@ -750,7 +750,7 @@ exec_command(project_id=..., ...)   command start/recovery still works
 
 Also verify the protocol catalog/tool count/fingerprint from the live service matches the committed runtime.
 
-- [ ] **Step 6: Mark the pre-Worktree spec implemented/verified only after fresh evidence**
+- [x] **Step 6: Mark the pre-Worktree spec implemented/verified only after fresh evidence**
 
 Record final HEAD, upstream tip, tool count/fingerprint, relevant test totals, and live connector fingerprint as historical evidence. Do not claim WT0 is unblocked before this step.
 

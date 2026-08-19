@@ -1,7 +1,7 @@
 # Pre-Worktree Runtime Modernization Design
 
 **Date:** 2026-08-18
-**Status:** PROPOSED / NOT IMPLEMENTED
+**Status:** IMPLEMENTED / VERIFIED 2026-08-19
 **Target:** fork-owned runtime/extension foundation that must be GREEN before
 Worktree routing, Work Items, Hooks, or Gateway implementation begins.
 
@@ -25,8 +25,46 @@ This document is a prerequisite of:
 - the future MCP Gateway implementation; and
 - any later higher-level coordination/UI layer.
 
-No part of this specification changes the deployed runtime until a separate
-implementation plan is accepted and implemented.
+The accepted implementation plan has now been completed through PW6. The
+pre-Worktree runtime gate is GREEN and WT0 may begin.
+
+### 2026-08-19 verification evidence
+
+- implementation tip before this evidence-only documentation update:
+  `c0bbf233a13ea0e5bdb70c1365f066016c0570f4`;
+- freshly fetched upstream tip: `ed85e41999b0cf840d6e45f2bed11ac7f52eab3f`;
+- `xyTom/main` is an ancestor of the implementation tip, with
+  `git rev-list --left-right --count xyTom/main...HEAD` reporting `0 227` at
+  verification time;
+- PW5 policy/telemetry/security gate: 61 tests GREEN;
+- focused core architectural gate: 110 tests GREEN;
+- Serena-backed semantic integration gate: 13 tests GREEN using the pinned
+  semantic extra;
+- `mise run verify`: 736 tests GREEN with 7 intentional skips, plus the npm
+  launcher/package checks;
+- Ruff GREEN and mypy GREEN across 46 source files;
+- committed composed catalog: 32 tools;
+- deployed composed catalog: 32 tools;
+- committed and deployed tool-name fingerprint:
+  `474f9d9c60ca0f275e9c954a44d9f8a3f708c378eda200361c5baaa4a47611b3`;
+- deployed project registry: exactly four available projects;
+- live `project_context` and `doctor` returned bounded project/policy health
+  views; live `get_diagnostics` routed through Serena; live
+  `find_implementations` succeeded against a TypeScript semantic backend and
+  correctly returned a structured backend error where the Python language
+  server did not implement `textDocument/implementation`;
+- live `exec_command` succeeded with only `project_id`, and `get_command`
+  recovered the result by `client_request_id`.
+
+One client-side operational caveat was observed during the same long-running
+ChatGPT conversation: its already-materialized connector tool schemas remained
+at the earlier 28-tool catalog even after the live MCP endpoint moved to 32.
+Fresh raw `tools/list` against the deployed endpoint returned all 32 tools,
+including `project_context`, `doctor`, `find_implementations`, and
+`get_diagnostics`, and the live fingerprint matched the committed runtime.
+This is treated as connector-host/session schema caching: a fresh connector
+session/reconnect must refresh the tool schemas. It is not a server catalog or
+runtime-contract mismatch.
 
 ---
 

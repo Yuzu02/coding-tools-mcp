@@ -25,12 +25,13 @@ The implemented prerequisite runtime is the current v0.4 architecture:
 - recoverable command handles; and
 - the `projects` and `semantic` extensions.
 
-Before **any WT0 implementation begins**, the separate
+The separate
 [`2026-08-18-pre-worktree-runtime-modernization-design.md`](2026-08-18-pre-worktree-runtime-modernization-design.md)
-must be implemented and freshly accepted. In particular, Worktrees must not be
-used as the place to fix protocol-era drift, upstream-sync topology,
-`cwd`/`workdir` schema ambiguity, request cancellation, context bloat, or
-provider policy seams. Those are preconditions, not Worktree responsibilities.
+was implemented and freshly accepted on 2026-08-19. **WT0 is therefore
+unblocked.** Worktrees must still not be used as the place to fix protocol-era
+drift, upstream-sync topology, `cwd`/`workdir` schema ambiguity, request
+cancellation, context bloat, or provider policy seams. Those remain foundation
+responsibilities, not Worktree responsibilities.
 
 No part of this document changes the deployed v0.4 contract until a later
 implementation plan is accepted and implemented.
