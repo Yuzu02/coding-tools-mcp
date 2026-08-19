@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import JsonRpcError
+from .operation_context import OperationContext
 
 
 # The two eras negotiate their version through different channels and must not
@@ -49,8 +50,6 @@ DISCOVER_METHOD = "server/discover"
 MODERN_METHODS = frozenset(
     {
         DISCOVER_METHOD,
-        "notifications/cancelled",
-        "ping",
         "tools/list",
         "tools/call",
     }
@@ -369,6 +368,7 @@ def dispatch_rpc(
     request: dict[str, Any],
     *,
     transport_protocol_version: str | None = None,
+    operation_context: OperationContext | None = None,
 ) -> dict[str, Any] | None:
     """Dispatch one MCP JSON-RPC request against a runtime, shared by all transports.
 
@@ -401,13 +401,13 @@ def dispatch_rpc(
         runtime.telemetry.record_request(era, method)
         if era == MODERN_ERA:
             context = modern_request_context(params)
-            result = _dispatch_modern(runtime, method, params, context)
+            result = _dispatch_modern(runtime, method, params, context, operation_context)
         else:
             context = RequestContext(
                 era=LEGACY_ERA,
                 protocol_version=transport_protocol_version or LATEST_LEGACY_PROTOCOL_VERSION,
             )
-            result = _dispatch_legacy(runtime, request, method, params, context)
+            result = _dispatch_legacy(runtime, request, method, params, context, operation_context)
         request_id = request.get("id")
         if result is None or request_id is None:
             return None
@@ -427,6 +427,7 @@ def _dispatch_modern(
     method: str,
     params: dict[str, Any],
     context: RequestContext,
+    operation_context: OperationContext | None,
 ) -> dict[str, Any] | None:
     """Handle a request that carries its own protocol version.
 
@@ -436,16 +437,11 @@ def _dispatch_modern(
 
     if method not in MODERN_METHODS:
         raise JsonRpcError(-32601, f"Unknown method: {method}")
-    if method == "notifications/cancelled":
-        # Accepted and acknowledged by staying silent, as in the legacy era.
-        return None
-    if method == "ping":
-        return {}
     if method == DISCOVER_METHOD:
         return runtime.discover_payload()
     if method == "tools/list":
         return runtime.list_tools()
-    return _call_tool(runtime, params, context)
+    return _call_tool(runtime, params, context, operation_context)
 
 
 def _dispatch_legacy(
@@ -454,6 +450,7 @@ def _dispatch_legacy(
     method: str,
     params: dict[str, Any],
     context: RequestContext,
+    operation_context: OperationContext | None,
 ) -> dict[str, Any] | None:
     """Handle a request that negotiated its version through ``initialize``.
 
@@ -489,14 +486,24 @@ def _dispatch_legacy(
     if method == "tools/list":
         return runtime.list_tools()
     if method == "tools/call":
-        return _call_tool(runtime, params, context)
+        return _call_tool(runtime, params, context, operation_context)
     raise JsonRpcError(-32601, f"Unknown method: {method}")
 
 
-def _call_tool(runtime: Any, params: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+def _call_tool(
+    runtime: Any,
+    params: dict[str, Any],
+    context: RequestContext,
+    operation_context: OperationContext | None,
+) -> dict[str, Any]:
     if not isinstance(params.get("name"), str):
         raise JsonRpcError(-32602, "tools/call requires a tool name")
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):
         raise JsonRpcError(-32602, "tools/call arguments must be an object")
-    return runtime.call_tool(params["name"], arguments, context=context)
+    return runtime.call_tool(
+        params["name"],
+        arguments,
+        context=context,
+        operation_context=operation_context,
+    )

@@ -317,6 +317,13 @@ def legacy_script() -> list[tuple[str, dict[str, Any], str]]:
 class ModernLifecycleTests(unittest.TestCase):
     """The new era from first byte to last: one process, no handshake in it."""
 
+    def test_modern_ping_is_not_a_core_method(self) -> None:
+        with workspace_from_fixture("tiny-js-project", git=False) as workspace:
+            with StdioConnection(workspace.root) as connection:
+                response = connection.request(modern_request(1, "ping"))
+
+        self.assertEqual(response.get("error", {}).get("code"), -32601, response)
+
     def test_a_client_that_discovers_never_needs_to_initialize(self) -> None:
         with workspace_from_fixture("tiny-js-project", git=False) as workspace:
             with StdioConnection(workspace.root) as connection:

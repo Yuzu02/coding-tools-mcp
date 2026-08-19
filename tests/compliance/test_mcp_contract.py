@@ -503,8 +503,8 @@ class MCPContractTests(ComplianceTestCase):
         self.assertEqual(result.get("structuredContent", {}).get("path"), "src/math.js")
 
         ping_status, ping = self.modern_http_post(modern_request(2, "ping"))
-        self.assertEqual(ping_status, 200, ping)
-        self.assert_modern_result(ping.get("result", {}))
+        self.assertEqual(ping_status, 404, ping)
+        self.assertEqual(ping.get("error", {}).get("code"), -32601, ping)
 
         listed_status, listed = self.modern_http_post(modern_request(3, "tools/list"))
         self.assertEqual(listed_status, 200, listed)
@@ -1563,14 +1563,12 @@ class MCPContractTests(ComplianceTestCase):
         finally:
             self.stop_process(process)
 
-    def test_stdio_modern_ping_answers_and_cancellation_stays_silent(self) -> None:
+    def test_stdio_modern_ping_is_rejected_and_cancellation_stays_silent(self) -> None:
         process = self.start_stdio_server()
         try:
-            pong = self.stdio_rpc(process, modern_request(1, "ping"))
-            result = pong.get("result", {})
-            self.assert_modern_result(result)
-            self.assertNotIn("ttlMs", result)
-            self.assertNotIn("cacheScope", result)
+            pong = self.stdio_rpc_allow_error(process, modern_request(1, "ping"))
+            self.assertEqual(pong.get("error", {}).get("code"), -32601, pong)
+            self.assertNotIn("result", pong)
 
             self.stdio_send(
                 process,
@@ -1632,7 +1630,7 @@ class MCPContractTests(ComplianceTestCase):
 
             omitted_client_info = self.stdio_rpc(
                 process,
-                modern_request(100, "ping", meta=modern_meta(drop=(META_CLIENT_INFO,))),
+                modern_request(100, "tools/list", meta=modern_meta(drop=(META_CLIENT_INFO,))),
             )
             self.assert_modern_result(omitted_client_info.get("result", {}))
         finally:

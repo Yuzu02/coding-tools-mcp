@@ -14,10 +14,12 @@ import mimetypes
 import os
 import posixpath
 import re
+import select
 import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -36,6 +38,12 @@ from typing import Any, cast
 from . import __version__
 from .envutils import ENV_PREFIX, truthy_env
 from .errors import JsonRpcError, ToolFailure
+from .operation_context import (
+    OperationContext,
+    bind_operation_context,
+    new_operation_context,
+    raise_if_operation_cancelled,
+)
 from .extensions import (
     CORE_CONFIG_SNAPSHOT,
     CORE_WORKSPACE,
@@ -2223,23 +2231,23 @@ class Runtime:
         for raw in MISE_DEFAULT_READ_ROOTS:
             add_unique(read_roots, Path(raw), protect_broker=True)
         for name in (*MISE_READ_ROOT_ENV_NAMES, *MISE_READ_FILE_ENV_NAMES):
-            raw = environment.get(name)
-            if raw:
-                add_unique(read_roots, Path(raw), protect_broker=True)
-        for raw in MISE_DEFAULT_READ_ROOTS:
-            add_mise_config_symlink_targets(Path(raw))
+            configured_root = environment.get(name)
+            if configured_root:
+                add_unique(read_roots, Path(configured_root), protect_broker=True)
+        for default_mise_root in MISE_DEFAULT_READ_ROOTS:
+            add_mise_config_symlink_targets(Path(default_mise_root))
         mise_config_dir = environment.get("MISE_CONFIG_DIR")
         if mise_config_dir:
             add_mise_config_symlink_targets(Path(mise_config_dir))
-        for raw in (
+        for runtime_root in (
             self.runtime_dir,
             self.command_home_dir(),
             self.command_tmp_dir(),
             self.state_dir,
             self.cache_dir,
         ):
-            add_unique(read_roots, raw)
-            add_unique(write_roots, raw)
+            add_unique(read_roots, runtime_root)
+            add_unique(write_roots, runtime_root)
         if self.global_tmp_write_policy() == "allowed":
             for raw in GLOBAL_TMP_ROOTS:
                 path = Path(raw)
@@ -2535,6 +2543,7 @@ class Runtime:
         arguments: dict[str, Any] | None,
         *,
         context: RequestContext | None = None,
+        operation_context: OperationContext | None = None,
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
@@ -2543,7 +2552,12 @@ class Runtime:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         validate_arguments(tool, args)
         try:
-            payload = tool.handler(args)
+            with bind_operation_context(operation_context):
+                if operation_context is not None:
+                    operation_context.cancellation.raise_if_cancelled()
+                payload = tool.handler(args)
+                if operation_context is not None:
+                    operation_context.cancellation.raise_if_cancelled()
             payload.setdefault("ok", True)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = tool.content_builder(payload) if tool.content_builder else None
@@ -2763,6 +2777,7 @@ class Runtime:
 
         def visit(directory: Path, depth: int) -> None:
             nonlocal truncated
+            raise_if_operation_cancelled()
             if truncated:
                 return
             try:
@@ -2772,6 +2787,7 @@ class Runtime:
             child_rel_paths = [normalize_rel_display(child, self.workspace.root) for child in children]
             ignored = set() if include_ignored else self.workspace.git_ignored_paths(child_rel_paths)
             for child in children:
+                raise_if_operation_cancelled()
                 if self.workspace.is_ignored_path(
                     child,
                     include_hidden=include_hidden,
@@ -2825,6 +2841,7 @@ class Runtime:
         files: list[dict[str, Any]] = []
         truncated = False
         for batch in path_batches(walk_files(resolved.path), 256):
+            raise_if_operation_cancelled()
             # Filter by glob first so git check-ignore only sees candidates.
             candidates = [
                 (path, rel)
@@ -2894,6 +2911,7 @@ class Runtime:
 
         paths: dict[str, Path] = {}
         for pattern in patterns:
+            raise_if_operation_cancelled()
             effective = pattern
             args = list(args_base)
             if "/" in pattern:
@@ -2932,6 +2950,7 @@ class Runtime:
         ignored = set() if include_ignored else self.workspace.git_ignored_paths(list(paths))
         files: list[dict[str, Any]] = []
         for rel, path in paths.items():
+            raise_if_operation_cancelled()
             if self.workspace.is_ignored_path(
                 path,
                 include_hidden=include_hidden,
@@ -2992,6 +3011,7 @@ class Runtime:
 
         roots: Iterator[Path] = iter([resolved.path]) if resolved.path.is_file() else walk_files(resolved.path)
         for batch in path_batches(roots, 256):
+            raise_if_operation_cancelled()
             # Filter by glob first so git check-ignore runs once per batch of
             # candidates instead of once per walked file.
             candidates = []
@@ -3008,6 +3028,7 @@ class Runtime:
                 candidates.append((path, rel))
             ignored = self.workspace.git_ignored_paths([rel for _, rel in candidates])
             for path, rel in candidates:
+                raise_if_operation_cancelled()
                 if self.workspace.is_ignored_path(path, git_ignored=ignored):
                     continue
                 try:
@@ -3021,6 +3042,7 @@ class Runtime:
                 except UnicodeDecodeError:
                     continue
                 for index, line in enumerate(lines):
+                    raise_if_operation_cancelled()
                     if compiled:
                         found = compiled.search(line)
                         if not found:
@@ -3103,6 +3125,7 @@ class Runtime:
         assert process.stdout is not None
         try:
             for raw in process.stdout:
+                raise_if_operation_cancelled()
                 try:
                     event = json.loads(raw)
                 except json.JSONDecodeError:
@@ -6616,13 +6639,63 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         except JsonRpcError as exc:
             self.send_rpc_error(exc.code, exc.message, request_id=response_id(request), data=exc.data)
             return
-        response = self.handle_rpc(request, transport_protocol_version=protocol_version)
+        operation = new_operation_context(response_id(request))
+        disconnect_stop = threading.Event()
+        disconnect_watcher: threading.Thread | None = None
+        if era == MODERN_ERA and "id" in request:
+            disconnect_watcher = threading.Thread(
+                target=self._watch_modern_client_disconnect,
+                args=(operation, disconnect_stop),
+                name=f"mcp-http-disconnect-{operation.operation_id}",
+                daemon=True,
+            )
+            disconnect_watcher.start()
+        try:
+            response = self.handle_rpc(
+                request,
+                transport_protocol_version=protocol_version,
+                operation_context=operation,
+            )
+        finally:
+            disconnect_stop.set()
+            if disconnect_watcher is not None:
+                disconnect_watcher.join(timeout=0.2)
+        if operation.cancellation.cancelled:
+            self.close_connection = True
+            return
         if response is None:
             self.send_response(202)
             self.send_cors_headers()
             self.end_headers()
             return
         self.send_json(response, status=rpc_response_status(era, response))
+
+    def _watch_modern_client_disconnect(
+        self,
+        operation: OperationContext,
+        stop: threading.Event,
+    ) -> None:
+        """Cancel request-owned work when the modern HTTP client closes its stream."""
+
+        connection = self.connection
+        while not stop.wait(0.02):
+            try:
+                readable, _, _ = select.select([connection], [], [], 0)
+                if not readable:
+                    continue
+                pending = connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                if pending:
+                    # Pipelined bytes belong to the connection, not to this
+                    # request. Do not consume them and do not call them a
+                    # cancellation signal.
+                    continue
+                operation.cancellation.cancel()
+                return
+            except BlockingIOError:
+                continue
+            except OSError:
+                operation.cancellation.cancel()
+                return
 
     def duplicated_mirror_header(self) -> str | None:
         """Name the first mirror header that was sent more than once, if any.
@@ -6643,6 +6716,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         request: dict[str, Any],
         *,
         transport_protocol_version: str | None = None,
+        operation_context: OperationContext | None = None,
     ) -> dict[str, Any] | None:
         legacy_version = (
             transport_protocol_version
@@ -6650,7 +6724,12 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             else None
         )
         try:
-            return dispatch_rpc(self.runtime, request, transport_protocol_version=legacy_version)
+            return dispatch_rpc(
+                self.runtime,
+                request,
+                transport_protocol_version=legacy_version,
+                operation_context=operation_context,
+            )
         except Exception as exc:  # noqa: BLE001 - HTTP must always answer with JSON-RPC
             return jsonrpc_error(response_id(request), -32603, str(exc))
 
@@ -7291,7 +7370,7 @@ def run_http(
             print("ERROR: HostConfig transport.kind is not http.", file=sys.stderr)
             return 2
         try:
-            auth_token, oauth_config = _host_http_auth(host_config)
+            auth_token, host_oauth_config = _host_http_auth(host_config)
         except ConfigError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
@@ -7300,7 +7379,7 @@ def run_http(
                 args,
                 runtime_policy_from_host_config(host_config),
                 auth_token=auth_token,
-                oauth_config=oauth_config,
+                oauth_config=host_oauth_config,
                 transport="http",
                 config_snapshot=snapshot,
                 extension_registry=registry,
@@ -7312,7 +7391,7 @@ def run_http(
             bind_host=host_config.transport.host,
             bind_port=host_config.transport.port,
             runtime=runtime,
-            oauth_config=oauth_config,
+            oauth_config=host_oauth_config,
         )
 
     auth_mode = (os.environ.get(f"{ENV_PREFIX}_AUTH_MODE") or "").strip().lower()
