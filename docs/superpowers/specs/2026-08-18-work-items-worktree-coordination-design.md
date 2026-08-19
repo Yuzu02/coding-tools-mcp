@@ -423,15 +423,60 @@ Examples:
 ```text
 read_file(project_id, worktree_id?, path)
 apply_patch(project_id, worktree_id?, patch)
-exec_command(project_id, worktree_id?, workdir, ...)
-git_status(project_id, worktree_id?, workdir, ...)
-git_diff(project_id, worktree_id?, workdir, ...)
+exec_command(project_id, worktree_id?, workdir=".", ...)
+git_status(project_id, worktree_id?, workdir=".", ...)
+git_diff(project_id, worktree_id?, workdir=".", ...)
 list_symbols(project_id, worktree_id?, path)
 find_symbol(project_id, worktree_id?, ...)
 ```
 
 Omission always means the registered default worktree. No previous tool call can
 change that default for a session.
+
+`workdir` is also optional for operations that conceptually execute from a
+directory. Omitting it means `"."` relative to the execution root selected by
+`(project_id, worktree_id?)`; it never means process `cwd` and never depends on
+a previous request.
+
+The routing algorithm is normative:
+
+```text
+execution_root = resolve_worktree_root(
+    project_id,
+    worktree_id ?? registered_default_worktree,
+)
+
+effective_workdir = resolve_beneath(
+    execution_root,
+    workdir ?? ".",
+)
+```
+
+Therefore the common case stays compact:
+
+```text
+git_status(project_id="coding-tools")
+```
+
+is equivalent to targeting the registered default worktree at its root, while:
+
+```text
+git_status(project_id="coding-tools", worktree_id="wt_abc123")
+```
+
+targets the root of that authorized worktree. `workdir` is supplied only when a
+subdirectory is semantically required.
+
+`workdir` is never a project/worktree selector. `..`, symlink traversal, or any
+other resolution that escapes the selected execution root is rejected rather
+than retargeting the request. This preserves explicit project/worktree
+isolation while removing redundant arguments from ordinary calls.
+
+Internally all filesystem, Git, command, skill/instruction, patch, and semantic
+entry points should consume one canonical `ExecutionTarget`/resolver service
+rather than reimplementing defaulting and path checks independently. The exact
+type name is implementation-defined; the invariant is a single source of truth
+for `(project_id, worktree_id?, workdir?) -> canonical execution root/workdir`.
 
 ### 6.2 Compact discovery API
 
