@@ -23,6 +23,13 @@ FORBIDDEN_PATH_NAMES = frozenset(
 FORBIDDEN_PASSTHROUGH_NAMES = FORBIDDEN_PATH_NAMES | {
     "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"
 }
+# Providers may rehome XDG directories only through ``env_paths``.  Those
+# values are constrained to the provider's broker subtree below, unlike an
+# inherited environment value, so this preserves per-provider isolation while
+# supporting CLIs (notably Vercel) that create state in XDG locations.
+PROVIDER_SCOPED_XDG_PATH_NAMES = frozenset(
+    {"XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"}
+)
 
 
 @dataclass(frozen=True)
@@ -72,7 +79,7 @@ def _env_path(raw: object, field: str) -> tuple[str, Path]:
         raise ConfigError(f"{field} must use NAME=/absolute/path")
     if SECRET_NAME_RE.search(name):
         raise ConfigError(f"{field} cannot set a secret-like environment variable")
-    if name.upper() in FORBIDDEN_PASSTHROUGH_NAMES:
+    if name.upper() in FORBIDDEN_PASSTHROUGH_NAMES - PROVIDER_SCOPED_XDG_PATH_NAMES:
         raise ConfigError(f"{field} cannot override the isolated process environment")
     return name, _declared_path(value, field)
 

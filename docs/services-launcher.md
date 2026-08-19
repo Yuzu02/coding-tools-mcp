@@ -522,9 +522,13 @@ env_paths = ["EXAMPLE_CLI_CONFIG_DIR=/var/lib/coding-tools-mcp/state/credentials
 subtree; symlinked roots and paths outside it are rejected. `env_passthrough`
 contains variable names only. Values come from the service environment and
 are granted only to the matching simple executable. Secret-like variable names
-are rejected from `env_paths`, and the isolated `HOME`, `PATH`, temporary, and
-XDG roots cannot be overridden. Never bind or copy a personal home directory:
-provision the required files into the provider's broker subtree instead.
+are rejected from `env_paths`. `HOME`, `PATH`, temporary roots, and inherited
+XDG values cannot be overridden. A provider may set `XDG_CACHE_HOME`,
+`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, or `XDG_STATE_HOME` only through an
+`env_paths` value that remains inside its own broker subtree; this lets CLIs
+with XDG state use provider-owned storage without widening their authority.
+Never bind or copy a personal home directory: provision the required files
+into the provider's broker subtree instead.
 
 The registry is checked lazily before each `exec_command` and `server_info`.
 Changes to fragment names, metadata, size, timestamps, or contents create a

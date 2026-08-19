@@ -116,6 +116,36 @@ class CredentialProviderRegistryTests(unittest.TestCase):
             self.assertEqual(provider.env_passthrough, ("EXAMPLE_TOKEN",))
             self.assertEqual(provider.env_paths, (("EXAMPLE_CONFIG_DIR", env_root.resolve()),))
 
+    def test_registry_allows_provider_scoped_xdg_data_and_cache_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            state_root = broker_dir / "vercel" / "state"
+            cache_root = state_root / "cache"
+            for path in (registry_dir, state_root, cache_root):
+                path.mkdir(parents=True)
+            (registry_dir / "vercel.toml").write_text(
+                "\n".join(
+                    (
+                        'name = "vercel"',
+                        'commands = ["vercel"]',
+                        f'write_roots = ["{state_root}"]',
+                        f'env_paths = ["XDG_DATA_HOME={state_root}", "XDG_CACHE_HOME={cache_root}"]',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = CredentialProviderRegistry(registry_dir, broker_dir).snapshot()
+
+            self.assertEqual(snapshot.health, "healthy")
+            self.assertEqual(
+                snapshot.providers[0].env_paths,
+                (("XDG_DATA_HOME", state_root.resolve()), ("XDG_CACHE_HOME", cache_root.resolve())),
+            )
+
     def test_registry_reloads_add_and_remove_without_recreation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
