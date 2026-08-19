@@ -3,7 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, cast
+
+if TYPE_CHECKING:
+    from ..host_config import ConfigSnapshot  # noqa: F401 - forward generic type only
 
 
 T = TypeVar("T")

@@ -23,9 +23,17 @@ class RootValidator(Protocol):
 
 
 class RegisteredProjectRecord(Protocol):
-    project_id: str
-    root: Path
-    allow_unavailable: bool
+    @property
+    def project_id(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def root(self) -> Path:
+        raise NotImplementedError
+
+    @property
+    def allow_unavailable(self) -> bool:
+        raise NotImplementedError
 
 
 def _contains(root: Path, path: Path) -> bool:

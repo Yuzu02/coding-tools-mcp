@@ -165,8 +165,10 @@ class CredentialAdmin:
         os.chmod(self.broker_dir, 0o710)
         os.chmod(self.registry_dir, 0o750)
         if os.geteuid() == 0:
-            os.chown(self.broker_dir, 0, self.service_gid)
-            os.chown(self.registry_dir, 0, self.service_gid)
+            service_gid = self.service_gid
+            assert service_gid is not None
+            os.chown(self.broker_dir, 0, service_gid)
+            os.chown(self.registry_dir, 0, service_gid)
         with tempfile.TemporaryDirectory(prefix=f".{request.name}.", dir=self.broker_dir) as temporary:
             stage = Path(temporary) / request.name
             stage.mkdir(mode=0o700)
@@ -186,7 +188,9 @@ class CredentialAdmin:
     def _secure_fragment(self, fragment: Path) -> None:
         os.chmod(fragment, 0o640)
         if os.geteuid() == 0:
-            os.chown(fragment, 0, self.service_gid)
+            service_gid = self.service_gid
+            assert service_gid is not None
+            os.chown(fragment, 0, service_gid)
 
     def _validate_fragment(self, text: str, name: str) -> None:
         with tempfile.TemporaryDirectory(prefix=".validate-", dir=self.registry_dir.parent) as validation_root:
@@ -229,8 +233,11 @@ class CredentialAdmin:
         os.chmod(destination, 0o600)
 
     def _chown_tree(self, root: Path) -> None:
+        service_uid = self.service_uid
+        service_gid = self.service_gid
+        assert service_uid is not None and service_gid is not None
         for item in (root, *root.rglob("*")):
-            os.chown(item, self.service_uid, self.service_gid)
+            os.chown(item, service_uid, service_gid)
             if item.is_dir():
                 os.chmod(item, 0o700)
             else:
