@@ -330,7 +330,15 @@ ENV_FLAG_OPTIONS = {
 NETWORK_LITERAL_COMMANDS = {"echo", "printf", "grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc"}
 INLINE_SCRIPT_PERMISSION = "inline_script"
 RUNTIME_ROOT_DIR_NAME = "coding-tools-mcp"
-SPECIAL_DEVICE_PATHS = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom")
+SPECIAL_DEVICE_PATHS = (
+    "/dev/null",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/ptmx",
+    "/dev/pts",
+)
+GLOBAL_TMP_ROOTS = ("/tmp", "/var/tmp")
 DNS_RESOLVER_READ_ROOTS = (
     "/etc/resolv.conf",
     "/etc/hosts",
@@ -356,10 +364,27 @@ TOOLCHAIN_READ_ROOTS = (
     "/usr/local/sdkman/candidates",
 )
 OS_METADATA_READ_FILES = (
+    "/proc",
+    "/sys/devices/system/cpu",
+    "/sys/fs/cgroup",
+    "/sys/kernel/mm/transparent_hugepage",
     "/etc/debian_version",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/ld.so.cache",
     "/etc/os-release",
     "/etc/lsb-release",
 )
+MISE_READ_ROOT_ENV_NAMES = (
+    "MISE_CONFIG_DIR",
+    "MISE_DATA_DIR",
+    "MISE_SYSTEM_DATA_DIR",
+)
+MISE_READ_FILE_ENV_NAMES = (
+    "MISE_GLOBAL_CONFIG_FILE",
+    "MISE_SYSTEM_CONFIG_FILE",
+)
+MISE_DEFAULT_READ_ROOTS = ("/etc/mise",)
 GIT_READ_ROOTS = (
     "/etc/gitconfig",
     "/etc/gitconfig.d",
@@ -2144,8 +2169,13 @@ class Runtime:
         provider = self._exec_credential_provider(command)
         read_roots: list[Path] = []
         write_roots: list[Path] = []
+        broker_dir = (
+            self.credential_registry.broker_dir.expanduser().resolve(strict=False)
+            if self.credential_registry is not None
+            else None
+        )
 
-        def add_unique(target: list[Path], raw: Path) -> None:
+        def add_unique(target: list[Path], raw: Path, *, protect_broker: bool = False) -> None:
             try:
                 resolved = raw.expanduser().resolve(strict=False)
             except OSError as exc:
@@ -2155,14 +2185,52 @@ class Runtime:
                     category="security",
                     details={"path": str(raw), "reason": exc.strerror or str(exc)},
                 ) from exc
+            if protect_broker and broker_dir is not None and (
+                resolved == broker_dir or is_relative_to(broker_dir, resolved)
+            ):
+                raise ToolFailure(
+                    "CREDENTIAL_SANDBOX_UNAVAILABLE",
+                    "Runtime path would encompass the credential broker.",
+                    category="security",
+                    details={"path": str(resolved)},
+                )
             if resolved not in target:
                 target.append(resolved)
+
+        def add_mise_config_symlink_targets(raw_root: Path) -> None:
+            try:
+                resolved_root = raw_root.expanduser().resolve(strict=False)
+            except OSError:
+                return
+            if not resolved_root.is_dir():
+                return
+            for directory, dirnames, filenames in os.walk(resolved_root, followlinks=False):
+                for name in (*dirnames, *filenames):
+                    candidate = Path(directory) / name
+                    if not candidate.is_symlink():
+                        continue
+                    try:
+                        resolved_target = candidate.resolve(strict=True)
+                    except OSError:
+                        continue
+                    add_unique(read_roots, resolved_target, protect_broker=True)
 
         # These are the fixed OS/runtime roots needed by a regular shell and
         # resolved executable.  In particular, this list intentionally does
         # not consult guard_allow_roots or CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS.
         for raw in (*TOOLCHAIN_READ_ROOTS, *OS_METADATA_READ_FILES, *GIT_READ_ROOTS, *DNS_RESOLVER_READ_ROOTS):
             add_unique(read_roots, Path(raw))
+        for raw in MISE_DEFAULT_READ_ROOTS:
+            add_unique(read_roots, Path(raw), protect_broker=True)
+        for name in (*MISE_READ_ROOT_ENV_NAMES, *MISE_READ_FILE_ENV_NAMES):
+            raw = environment.get(name)
+            if raw:
+                add_unique(read_roots, Path(raw), protect_broker=True)
+        for raw in MISE_DEFAULT_READ_ROOTS:
+            add_mise_config_symlink_targets(Path(raw))
+        mise_config_dir = environment.get("MISE_CONFIG_DIR")
+        if mise_config_dir:
+            add_mise_config_symlink_targets(Path(mise_config_dir))
         for raw in (
             self.runtime_dir,
             self.command_home_dir(),
@@ -2172,6 +2240,13 @@ class Runtime:
         ):
             add_unique(read_roots, raw)
             add_unique(write_roots, raw)
+        if self.global_tmp_write_policy() == "allowed":
+            for raw in GLOBAL_TMP_ROOTS:
+                path = Path(raw)
+                if not path.exists():
+                    continue
+                add_unique(read_roots, path, protect_broker=True)
+                add_unique(write_roots, path, protect_broker=True)
 
         # A command may be an executable supplied by a project or its PATH.
         # Allow only the canonical parent needed to resolve that executable;
@@ -2180,11 +2255,6 @@ class Runtime:
             tokens = shlex_split(command)
         except ValueError:
             tokens = []
-        broker_dir = (
-            self.credential_registry.broker_dir.expanduser().resolve(strict=False)
-            if self.credential_registry is not None
-            else None
-        )
         for executable in command_executables(tokens)[:1]:
             if "/" in executable or "\\" in executable:
                 executable_path = Path(executable).expanduser()
@@ -3757,7 +3827,15 @@ class Runtime:
         tmp_dir = self.command_tmp_dir()
         env["HOME"] = str(self.command_home_dir())
         env["TMPDIR"] = str(tmp_dir)
-        if not self.dangerously_skip_all_permissions:
+        if self.credential_registry is not None:
+            env["UV_CACHE_DIR"] = str(self.cache_dir / "uv")
+            env["XDG_CACHE_HOME"] = str(self.cache_dir)
+            env["XDG_CONFIG_HOME"] = str(self.state_dir / "config")
+            env["XDG_DATA_HOME"] = str(self.state_dir / "data")
+            env["XDG_STATE_HOME"] = str(self.state_dir / "state")
+            env["MISE_CACHE_DIR"] = str(self.cache_dir / "mise")
+            env["MISE_STATE_DIR"] = str(self.state_dir / "mise")
+        elif not self.dangerously_skip_all_permissions:
             if "UV_CACHE_DIR" in env and "UV_CACHE_DIR" not in self.shell_env_policy.set:
                 env["UV_CACHE_DIR"] = str(self.cache_dir / "uv")
             if "XDG_CACHE_HOME" in env and "XDG_CACHE_HOME" not in self.shell_env_policy.set:
@@ -5436,6 +5514,15 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots
         readonly_access = handled & (
             LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
         )
+        # Bun and similar runtimes canonicalize the process cwd by opening and
+        # walking ancestor directories.  Landlock has no traversal-only right:
+        # READ_DIR covers opening/listing a directory and every directory below
+        # a PathBeneath rule.  Grant directory discovery globally while keeping
+        # READ_FILE, execution, and writes restricted to the explicit roots.
+        # Credential confidentiality therefore rests on file-open isolation,
+        # not on hiding provider/directory names from child processes.
+        directory_discovery_access = handled & LANDLOCK_ACCESS_FS_READ_DIR
+        add_landlock_path(ruleset_fd, Path("/"), directory_discovery_access)
         device_access = landlock_device_access(handled)
         add_landlock_path(ruleset_fd, workspace, workspace_access)
         for write_root in write_roots or []:

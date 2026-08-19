@@ -76,6 +76,193 @@ class CredentialLandlockTests(unittest.TestCase):
             self.assertIn("A_BLOCKED", result.get("stdout", ""))
             self.assertIn("B_BLOCKED", result.get("stdout", ""))
 
+    def test_non_provider_can_read_its_own_proc_self_metadata(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                result = runtime.exec_command(
+                    {
+                        "cmd": "head -c 1 /proc/self/maps >/dev/null && printf SELF_READABLE",
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000,
+                    }
+                )
+            finally:
+                runtime.close()
+
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertEqual(result.get("stdout"), "SELF_READABLE")
+
+    def test_non_provider_can_resolve_current_posix_identity(self) -> None:
+        identity = shutil.which("id")
+        if identity is None:
+            self.skipTest("POSIX id command is not installed")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                result = runtime.exec_command(
+                    {
+                        "cmd": f"{identity} -un",
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000,
+                    }
+                )
+            finally:
+                runtime.close()
+
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertTrue(result.get("stdout", "").strip())
+
+    def test_non_provider_can_allocate_posix_pty(self) -> None:
+        script = shutil.which("script")
+        if script is None:
+            self.skipTest("POSIX script command is not installed")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                result = runtime.exec_command(
+                    {
+                        "cmd": f"{script} -q -c 'printf PTY_OK' /dev/null",
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000,
+                    }
+                )
+            finally:
+                runtime.close()
+
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertIn("PTY_OK", result.get("stdout", ""))
+
+    def test_non_provider_cannot_read_parent_process_maps(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                result = runtime.exec_command(
+                    {
+                        "cmd": (
+                            f"if head -c 1 /proc/{os.getpid()}/maps >/dev/null 2>&1; "
+                            "then printf PARENT_READABLE; else printf PARENT_BLOCKED; fi"
+                        ),
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000,
+                    }
+                )
+            finally:
+                runtime.close()
+
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertEqual(result.get("stdout"), "PARENT_BLOCKED")
+
+    def test_non_provider_can_start_bun_javascript_runtime(self) -> None:
+        bun = shutil.which("bun")
+        if bun is None:
+            self.skipTest("Bun is not installed")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                result = runtime.exec_command(
+                    {
+                        "cmd": f"{bun} -e 'console.log(\"BUN_RUNTIME_OK\")'",
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000,
+                    }
+                )
+            finally:
+                runtime.close()
+
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertEqual(result.get("stdout"), "BUN_RUNTIME_OK\n")
+
+    def test_non_provider_bunx_can_resolve_nested_current_directory(self) -> None:
+        bun = shutil.which("bun")
+        if bun is None:
+            self.skipTest("Bun is not installed")
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            local_bin = workspace / "node_modules" / ".bin"
+            local_bin.mkdir(parents=True)
+            probe = local_bin / "probe"
+            probe.write_text("#!/bin/sh\nprintf 'BUNX_LOCAL_OK\\n'\n", encoding="utf-8")
+            probe.chmod(0o755)
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                result = runtime.exec_command(
+                    {
+                        "cmd": f"{bun} x --no-install probe",
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000,
+                    }
+                )
+            finally:
+                runtime.close()
+
+            self.assertEqual(result.get("exit_code"), 0, result)
+            self.assertEqual(result.get("stdout"), "BUNX_LOCAL_OK\n")
+
     def test_provider_can_read_and_write_only_its_own_roots(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -241,6 +428,146 @@ class CredentialLandlockTests(unittest.TestCase):
             self.assertEqual(isolation["backend"], "landlock")
             self.assertEqual(isolation["enforced_for"], "all_exec")
             self.assertIn(isolation["status"], {"available", "unavailable"})
+
+    def test_mise_system_user_and_project_layers_are_readable_without_home_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            user_home = root / "home" / "yuzu"
+            user_config = user_home / ".config" / "mise"
+            user_data = user_home / ".local" / "share" / "mise"
+            system_data = root / "usr-local-share-mise"
+            global_config = user_config / "config.toml"
+            system_config = root / "etc-mise" / "config.toml"
+            for path in (user_config, user_data, system_data, system_config.parent):
+                path.mkdir(parents=True, exist_ok=True)
+            global_config.write_text("[tools]\nuser-tool = \"1\"\n", encoding="utf-8")
+            system_config.write_text("[tools]\nsystem-tool = \"1\"\n", encoding="utf-8")
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=server_module.ShellEnvPolicy(inherit="all"),
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            host_env = {
+                "PATH": "/usr/bin",
+                "MISE_CONFIG_DIR": str(user_config),
+                "MISE_DATA_DIR": str(user_data),
+                "MISE_SYSTEM_DATA_DIR": str(system_data),
+                "MISE_GLOBAL_CONFIG_FILE": str(global_config),
+                "MISE_SYSTEM_CONFIG_FILE": str(system_config),
+            }
+            try:
+                with patch.dict(server_module.os.environ, host_env, clear=True):
+                    roots = runtime._credential_landlock_roots("mise run verify", workspace)
+            finally:
+                runtime.close()
+
+            for expected in (
+                workspace.resolve(),
+                user_config.resolve(),
+                user_data.resolve(),
+                system_data.resolve(),
+                global_config.resolve(),
+                system_config.resolve(),
+            ):
+                self.assertIn(expected, roots.read_roots)
+            self.assertNotIn(user_home.resolve(), roots.read_roots)
+
+    def test_dangerous_registry_preserves_global_tmp_write_contract(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                roots = runtime._credential_landlock_roots("mise run verify", workspace)
+            finally:
+                runtime.close()
+
+            self.assertEqual(runtime.global_tmp_write_policy(), "allowed")
+            for raw in (Path("/tmp"), Path("/var/tmp")):
+                if raw.exists():
+                    resolved = raw.resolve(strict=False)
+                    self.assertIn(resolved, roots.read_roots)
+                    self.assertIn(resolved, roots.write_roots)
+
+    def test_mise_read_root_cannot_encompass_credential_broker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "mise-data" / "credentials"
+            registry_dir.mkdir()
+            broker_dir.mkdir(parents=True)
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=server_module.ShellEnvPolicy(inherit="all"),
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                with patch.dict(
+                    server_module.os.environ,
+                    {"PATH": "/usr/bin", "MISE_DATA_DIR": str(broker_dir.parent)},
+                    clear=True,
+                ):
+                    with self.assertRaises(ToolFailure) as raised:
+                        runtime._credential_landlock_roots("mise run verify", workspace)
+            finally:
+                runtime.close()
+
+            self.assertEqual(raised.exception.code, "CREDENTIAL_SANDBOX_UNAVAILABLE")
+
+    def test_mise_config_symlink_target_is_added_as_exact_read_root(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            user_config = root / "home" / "yuzu" / ".config" / "mise"
+            task_dir = user_config / "tasks"
+            task_dir.mkdir(parents=True)
+            external_dir = root / "shared" / "mise-tasks"
+            external_dir.mkdir(parents=True)
+            external_task = external_dir / "status"
+            external_task.write_text("#!/bin/sh\n", encoding="utf-8")
+            (task_dir / "status").symlink_to(external_task)
+            registry_dir = root / "credentials.d"
+            broker_dir = root / "broker"
+            registry_dir.mkdir()
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=server_module.ShellEnvPolicy(inherit="all"),
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            try:
+                with patch.dict(
+                    server_module.os.environ,
+                    {"PATH": "/usr/bin", "MISE_CONFIG_DIR": str(user_config)},
+                    clear=True,
+                ):
+                    roots = runtime._credential_landlock_roots("mise run verify", workspace)
+            finally:
+                runtime.close()
+
+            self.assertIn(external_task.resolve(), roots.read_roots)
+            self.assertNotIn(external_dir.resolve(), roots.read_roots)
 
     def test_mise_node_cli_allows_exact_installed_tool_root(self) -> None:
         with TemporaryDirectory() as tmp:

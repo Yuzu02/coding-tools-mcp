@@ -938,6 +938,42 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertEqual(env.get("UV_CACHE_DIR"), str(runtime.cache_dir / "uv"))
             self.assertEqual(env.get("XDG_CACHE_HOME"), str(runtime.cache_dir))
 
+    def test_command_env_dangerous_registry_rehomes_inherited_xdg_roots_inside_runtime(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            registry_dir = root / "credentials.d"
+            registry_dir.mkdir()
+            broker_dir = root / "broker"
+            broker_dir.mkdir()
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                shell_env_policy=ShellEnvPolicy(inherit="all"),
+                credential_registry=CredentialProviderRegistry(registry_dir, broker_dir),
+            )
+            host_env = {
+                "PATH": "/usr/bin",
+                "UV_CACHE_DIR": "/var/cache/coding-tools-mcp/uv",
+                "XDG_CACHE_HOME": "/var/cache/coding-tools-mcp",
+                "XDG_CONFIG_HOME": "/var/lib/coding-tools-mcp/config",
+                "XDG_DATA_HOME": "/var/lib/coding-tools-mcp/data",
+                "XDG_STATE_HOME": "/var/lib/coding-tools-mcp/state",
+                "MISE_CACHE_DIR": "/var/cache/coding-tools-mcp/mise",
+                "MISE_STATE_DIR": "/var/lib/coding-tools-mcp/mise-state",
+            }
+            with patch.dict(server_module.os.environ, host_env, clear=True):
+                env = runtime._command_env({}, workdir=workspace, command="printf ok")
+
+            self.assertEqual(env.get("UV_CACHE_DIR"), str(runtime.cache_dir / "uv"))
+            self.assertEqual(env.get("XDG_CACHE_HOME"), str(runtime.cache_dir))
+            self.assertEqual(env.get("XDG_CONFIG_HOME"), str(runtime.state_dir / "config"))
+            self.assertEqual(env.get("XDG_DATA_HOME"), str(runtime.state_dir / "data"))
+            self.assertEqual(env.get("XDG_STATE_HOME"), str(runtime.state_dir / "state"))
+            self.assertEqual(env.get("MISE_CACHE_DIR"), str(runtime.cache_dir / "mise"))
+            self.assertEqual(env.get("MISE_STATE_DIR"), str(runtime.state_dir / "mise"))
+
     def test_command_env_dangerous_core_removes_mcp_venv_from_path(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)

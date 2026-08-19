@@ -198,8 +198,12 @@ while the credential broker exists. It preserves normal workspace commands,
 system toolchains, network capability, shell expansion, and the normal runtime
 directories; it no longer promises arbitrary host-path reads from a child.
 `server_info` reports this as `credential_isolation.enforced_for = "all_exec"`.
-It is the required trade-off for ensuring non-provider children cannot see the
-broker on a host where mount namespaces are unavailable.
+It is the required trade-off for ensuring non-provider children cannot open
+broker credential files on a host where a per-command mount namespace is not
+part of the runtime contract. Landlock has no traversal-only directory right;
+toolchains that must walk cwd ancestors may therefore observe directory names
+or other filesystem metadata even though `READ_FILE`/write/execute access stays
+restricted. Provider names and directory metadata are not credential secrets.
 
 The runtime resolves the selected executable from its sanitized command
 environment and includes only its canonical executable/runtime parents when

@@ -548,6 +548,17 @@ Landlock profile cannot be created or verified, the command is not started
 (fail closed). `server_info.credential_providers.filesystem_isolation` reports
 the backend, availability, and `enforced_for = "all_exec"`.
 
+The Linux profile permits directory discovery (`READ_DIR`) across the host so
+toolchains can canonicalize the current working directory and search ancestor
+directories. That grant does not include `READ_FILE`, execution, or write
+rights: non-provider commands still cannot open provider files, and provider
+commands receive file access only to their declared broker subtree.
+Because Landlock has no traversal-only directory permission, this compatibility
+grant can expose directory names/metadata to child processes. Provider names
+are not treated as credentials; credential confidentiality is enforced at
+file-open/write access. A future mount-namespace layer may tighten metadata
+visibility independently without changing the broker authorization model.
+
 For operations and dry-run behavior, use
 [credential-provider-migration.md](credential-provider-migration.md). The
 `credentials` tool is host-only and is never exposed as an MCP tool.
@@ -593,6 +604,25 @@ Mise-managed user tools may bind only the two Mise subtrees read-only
 `MISE_DATA_DIR` to those paths, and retain `ProtectHome=tmpfs`. Never bind the
 home root, Git/GitHub config, or any credential store; project `mise.toml`
 files are already available through the registered project binds.
+
+The all-command credential Landlock profile preserves that same three-level
+Mise hierarchy instead of flattening it: system config/data (`/etc/mise` and
+`MISE_SYSTEM_DATA_DIR`), user config/tool installs (`MISE_CONFIG_DIR` and
+`MISE_DATA_DIR`), and the registered project tree are readable by child
+commands. Explicit `MISE_GLOBAL_CONFIG_FILE` and `MISE_SYSTEM_CONFIG_FILE`
+overrides are admitted as exact read-only files. These Mise roots may never
+encompass the credential broker. Mutable Mise cache/state are rehomed to the
+project-scoped MCP cache/state trees via `MISE_CACHE_DIR` and
+`MISE_STATE_DIR`, so user and system Mise stores remain read-only.
+Symlinked entries inside the system/user Mise config trees are followed only
+to their exact resolved targets; this keeps centrally managed task links
+usable without granting the target parent tree wholesale.
+
+The credential profile must also preserve the selected permission mode's
+temporary-directory contract. In `dangerous` mode, where
+`global_tmp_write=allowed`, `/tmp` and `/var/tmp` remain readable/writable so
+system/user Mise configuration such as `TMPDIR=/var/tmp` continues to work.
+Those roots are still rejected if they would encompass the credential broker.
 
 Provision the runtime/state/cache/log roots outside the source tree and make
 them writable by the service account before preflight.
