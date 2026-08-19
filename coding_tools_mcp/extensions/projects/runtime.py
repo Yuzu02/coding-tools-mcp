@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 
 from coding_tools_mcp.errors import ToolFailure
+from coding_tools_mcp.execution_target import ExecutionTarget, bind_execution_target
 from coding_tools_mcp.project_context import ProjectContext, load_project_context
 
 from ..services import CapabilityKey, ResolvedPathLike, WorkspaceRuntimeHandle, WorkspaceRuntimeService
@@ -118,9 +119,39 @@ class ProjectRuntimeManager:
         project_id: str,
         handler,
         arguments: dict[str, object],
+        *,
+        target_workdir: str | None = None,
     ) -> dict[str, object]:
         runtime = self.require(project_id)
-        return self.workspace_runtimes.invoke(runtime.workspace, handler, arguments)
+        raw_workdir = target_workdir if target_workdir is not None else str(arguments.get("workdir", "."))
+        target = self.resolve_target(project_id, raw_workdir, runtime=runtime)
+        normalized_arguments = dict(arguments)
+        if "workdir" in normalized_arguments:
+            normalized_arguments["workdir"] = target.relative_workdir
+        with bind_execution_target(target):
+            return self.workspace_runtimes.invoke(runtime.workspace, handler, normalized_arguments)
+
+    def resolve_target(
+        self,
+        project_id: str,
+        raw_workdir: str = ".",
+        *,
+        runtime: ProjectRuntime | None = None,
+    ) -> ExecutionTarget:
+        selected = runtime or self.require(project_id)
+        resolved = self.workspace_runtimes.resolve_existing(selected.workspace, raw_workdir)
+        if not resolved.path.is_dir():
+            raise ToolFailure(
+                "NOT_A_DIRECTORY",
+                "workdir must resolve to a directory inside the selected project.",
+                category="validation",
+            )
+        return ExecutionTarget(
+            project_id=project_id,
+            root=selected.workspace.root,
+            workdir=resolved.path,
+            relative_workdir=resolved.display,
+        )
 
     def resolve_existing(self, project_id: str, raw_path: str = ".") -> ResolvedPathLike:
         runtime = self.require(project_id)

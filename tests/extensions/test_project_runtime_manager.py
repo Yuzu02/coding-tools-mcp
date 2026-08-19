@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from coding_tools_mcp.errors import ToolFailure
+from coding_tools_mcp.execution_target import current_execution_target
 from coding_tools_mcp.extensions.projects.registry import ProjectRegistry, RegisteredProject
 from coding_tools_mcp.extensions.projects.runtime import (
     CommandOwnershipIndex,
@@ -166,6 +167,31 @@ class ProjectRuntimeManagerTests(unittest.TestCase):
         with self.assertRaises(ToolFailure) as missing:
             manager.command_owners.owner("command-1")
         self.assertEqual(missing.exception.code, "COMMAND_NOT_FOUND")
+
+    def test_invoke_binds_one_canonical_execution_target(self) -> None:
+        manager = self.manager()
+        nested = self.other / "nested"
+        nested.mkdir()
+
+        def inspect(arguments):
+            target = current_execution_target()
+            assert target is not None
+            return {
+                "project_id": target.project_id,
+                "root": str(target.root),
+                "workdir": str(target.workdir),
+                "relative_workdir": target.relative_workdir,
+                "forwarded_workdir": arguments.get("workdir"),
+            }
+
+        payload = manager.invoke("other", inspect, {"workdir": "nested"})
+
+        self.assertEqual(payload["project_id"], "other")
+        self.assertEqual(Path(payload["root"]), self.other.resolve())
+        self.assertEqual(Path(payload["workdir"]), nested.resolve())
+        self.assertEqual(payload["relative_workdir"], "nested")
+        self.assertEqual(payload["forwarded_workdir"], "nested")
+        self.assertIsNone(current_execution_target())
 
     def test_command_ownership_collision_is_rejected(self) -> None:
         owners = CommandOwnershipIndex()

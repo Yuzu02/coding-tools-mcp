@@ -124,6 +124,20 @@ class ProjectToolRoutingTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_public_workdir_vocabulary_is_unambiguous(self) -> None:
+        runtime = self.runtime()
+        try:
+            tools = {tool["name"]: tool for tool in runtime.list_tools()["tools"]}
+            exec_properties = tools["exec_command"]["inputSchema"]["properties"]
+            self.assertIn("workdir", exec_properties)
+            self.assertNotIn("cwd", exec_properties)
+
+            status_properties = tools["git_status"]["inputSchema"]["properties"]
+            self.assertIn("workdir", status_properties)
+            self.assertNotIn("path", status_properties)
+        finally:
+            runtime.close()
+
     def test_same_relative_paths_route_independently_for_read_list_search_and_environment(self) -> None:
         runtime = self.runtime()
         try:
@@ -225,6 +239,43 @@ class ProjectToolRoutingTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_omitted_workdir_targets_project_root_and_explicit_workdir_stays_relative(self) -> None:
+        runtime = self.runtime()
+        subdir = self.beta / "nested"
+        subdir.mkdir()
+        try:
+            root = runtime.call_tool(
+                "exec_command",
+                {"project_id": "beta", "cmd": "python -c \"import os; print(os.getcwd())\""},
+            )["structuredContent"]
+            self.assertEqual(Path(root["stdout"].strip()), self.beta.resolve())
+
+            nested = runtime.call_tool(
+                "exec_command",
+                {
+                    "project_id": "beta",
+                    "workdir": "nested",
+                    "cmd": "python -c \"import os; print(os.getcwd())\"",
+                },
+            )["structuredContent"]
+            self.assertEqual(Path(nested["stdout"].strip()), subdir.resolve())
+
+            escaped = runtime.call_tool(
+                "exec_command",
+                {
+                    "project_id": "beta",
+                    "workdir": "../alpha",
+                    "cmd": "python -c \"print('NO')\"",
+                },
+            )
+            self.assertTrue(escaped["isError"], escaped)
+            self.assertEqual(
+                escaped["structuredContent"]["error"]["code"],
+                "PATH_OUTSIDE_WORKSPACE",
+            )
+        finally:
+            runtime.close()
+
     def test_project_scoped_continuations_preserve_project_id(self) -> None:
         runtime = self.runtime()
         try:
@@ -242,6 +293,7 @@ class ProjectToolRoutingTests(unittest.TestCase):
             )["structuredContent"]
             self.assertTrue(log["truncated"])
             self.assertEqual(log["next_action"]["arguments"]["project_id"], "alpha")
+            self.assertNotIn("workdir", log["next_action"]["arguments"])
 
             blame = runtime.call_tool(
                 "git_blame",

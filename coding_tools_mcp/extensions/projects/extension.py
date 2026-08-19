@@ -475,7 +475,12 @@ class ProjectsExtension:
             clean_target.pop("project_id", None)
             clean_outer = dict(args)
             clean_outer["arguments"] = clean_target
-            payload = self._require_runtimes().invoke(project_id, next_handler, clean_outer)
+            payload = self._require_runtimes().invoke(
+                project_id,
+                next_handler,
+                clean_outer,
+                target_workdir=str(clean_target.get("workdir", ".")),
+            )
             return self._restore_permission_target(payload, project_id)
 
         return routed

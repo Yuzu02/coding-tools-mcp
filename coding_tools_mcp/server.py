@@ -861,10 +861,11 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "exec_command": ToolSpec(
         title="Execute command",
         description=(
-            "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
+            "Run a bounded command under runtime policy. Omit workdir to run from the selected project root; "
+            "supply a relative workdir only when a project subdirectory is required. "
             "A still-running command returns command_id. Supply one stable non-secret client_request_id to "
             "deduplicate an uncertain retry. Example: "
-            "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000,"
+            "{\"cmd\":\"pytest -q\",\"yield_time_ms\":30000,"
             "\"client_request_id\":\"test-run-1\"}. "
             "Retained output is bounded per stream; for very large output redirect to a file "
             "(cmd > out.log 2>&1) and page it with read_file or search_text."
@@ -3476,9 +3477,7 @@ class Runtime:
         cmd = str(args.get("cmd", ""))
         if not cmd:
             raise ToolFailure("INVALID_ARGUMENT", "cmd is required.", category="validation")
-        workdir_arg = args.get("workdir", args.get("cwd", "."))
-        if "workdir" in args and "cwd" in args and str(args["workdir"]) != str(args["cwd"]):
-            raise ToolFailure("INVALID_ARGUMENT", "workdir and cwd refer to different directories.", category="validation")
+        workdir_arg = args.get("workdir", ".")
         workdir = self.resolve_existing(str(workdir_arg))
         if not workdir.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
@@ -4034,23 +4033,8 @@ class Runtime:
         completed = self._run_git_text([require_git(), "-C", str(path), "rev-parse", rev], env=env)
         return completed.stdout.strip() if completed.returncode == 0 else ""
 
-    def _resolve_git_workdir(self, args: dict[str, Any], *, path_alias: bool = False) -> ResolvedPath:
-        raw_workdir = args.get("workdir")
-        raw_alias = args.get("path") if path_alias else None
-        if raw_workdir is not None and raw_alias is not None:
-            if str(raw_alias) == ".":
-                resolved = self.resolve_existing(str(raw_workdir))
-            elif str(raw_workdir) == ".":
-                resolved = self.resolve_existing(str(raw_alias))
-            else:
-                workdir = self.resolve_existing(str(raw_workdir))
-                alias = self.resolve_existing(str(raw_alias))
-                if workdir.path != alias.path:
-                    raise ToolFailure("INVALID_ARGUMENT", "workdir and path refer to different repositories.", category="validation")
-                resolved = workdir
-        else:
-            raw = raw_workdir if raw_workdir is not None else raw_alias if raw_alias is not None else "."
-            resolved = self.resolve_existing(str(raw))
+    def _resolve_git_workdir(self, args: dict[str, Any]) -> ResolvedPath:
+        resolved = self.resolve_existing(str(args.get("workdir", ".")))
         if not resolved.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "Git workdir must be a directory.", category="validation")
         return resolved
@@ -4567,7 +4551,7 @@ class Runtime:
         return command
 
     def git_status(self, args: dict[str, Any]) -> dict[str, Any]:
-        resolved = self._resolve_git_workdir(args, path_alias=True)
+        resolved = self._resolve_git_workdir(args)
         max_entries = int(args.get("max_entries", 1000))
         include_untracked = bool(args.get("include_untracked", True))
         git = require_git()
@@ -4767,7 +4751,7 @@ class Runtime:
             result["next_action"] = {
                 "tool": "git_log",
                 "arguments": {
-                    "workdir": workdir.display,
+                    **({"workdir": workdir.display} if workdir.display != "." else {}),
                     **({"path": path_filter} if path_filters else {}),
                     "ref": ref,
                     "max_count": max_count,
@@ -4879,7 +4863,7 @@ class Runtime:
         }
         if truncated and final_line < requested_final_line:
             next_arguments: dict[str, Any] = {
-                "workdir": workdir.display,
+                **({"workdir": workdir.display} if workdir.display != "." else {}),
                 "path": requested_path,
                 "start_line": final_line + 1,
                 "end_line": requested_final_line,
@@ -6260,7 +6244,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             {
                 "cmd": {**string, "minLength": 1},
                 "workdir": {**string, "default": "."},
-                "cwd": {**string},
                 "timeout_ms": {**integer, "minimum": 1, "maximum": 600000, "default": 30000},
                 "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
@@ -6339,7 +6322,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
         "git_status": object_schema(
             {
                 "workdir": {**string, "default": "."},
-                "path": {**string, "default": "."},
                 "include_untracked": {**boolean, "default": True},
                 "max_entries": {**integer, "minimum": 1, "maximum": 10000, "default": 1000},
             }
